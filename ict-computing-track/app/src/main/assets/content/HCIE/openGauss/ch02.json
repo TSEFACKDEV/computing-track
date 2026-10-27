@@ -1,0 +1,711 @@
+{
+  "id": "hcie-og-02",
+  "phase": "HCIE",
+  "subject": "openGauss",
+  "number": 2,
+  "title_fr": "Optimizer et SQL avancé",
+  "title_en": "Optimizer and Advanced SQL",
+  "minutes": 90,
+  "source": "HCIE-openGauss V1.0 Training Material — Sessions 4-5 et 7 «Query Execution/Plans · Performance Optimization · NUMA/MOT»",
+  "objectives": [
+    "Décrire les étapes parse, rewrite, optimize et execute jusqu'au plan",
+    "Interpréter coûts, cardinalités, buffers et écarts estimation/réalité",
+    "Choisir entre seq scan, index scan, bitmap et index-only",
+    "Expliquer Nested Loop, Hash Join et Merge Join, y compris en MPP",
+    "Maîtriser hints, partition pruning et SQL analytique",
+    "Conduire une revue de requête et des réécritures mesurables"
+  ],
+  "sections": [
+    {
+      "heading": "Du texte SQL au plan d'exécution",
+      "body": "Une requête traverse quatre étages. Le parseur lexical et syntaxique transforme le texte en arbre d'analyse et vérifie la grammaire. La réécriture applique les vues, les règles et certaines transformations. Le planificateur énumère les chemins d'accès et les ordres de jointure, les chiffre avec le modèle de coût et choisit le moins cher. L'exécuteur déroule ensuite l'arbre de plans avec des opérateurs qui s'appellent en pipeline : un Index Scan alimente un Nested Loop, qui alimente un Sort, et ainsi de suite. Comprendre ce pipeline évite de chercher au mauvais endroit. Un plan se lit de l'intérieur vers l'extérieur : les nœuds les plus indentés sont exécutés en premier, et chaque nœud indique son coût estimé, son nombre de lignes et sa largeur, puis avec ANALYZE ses mesures réelles, ses boucles et ses buffers. La différence entre estimation et réalité est le premier indice : un écart de plusieurs ordres de grandeur trahit des statistiques périmées, une corrélation ignorée ou un prédicat mal estimé.",
+      "bullets": [
+        "Le planificateur compare des coûts, l'exécuteur produit des lignes",
+        "Un plan se lit du plus profond vers la racine",
+        "EXPLAIN seul estime ; EXPLAIN ANALYZE exécute et mesure",
+        "L'écart estimation/réalité oriente le diagnostic"
+      ],
+      "code": [
+        "EXPLAIN SELECT customer_id, sum(amount)",
+        "FROM orders WHERE created_at >= '2026-01-01'",
+        "GROUP BY customer_id;",
+        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE)",
+        "SELECT customer_id, sum(amount)",
+        "FROM orders WHERE created_at >= '2026-01-01'",
+        "GROUP BY customer_id;"
+      ],
+      "diagram": "HashAggregate  (cost=... rows=... width=...)\n  ->  Hash Join  (cost=... rows=...)\n        Hash Cond: (o.customer_id = c.id)\n        ->  Index Scan on orders  (actual rows=...)\n        ->  Hash  (actual rows=...)\n              ->  Seq Scan on customers\n\nLecture : du bas vers le haut\nChaque niveau consomme les lignes de ses enfants",
+      "tip": "EXPLAIN ANALYZE exécute réellement la requête : sur un UPDATE ou un DELETE, encadrez-le par BEGIN; ... ROLLBACK; pour ne pas modifier les données de production."
+    },
+    {
+      "heading": "Coût, statistiques et sélectivité",
+      "body": "Le planificateur compare des coûts, pas des durées. Le coût additionne les lectures séquentielles (seq_page_cost), aléatoires (random_page_cost), le CPU par tuple et par opérateur, et tient compte du cache (effective_cache_size). Ces paramètres doivent refléter le matériel : sur SSD, un random_page_cost proche de 1,1 favorise l'index ; la valeur par défaut de 4, héritée des disques mécaniques, pénalise excessivement les accès aléatoires. Les estimations de lignes viennent des statistiques : reltuples et relpages pour la taille, pg_statistic pour la distribution, avec les valeurs les plus fréquentes, les histogrammes et n_distinct. ANALYZE échantillonne la table et met à jour ces structures ; default_statistics_target règle la finesse de l'échantillon. Après un chargement massif, un gros DELETE ou un changement de distribution, les statistiques sont périmées et le plan dérive. On vérifie avec pg_stats et on corrige par ANALYZE, en augmentant éventuellement la cible sur les colonnes très corrélées ou utilisées dans les jointures.",
+      "bullets": [
+        "Le coût est une estimation relative, pas un temps en millisecondes",
+        "random_page_cost doit refléter le stockage, surtout sur SSD",
+        "ANALYZE met à jour MCV, histogrammes et n_distinct",
+        "Des statistiques périmées produisent un bon plan pour de mauvaises données"
+      ],
+      "code": [
+        "ANALYZE orders;",
+        "SELECT attname, n_distinct, correlation",
+        "FROM pg_stats WHERE tablename = 'orders';",
+        "ALTER TABLE orders ALTER COLUMN customer_id SET STATISTICS 500;",
+        "ANALYZE orders;"
+      ],
+      "table": {
+        "headers": [
+          "Statistique",
+          "Ce qu'elle décrit",
+          "Effet sur le plan"
+        ],
+        "rows": [
+          [
+            "reltuples / relpages",
+            "taille de la table",
+            "coût des scans complets"
+          ],
+          [
+            "n_distinct",
+            "nombre de valeurs distinctes",
+            "estimation d'égalité"
+          ],
+          [
+            "MCV",
+            "valeurs les plus fréquentes",
+            "prédicats sur valeurs skewed"
+          ],
+          [
+            "Histogramme",
+            "distribution hors MCV",
+            "prédicats de plage"
+          ],
+          [
+            "Correlation",
+            "ordre physique des lignes",
+            "attractivité de l'index"
+          ]
+        ]
+      },
+      "tip": "Piège d'examen : un index n'est pas choisi parce qu'il existe, mais parce que son coût estimé est inférieur au scan séquentiel. Un filtre peu sélectif peut donc légitimement rester en Seq Scan."
+    },
+    {
+      "heading": "Chemins d'accès : seq scan, index, bitmap, index-only",
+      "body": "Le choix d'accès dépend de la sélectivité. Un Seq Scan lit toutes les pages : imbattable si l'on veut une grande fraction de la table, car il économise les sauts aléatoires. Un Index Scan parcourt l'arbre B-tree puis va chercher chaque tuple dans le heap : idéal pour peu de lignes, surtout si elles sont groupées. Un Bitmap Index Scan construit d'abord une bitmap des pages concernées, puis un Bitmap Heap Scan les lit en ordre physique : bon compromis pour une sélectivité moyenne ou plusieurs index combinés. L'Index Only Scan évite le heap si toutes les colonnes demandées sont dans l'index et si la visibilité des pages est connue ; sinon il paie des vérifications. openGauss propose notamment B-tree (défaut), hash pour l'égalité, GiST et GIN pour les recherches complexes, ainsi que des index spécialisés. Un index mal choisi coûte à chaque écriture : chaque INSERT, UPDATE et DELETE doit le maintenir. La règle est de partir des requêtes réelles, pas d'indexer toutes les colonnes.",
+      "bullets": [
+        "Seq Scan gagne sur les fortes sélectivités",
+        "Index Scan excelle sur peu de lignes groupées",
+        "Bitmap Scan lit les pages en ordre physique",
+        "Chaque index ralentit les écritures : indexez avec parcimonie"
+      ],
+      "code": [
+        "CREATE INDEX idx_orders_created ON orders (created_at);",
+        "CREATE INDEX idx_orders_customer_amount ON orders (customer_id, amount);",
+        "EXPLAIN (ANALYZE, BUFFERS)",
+        "SELECT id, amount FROM orders WHERE customer_id = 42;",
+        "SET enable_seqscan = off;  -- diagnostic seulement"
+      ],
+      "table": {
+        "headers": [
+          "Fraction lue",
+          "Chemin probable",
+          "Pourquoi"
+        ],
+        "rows": [
+          [
+            "moins de 1 %",
+            "Index Scan",
+            "peu de pages aléatoires"
+          ],
+          [
+            "1 à 10 %",
+            "Bitmap Scan",
+            "regroupement physique des pages"
+          ],
+          [
+            "plus de 10 à 20 %",
+            "Seq Scan",
+            "lecture séquentielle moins coûteuse"
+          ],
+          [
+            "toutes les colonnes dans l'index",
+            "Index Only Scan",
+            "évite le heap si visibilité connue"
+          ]
+        ]
+      },
+      "tip": "Un index sur une expression comme lower(email) ne sert que si la requête utilise exactement lower(email). Écrire WHERE email = lower(:value) rend le prédicat non sargable et force souvent un scan complet."
+    },
+    {
+      "heading": "Algorithmes de jointure et mémoire",
+      "body": "Trois algorithmes de jointure répondent à des situations différentes. Nested Loop parcourt la table externe et, pour chaque ligne, sonde l'interne : excellent quand l'externe est petite et l'interne indexée, désastreux si l'interne est scanné à chaque itération. Hash Join construit une table de hachage sur la plus petite entrée puis sonde avec l'autre : roi des jointures d'égalité sur de gros volumes non triés, à condition que la table de hachage tienne dans work_mem, sinon elle déborde en fichiers temporaires. Merge Join trie les deux entrées, ou exploite des index ordonnés, puis les fusionne : efficace pour de très gros volumes déjà triés et pour certaines jointures d'inégalité. Le planificateur choisit selon les cardinalités, la présence d'index et la mémoire. En MPP, des opérateurs Stream (Redistribute, Broadcast, Gather) déplacent les lignes entre nœuds : un Broadcast d'une grosse table sature le réseau, un Redistribute mal choisi crée du skew. Les hints permettent de forcer un algorithme, mais seulement après avoir compris pourquoi le planificateur s'est trompé.",
+      "bullets": [
+        "Nested Loop : petite entrée externe et index sur l'interne",
+        "Hash Join : égalité, gros volumes, mémoire suffisante",
+        "Merge Join : entrées triées ou index ordonnés",
+        "En MPP, le déplacement des lignes peut dominer le coût"
+      ],
+      "code": [
+        "SET work_mem = '256MB';",
+        "SET enable_nestloop = off;",
+        "EXPLAIN (ANALYZE, BUFFERS)",
+        "SELECT c.name, count(*)",
+        "FROM customers c JOIN orders o ON o.customer_id = c.id",
+        "GROUP BY c.name;"
+      ],
+      "table": {
+        "headers": [
+          "Algorithme",
+          "Condition idéale",
+          "Risque principal"
+        ],
+        "rows": [
+          [
+            "Nested Loop",
+            "externe petite, interne indexée",
+            "explosion si l'interne est rescanné"
+          ],
+          [
+            "Hash Join",
+            "égalité, gros volumes non triés",
+            "débordement si work_mem insuffisant"
+          ],
+          [
+            "Merge Join",
+            "entrées triées ou index ordonnés",
+            "tri coûteux si l'ordre manque"
+          ]
+        ]
+      },
+      "diagram": "Nested Loop                 Hash Join                 Merge Join\n------------                ---------                 ----------\nouter: 10 lignes           build: petite table       tri des deux flux\n  inner: index lookups       probe: grande table       fusion ordonnée\n  coût ~ 10 x lookup         mémoire: work_mem          cout ~ 2 tris\n\nPetit + index      -> Nested Loop\nGros + égalité     -> Hash Join\nDéjà trié          -> Merge Join",
+      "tip": "Un Nested Loop avec des millions de boucles n'est pas toujours visible dans le coût global : regardez la colonne loops et multipliez le temps du nœud interne par ce nombre."
+    },
+    {
+      "heading": "Hints, SQL Patch et stabilité des plans",
+      "body": "Un hint est un commentaire spécial placé juste après SELECT : /*+ ... */. openGauss reconnaît leading pour l'ordre de jointure, nestloop, hashjoin et mergejoin pour la méthode, indexscan, indexonlyscan et tablescan pour l'accès, rows pour corriger une cardinalité, et blockname pour cibler un sous-bloc. Un hint ne s'applique qu'au bloc de requête où il est écrit : pour une sous-requête, il faut le placer dans son propre SELECT. Les hints stabilisent un plan connu comme bon, mais ils masquent souvent une cause plus profonde : statistiques périmées, prédicat non sargable, paramètre de coût irréaliste. La bonne séquence est donc de corriger les statistiques et la requête, puis d'utiliser un hint en dernier recours. Pour ne pas modifier le code applicatif, la fonction SQL Patch permet d'attacher des hints à une requête identifiée par son texte ou son empreinte. Il faut alors documenter le patch, le réviser après chaque montée de version et prévoir sa suppression quand la cause est corrigée.",
+      "bullets": [
+        "Un hint est un commentaire /*+ ... */ après SELECT",
+        "Il ne s'applique qu'au bloc de requête où il est placé",
+        "Corriger stats et requête avant de forcer un plan",
+        "Un patch doit être documenté, révisé et un jour supprimé"
+      ],
+      "code": [
+        "SELECT /*+ leading(o c) hashjoin(o c) */ c.name, count(*)",
+        "FROM orders o JOIN customers c ON c.id = o.customer_id",
+        "GROUP BY c.name;",
+        "SELECT /*+ indexscan(orders idx_orders_created) */ *",
+        "FROM orders WHERE created_at >= '2026-01-01';",
+        "SELECT /*+ rows(o c *10) */ * FROM orders o JOIN customers c ON c.id = o.customer_id;"
+      ],
+      "table": {
+        "headers": [
+          "Hint",
+          "Effet",
+          "Quand l'utiliser"
+        ],
+        "rows": [
+          [
+            "leading(o c)",
+            "ordre de jointure",
+            "corriger un ordre manifestement mauvais"
+          ],
+          [
+            "hashjoin(o c)",
+            "force Hash Join",
+            "Nested Loop à tort sur gros volumes"
+          ],
+          [
+            "indexscan(t idx)",
+            "force un index précis",
+            "index connu comme optimal"
+          ],
+          [
+            "rows(t #1000)",
+            "corrige la cardinalité",
+            "estimation très fausse"
+          ],
+          [
+            "blockname(tt)",
+            "nomme un sous-bloc",
+            "cibler une sous-requête"
+          ]
+        ]
+      },
+      "tip": "Un hint qui améliore aujourd'hui peut dégrader demain : la distribution des données change. Traitez-le comme une dette technique avec une date de revue, pas comme une correction définitive."
+    },
+    {
+      "heading": "Partitionnement et partition pruning",
+      "body": "Le partitionnement découpe une grande table en morceaux selon une clé : RANGE pour les dates, LIST pour les catégories, HASH pour répartir uniformément. L'intérêt principal est le partition pruning : le planificateur élimine les partitions dont les bornes ne peuvent pas satisfaire le WHERE. Une requête sur janvier ne lit que la partition de janvier, ce qui réduit les I/O et accélère les index. Le pruning statique se fait à la planification quand les constantes sont connues ; le pruning dynamique intervient à l'exécution quand la valeur vient d'un paramètre ou d'une jointure. Attention aux fonctions sur la colonne de partitionnement, comme WHERE to_char(ts,'YYYY-MM') = ..., qui empêchent le pruning. Les index locaux sont plus faciles à maintenir ; les index globaux évitent de scanner chaque partition mais coûtent davantage en écriture. La gestion courante utilise ADD, DROP et EXCHANGE PARTITION : supprimer une partition est instantané comparé à un DELETE massif, et EXCHANGE permute une table avec une partition pour charger des données.",
+      "bullets": [
+        "RANGE pour le temps, LIST pour les catégories, HASH pour répartir",
+        "Le pruning élimine les partitions incompatibles avec le WHERE",
+        "Pruning statique à la planification, dynamique à l'exécution",
+        "DROP PARTITION est instantané ; EXCHANGE charge sans réécriture"
+      ],
+      "code": [
+        "CREATE TABLE orders (",
+        "  id bigint, created_at date, amount numeric",
+        ") PARTITION BY RANGE (created_at) (",
+        "  PARTITION p2025 VALUES LESS THAN ('2026-01-01'),",
+        "  PARTITION p2026 VALUES LESS THAN ('2027-01-01')",
+        ");",
+        "EXPLAIN SELECT * FROM orders WHERE created_at >= '2026-03-01';",
+        "ALTER TABLE orders DROP PARTITION p2025;"
+      ],
+      "diagram": "Requête : WHERE created_at >= '2026-03-01'\n\n orders\n   |- p2025  [2025-01 .. 2026-01)  <- éliminée\n   |- p2026  [2026-01 .. 2027-01)  <- scannée\n\nLe plan ne montre que p2026 : pruning statique",
+      "exercises": [
+        {
+          "prompt": "Une table orders est partitionnée par RANGE sur created_at. La requête SELECT * FROM orders WHERE to_char(created_at,'YYYY-MM') = '2026-03' met huit secondes. Réécrivez le prédicat et expliquez l'effet sur le plan.",
+          "correction": "Le prédicat doit devenir une plage sur la colonne brute : WHERE created_at >= DATE '2026-03-01' AND created_at < DATE '2026-04-01'. Ainsi, le planificateur compare les bornes des partitions à des constantes et élimine toutes les partitions hors mars 2026 : c'est le pruning statique. Avec to_char(created_at,...), la colonne est transformée par une fonction : le moteur ne peut pas déduire quelles partitions sont concernées et scanne toutes les partitions, en plus de rendre le prédicat non sargable pour un éventuel index. Vérifiez avec EXPLAIN que seules les partitions attendues apparaissent. Si la valeur de date vient d'un paramètre, le pruning peut être dynamique à l'exécution ; le principe de la plage reste le même."
+        }
+      ],
+      "tip": "Piège d'examen : le partition pruning ne s'applique pas si la colonne de partitionnement est enveloppée dans une fonction ou un cast implicite. Une plage de dates explicite est presque toujours préférable."
+    },
+    {
+      "heading": "SQL analytique : fenêtres, CTE et agrégats multi-niveaux",
+      "body": "Le SQL analytique répond à des questions de classement et de cumul sans sortir les données de la base. Les fonctions de fenêtre calculent sur un sous-ensemble défini par OVER (PARTITION BY ... ORDER BY ...) sans réduire le nombre de lignes, contrairement à GROUP BY. row_number numérote, rank laisse des trous après ex æquo, dense_rank n'en laisse pas ; lag et lead accèdent aux lignes voisines, parfait pour les deltas. La clause de frame (ROWS BETWEEN ...) précise si l'on cumule depuis le début ou sur une fenêtre glissante. Les CTE (WITH) nomment un résultat réutilisable et clarifient les requêtes complexes ; une CTE récursive parcourt une hiérarchie. GROUPING SETS, ROLLUP et CUBE produisent plusieurs niveaux d'agrégat en un seul passage, avec GROUPING pour distinguer un vrai zéro d'un sous-total NULL. Le piège classique est d'utiliser une fonction de fenêtre sans ORDER BY : le résultat n'est alors pas déterministe.",
+      "bullets": [
+        "Window ne réduit pas les lignes ; GROUP BY si",
+        "row_number, rank et dense_rank diffèrent sur les ex æquo",
+        "LAG/LEAD donnent accès aux lignes voisines",
+        "GROUPING SETS produit plusieurs niveaux en un passage"
+      ],
+      "code": [
+        "SELECT customer_id, amount,",
+        "       row_number() OVER (PARTITION BY customer_id ORDER BY amount DESC) AS rn,",
+        "       sum(amount) OVER (PARTITION BY customer_id ORDER BY created_at",
+        "                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total",
+        "FROM orders;",
+        "WITH recent AS (SELECT * FROM orders WHERE created_at >= '2026-01-01')",
+        "SELECT customer_id, count(*) FROM recent GROUP BY customer_id;",
+        "SELECT region, product, sum(amount)",
+        "FROM sales GROUP BY GROUPING SETS ((region, product), (region), ());"
+      ],
+      "table": {
+        "headers": [
+          "Fonction",
+          "Résultat",
+          "Usage"
+        ],
+        "rows": [
+          [
+            "row_number()",
+            "numéro unique",
+            "top-N par groupe"
+          ],
+          [
+            "rank()",
+            "rangs avec trous",
+            "classements sportifs"
+          ],
+          [
+            "dense_rank()",
+            "rangs sans trous",
+            "niveaux distincts"
+          ],
+          [
+            "lag() / lead()",
+            "ligne précédente / suivante",
+            "delta, variation"
+          ],
+          [
+            "sum() OVER",
+            "cumul",
+            "running total"
+          ]
+        ]
+      },
+      "tip": "Une fenêtre sans ORDER BY rend row_number non déterministe : deux exécutions peuvent attribuer des numéros différents. Ajoutez toujours une clé de tri stable, idéalement unique, pour garantir la reproductibilité."
+    },
+    {
+      "heading": "Méthode de revue et réécritures SQL",
+      "body": "Une revue de performance se conduit comme une enquête. On part de la requête et de son plan réel, pas d'intuitions. EXPLAIN ANALYZE fournit les lignes réelles, le temps par nœud, les boucles et les buffers ; on repère le nœud qui domine le temps total et l'écart entre lignes estimées et réelles. Un écart supérieur à un facteur dix oriente vers les statistiques ou la corrélation. Un nombre de boucles énorme signale un Nested Loop mal placé. Des blocs temporaires ou un tri sur disque révèlent un work_mem trop faible. Vient ensuite la réécriture : rendre les prédicats sargables, sans fonction sur la colonne ; remplacer NOT IN par NOT EXISTS quand des NULL sont possibles ; éviter SELECT * ; paginer par keyset plutôt que par OFFSET élevé ; remplacer UNION par UNION ALL quand la déduplication est inutile ; regrouper les appels N+1 en une jointure. On mesure après chaque changement, un seul à la fois, et on vérifie que le plan reste stable avec les paramètres réels.",
+      "bullets": [
+        "Lire le plan réel et trouver le nœud dominant",
+        "Comparer lignes estimées et réelles pour détecter les stats périmées",
+        "Réécrire les prédicats non sargables et les NOT IN dangereux",
+        "Mesurer un changement à la fois, avec les vrais paramètres"
+      ],
+      "code": [
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)",
+        "SELECT * FROM orders WHERE status <> 'cancelled';",
+        "-- Réécriture sargable",
+        "SELECT id, amount FROM orders",
+        "WHERE created_at >= DATE '2026-01-01'",
+        "  AND created_at <  DATE '2026-02-01';",
+        "-- Pagination keyset au lieu de OFFSET 100000",
+        "SELECT id, amount FROM orders",
+        "WHERE (created_at, id) > (:last_date, :last_id)",
+        "ORDER BY created_at, id LIMIT 50;"
+      ],
+      "table": {
+        "headers": [
+          "Symptôme dans le plan",
+          "Cause probable",
+          "Action"
+        ],
+        "rows": [
+          [
+            "estimated 100, actual 100000",
+            "statistiques périmées",
+            "ANALYZE, cible plus haute"
+          ],
+          [
+            "Nested Loop loops=500000",
+            "mauvais ordre ou index manquant",
+            "index, leading, hash join"
+          ],
+          [
+            "Sort external, temp blocks",
+            "work_mem trop faible",
+            "augmenter work_mem ou index"
+          ],
+          [
+            "Seq Scan sur filtre sélectif",
+            "prédicat non sargable",
+            "réécrire sans fonction"
+          ],
+          [
+            "Rows Removed by Filter élevé",
+            "index peu sélectif",
+            "index composite ou bitmap"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "La requête SELECT * FROM orders WHERE customer_id NOT IN (SELECT customer_id FROM blacklist) est lente et renvoie zéro ligne alors que la table blacklist est vide. Expliquez et corrigez.",
+          "correction": "NOT IN se comporte comme une conjonction de comparaisons avec chaque valeur ; si la sous-requête contient un NULL, chaque comparaison devient NULL et le résultat global n'est jamais vrai. Une table blacklist vide ne devrait pas produire ce comportement, mais une seule ligne dont customer_id est NULL suffit à faire disparaître toutes les lignes. Le plan peut en outre devenir un Anti Join peu efficace. Réécrivez avec NOT EXISTS (SELECT 1 FROM blacklist b WHERE b.customer_id = o.customer_id), qui traite correctement les NULL et s'arrête à la première correspondance. Vérifiez avec EXPLAIN que le plan utilise un Anti Join ou un index sur blacklist(customer_id). Ajoutez éventuellement une contrainte NOT NULL sur la colonne pour rendre l'intention explicite."
+        }
+      ],
+      "tip": "Un plan peut être excellent pour une valeur et désastreux pour une autre : c'est le plan sensible aux paramètres. Testez avec les valeurs réelles, pas seulement avec une constante choisie au hasard."
+    }
+  ],
+  "key_points": [
+    "Le planificateur choisit le chemin de coût minimal, pas le plus intuitif",
+    "Les statistiques (MCV, histogrammes, n_distinct) déterminent les cardinalités",
+    "random_page_cost et effective_cache_size doivent refléter le matériel",
+    "Un index est un compromis : lecture accélérée, écritures ralenties",
+    "Nested Loop brille avec un index, Hash Join avec work_mem, Merge Join avec l'ordre",
+    "Les hints stabilisent un plan mais ne corrigent pas une cause profonde",
+    "Le partition pruning exige des prédicats sur la colonne brute",
+    "Les fonctions de fenêtre ne réduisent pas le nombre de lignes"
+  ],
+  "traps": [
+    "EXPLAIN ANALYZE exécute la requête : attention aux UPDATE et DELETE",
+    "Un hint ne s'applique pas aux sous-requêtes s'il est placé dans la requête externe",
+    "NOT IN avec un NULL peut renvoyer zéro ligne, contrairement à NOT EXISTS",
+    "Un index n'est pas utilisé si la colonne est enveloppée dans une fonction",
+    "Le partition pruning est perdu avec to_char() ou un cast implicite sur la clé"
+  ],
+  "quiz": [
+    {
+      "id": "hcie-og-02-q01",
+      "type": "single",
+      "prompt": "Which hint syntax forces an index scan on a given index in openGauss?",
+      "options": [
+        "/*+ IndexScan(t idx_name) */",
+        "/*+ FORCE INDEX(idx_name) */",
+        "USE INDEX (idx_name)",
+        "/*+ NO_SEQ_SCAN */"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "openGauss utilise des hints en commentaire /*+ ... */ placés après SELECT ; IndexScan(table alias, index) impose l'index indiqué. FORCE INDEX et USE INDEX sont des syntaxes MySQL, pas openGauss. NO_SEQ_SCAN n'existe pas comme hint standard et n'indique pas quel index utiliser. Un hint d'accès ne s'applique qu'à la table ou à l'alias cité.",
+      "topic": "plan hints"
+    },
+    {
+      "id": "hcie-og-02-q02",
+      "type": "single",
+      "prompt": "Which mechanism eliminates partitions that cannot satisfy a range predicate?",
+      "options": [
+        "Index-only scan",
+        "Partition pruning at plan or execution time",
+        "VACUUM FULL",
+        "Hash aggregation"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le partition pruning compare les bornes des partitions au prédicat et ne conserve que les partitions utiles ; il peut être statique à la planification ou dynamique à l'exécution. VACUUM FULL réorganise le stockage et n'a aucun effet sur le choix des partitions. Hash aggregation concerne le regroupement, pas le découpage. Index-only scan évite le heap mais ne supprime pas les partitions.",
+      "topic": "partition pruning"
+    },
+    {
+      "id": "hcie-og-02-q03",
+      "type": "single",
+      "prompt": "Which window function returns the value of the previous row in the current window?",
+      "options": [
+        "RANK",
+        "NTILE",
+        "LAG",
+        "LEAD"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "LAG(col, 1) renvoie la valeur de la ligne précédente selon l'ORDER BY de la fenêtre, ce qui permet de calculer un delta. LEAD renvoie la ligne suivante, pas la précédente. RANK attribue un rang avec des trous après les ex æquo. NTILE répartit les lignes en buckets. LAG et LEAD nécessitent un ORDER BY déterministe pour être fiables.",
+      "topic": "window functions"
+    },
+    {
+      "id": "hcie-og-02-q04",
+      "type": "multi",
+      "prompt": "Which elements directly influence the planner's cardinality or cost estimates? (Choose 3)",
+      "options": [
+        "Per-column statistics target",
+        "effective_cache_size",
+        "The number of client connections",
+        "Refreshed statistics from ANALYZE"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "ANALYZE rafraîchit les histogrammes, MCV et n_distinct, qui déterminent les cardinalités estimées. La cible de statistiques par colonne règle la finesse de cet échantillon. effective_cache_size indique au planificateur la part de cache disponible et modifie le coût des accès. Le nombre de connexions clientes n'entre pas dans le modèle de coût d'une requête, même s'il peut affecter la charge globale.",
+      "topic": "statistics and cost"
+    },
+    {
+      "id": "hcie-og-02-q05",
+      "type": "multi",
+      "prompt": "Which rewrites usually make a slow query more efficient? (Choose 2)",
+      "options": [
+        "Make predicates sargable by removing functions from the column",
+        "Replace NOT IN with NOT EXISTS when NULLs are possible",
+        "Add SELECT * to every query",
+        "Split one query into an N+1 loop"
+      ],
+      "answer": [
+        0,
+        1
+      ],
+      "explanation_fr": "Un prédicat sargable sur la colonne brute permet l'utilisation d'un index et améliore les estimations. NOT EXISTS gère correctement les NULL et peut s'arrêter à la première correspondance, contrairement à NOT IN piégé par NULL. SELECT * transporte des colonnes inutiles et peut empêcher un index-only scan. Une boucle N+1 multiplie les allers-retours réseau et aggrave la latence.",
+      "topic": "query rewrite"
+    },
+    {
+      "id": "hcie-og-02-q06",
+      "type": "tf",
+      "prompt": "Nested Loop join is generally the best choice for two large unsorted tables without usable indexes.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Sans index sur l'entrée interne, Nested Loop rescane cette entrée pour chaque ligne de l'externe, ce qui produit un coût quadratique. Pour deux grandes tables non triées, Hash Join est généralement préférable s'il y a égalité et assez de work_mem. Merge Join peut convenir si les entrées peuvent être triées efficacement. Nested Loop reste excellent quand l'externe est petite et l'interne indexée.",
+      "topic": "join algorithms"
+    },
+    {
+      "id": "hcie-og-02-q07",
+      "type": "tf",
+      "prompt": "GROUPING SETS can compute aggregates at several grouping levels in a single statement.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "GROUPING SETS énumère plusieurs ensembles de regroupement, par exemple (region, product), (region) et (), et produit les sous-totaux correspondants en un seul passage. C'est plus efficace et plus lisible que plusieurs requêtes réunies par UNION ALL. ROLLUP et CUBE sont des raccourcis pour des ensembles hiérarchiques ou tous les sous-ensembles. La fonction GROUPING distingue un sous-total d'une valeur NULL réelle.",
+      "topic": "grouping sets"
+    },
+    {
+      "id": "hcie-og-02-q08",
+      "type": "text",
+      "prompt": "Write the hint that forces a hash join between table aliases a and b.",
+      "accept": [
+        "/*+ HashJoin(a b) */",
+        "/*+ hashjoin(a b) */",
+        "/*+ HashJoin(b a) */"
+      ],
+      "sample_answer": "/*+ HashJoin(a b) */",
+      "explanation_fr": "Le hint s'écrit dans un commentaire spécial après SELECT : /*+ HashJoin(a b) */. Les alias doivent correspondre à ceux de la requête, et l'ordre n'a pas d'importance. Il ne s'applique qu'au bloc de requête où il figure. Un hint ne dispense pas de vérifier les statistiques et la mémoire disponible.",
+      "topic": "join hint"
+    },
+    {
+      "id": "hcie-og-02-q09",
+      "type": "text",
+      "prompt": "Which SQL keyword introduces a named, reusable subquery in openGauss?",
+      "accept": [
+        "WITH"
+      ],
+      "sample_answer": "WITH",
+      "explanation_fr": "WITH définit une CTE (common table expression) nommée, réutilisable dans la requête principale. Elle peut être non récursive ou récursive avec WITH RECURSIVE. Une CTE améliore la lisibilité et peut être matérialisée ou repliée selon le plan. Elle ne remplace pas un index : sa performance dépend de la façon dont le planificateur l'intègre.",
+      "topic": "CTE"
+    },
+    {
+      "id": "hcie-og-02-q10",
+      "type": "single",
+      "prompt": "Which join algorithm is usually best for a small outer input and an indexed inner input?",
+      "options": [
+        "Hash Join",
+        "Merge Join",
+        "Bitmap Heap Scan",
+        "Nested Loop"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Nested Loop parcourt la petite entrée externe et effectue une recherche indexée peu coûteuse pour chaque ligne, ce qui donne un coût proportionnel au nombre de lignes externes. Hash Join construit une table de hachage et convient mieux aux gros volumes non triés. Merge Join exige des entrées triées ou des index ordonnés. Bitmap Heap Scan est un chemin d'accès, pas un algorithme de jointure.",
+      "topic": "nested loop"
+    },
+    {
+      "id": "hcie-og-02-q11",
+      "type": "single",
+      "prompt": "What happens when a Hash Join build side exceeds work_mem?",
+      "options": [
+        "It spills to temporary files, increasing I/O",
+        "It silently switches to a Merge Join",
+        "It returns incorrect results",
+        "It cancels the query with an error"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le côté build est partitionné et écrit dans des fichiers temporaires lorsque work_mem est dépassé, puis relu : le résultat reste correct mais les I/O augmentent fortement. Le planificateur ne bascule pas silencieusement vers un autre algorithme en cours d'exécution. Les résultats ne sont pas faux. La requête n'est pas annulée, sauf dépassement d'un autre garde-fou comme l'espace temporaire.",
+      "topic": "hash join memory"
+    },
+    {
+      "id": "hcie-og-02-q12",
+      "type": "single",
+      "prompt": "What does EXPLAIN ANALYZE add compared with plain EXPLAIN?",
+      "options": [
+        "It rewrites the query into a CTE",
+        "It executes the statement and reports actual rows, loops and timing",
+        "It only formats the plan as JSON",
+        "It creates missing indexes automatically"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "EXPLAIN ANALYZE exécute réellement la requête et ajoute les lignes réelles, le temps par nœud, les boucles et éventuellement les buffers. EXPLAIN seul se contente d'afficher le plan estimé sans exécuter. Le format JSON s'obtient avec FORMAT JSON, indépendamment d'ANALYZE. Aucun outil ne crée automatiquement les index ni ne réécrit la requête en CTE.",
+      "topic": "explain analyze"
+    },
+    {
+      "id": "hcie-og-02-q13",
+      "type": "single",
+      "prompt": "A plan estimates 100 rows but the actual count is 500000. What is the first corrective action?",
+      "options": [
+        "Disable hash joins globally",
+        "Add an index on every column",
+        "Refresh statistics with ANALYZE and inspect pg_stats",
+        "Increase work_mem immediately"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Un écart de plusieurs ordres de grandeur indique d'abord des statistiques périmées ou une corrélation mal modélisée : ANALYZE et l'inspection de pg_stats sont le point de départ. Augmenter work_mem ne corrige pas une cardinalité fausse et peut masquer le problème. Désactiver globalement les hash joins dégrade les autres requêtes. Indexer toutes les colonnes ralentit les écritures sans garantir de meilleures estimations.",
+      "topic": "cardinality estimation"
+    },
+    {
+      "id": "hcie-og-02-q14",
+      "type": "single",
+      "prompt": "A Bitmap Heap Scan is most appropriate when the query reads what fraction of a table?",
+      "options": [
+        "Always 100 percent",
+        "Only one single row",
+        "Never; it is obsolete",
+        "A moderate fraction, roughly 1 to 10 percent"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Le Bitmap Scan est un compromis : il collecte les pages concernées puis les lit en ordre physique, ce qui convient à une sélectivité moyenne ou à la combinaison de plusieurs index. Pour une seule ligne, un Index Scan classique est plus direct. Pour la table entière, un Seq Scan évite le surcoût de la bitmap. Ce chemin n'est pas obsolète : le planificateur le choisit régulièrement.",
+      "topic": "bitmap scan"
+    },
+    {
+      "id": "hcie-og-02-q15",
+      "type": "single",
+      "prompt": "Which condition is required for an Index Only Scan to avoid heap access?",
+      "options": [
+        "All referenced columns are in the index and page visibility is known",
+        "The table has no primary key",
+        "work_mem is larger than the table",
+        "The query uses ORDER BY"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "L'Index Only Scan ne peut éviter le heap que si l'index couvre toutes les colonnes lues et si la visibilité des pages est suffisamment connue, grâce à la carte de visibilité entretenue par VACUUM. L'absence de clé primaire n'aide pas. work_mem concerne les tris et hachages, pas la couverture d'un index. ORDER BY peut être satisfait par un index mais ne garantit pas un Index Only Scan.",
+      "topic": "index only scan"
+    },
+    {
+      "id": "hcie-og-02-q16",
+      "type": "multi",
+      "prompt": "Which conditions commonly prevent the use of an index on a column? (Choose 3)",
+      "options": [
+        "A leading wildcard LIKE '%text'",
+        "An equality predicate with a constant",
+        "A function applied to the column in the predicate",
+        "An implicit type cast on the column"
+      ],
+      "answer": [
+        0,
+        2,
+        3
+      ],
+      "explanation_fr": "Une fonction sur la colonne empêche l'utilisation directe de l'index, sauf index sur expression. Un cast implicite peut changer le type comparé et rendre l'index inutilisable. Un LIKE commençant par un joker ne peut pas utiliser un B-tree classique pour localiser le début de la chaîne. Une égalité avec une constante est au contraire le cas idéal d'utilisation d'un index.",
+      "topic": "sargability"
+    },
+    {
+      "id": "hcie-og-02-q17",
+      "type": "multi",
+      "prompt": "Which statements about window functions are correct? (Choose 2)",
+      "options": [
+        "They cannot be combined with PARTITION BY",
+        "They preserve the number of input rows",
+        "They require an ORDER BY for deterministic ranking",
+        "They always collapse rows like GROUP BY"
+      ],
+      "answer": [
+        1,
+        2
+      ],
+      "explanation_fr": "Une fonction de fenêtre ajoute une valeur calculée à chaque ligne sans regrouper les lignes, contrairement à GROUP BY. Pour row_number, rank ou lag, un ORDER BY déterministe est indispensable, sinon l'ordre et donc le résultat varient. PARTITION BY est justement la clause qui découpe la fenêtre. Les fonctions de fenêtre ne réduisent pas les lignes.",
+      "topic": "window functions"
+    },
+    {
+      "id": "hcie-og-02-q18",
+      "type": "tf",
+      "prompt": "Partition pruning can occur at execution time when the filtering value comes from a parameter.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le pruning dynamique intervient à l'exécution lorsque la valeur n'est pas connue à la planification, par exemple avec un paramètre ou une jointure. Le moteur détermine alors les partitions à lire au moment de l'exécution. Le pruning statique reste utilisé pour les constantes connues. Les deux mécanismes peuvent se combiner dans un même plan.",
+      "topic": "runtime pruning"
+    },
+    {
+      "id": "hcie-og-02-q19",
+      "type": "text",
+      "prompt": "Which keyword added to EXPLAIN makes the statement actually run and report real row counts and timing (one word)?",
+      "accept": [
+        "ANALYZE",
+        "analyse"
+      ],
+      "sample_answer": "ANALYZE",
+      "explanation_fr": "EXPLAIN ANALYZE exécute la requête et ajoute les mesures réelles : lignes, temps, boucles et buffers. Sans ANALYZE, le plan reste une estimation et n'exécute rien. Sur une requête d'écriture, encadrez l'essai par BEGIN et ROLLBACK pour ne pas modifier les données. Le mot-clé VERBOSE ajoute des détails mais n'exécute pas à lui seul.",
+      "topic": "explain"
+    },
+    {
+      "id": "hcie-og-02-q20",
+      "type": "single",
+      "prompt": "What is the main purpose of a SQL Patch in openGauss?",
+      "options": [
+        "Compress the result set",
+        "Attach plan hints to a statement without editing application SQL",
+        "Encrypt the statement before execution",
+        "Replace missing indexes automatically"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un SQL Patch associe des hints à une requête identifiée, sans modifier le code de l'application : utile pour stabiliser un plan en production. Il ne chiffre pas la requête, ne crée pas d'index et ne compresse pas les résultats. Comme tout hint, il doit être documenté et révisé, car il peut devenir inadapté après un changement de distribution ou de version.",
+      "topic": "sql patch"
+    }
+  ]
+}

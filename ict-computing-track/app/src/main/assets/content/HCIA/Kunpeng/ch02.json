@@ -1,0 +1,554 @@
+{
+  "id": "hcia-kp-02",
+  "phase": "HCIA",
+  "subject": "Kunpeng",
+  "number": 2,
+  "title_fr": "Portage d'applications vers ARM64",
+  "title_en": "Application Porting to ARM64",
+  "minutes": 40,
+  "source": "HCIA-Kunpeng Application Developer V2.0 — Chapitre 2 «Porting Kunpeng Applications» · Lab Guide (migration)",
+  "objectives": [
+    "Identifier les sources d'incompatibilité entre x86-64 et ARM64",
+    "Distinguer les applications compilées des applications interprétées",
+    "Utiliser une chaîne de compilation native ou croisée pour aarch64",
+    "Corriger les erreurs classiques : char, options -m64, assembleur, SIMD, alignement",
+    "Valider une migration avec des tests fonctionnels et de performance"
+  ],
+  "sections": [
+    {
+      "heading": "Pourquoi un binaire x86 ne démarre pas sur ARM64",
+      "body": "Un programme compilé est une suite d'instructions en langage machine destinées à un processeur précis. Un binaire x86-64 contient des opcodes que seul un CPU x86 sait décoder ; un CPU ARM64 ne les comprend pas. Ce n'est pas une question de système d'exploitation ni de format de fichier : même si le fichier ELF est valide, le contenu des instructions est incompatible.\n\nL'ABI (Application Binary Interface) ajoute une deuxième couche de différence. Elle définit la convention d'appel des fonctions, la place des arguments dans les registres, la taille de certains types et l'alignement des structures. ARM64 Linux suit globalement le modèle LP64, comme x86-64 Linux, mais certains détails changent : par exemple, le type `char` est non signé par défaut sur ARM64 alors qu'il est signé sur x86. Une hypothèse implicite du code peut donc produire un comportement différent sans erreur de compilation.\n\nLes applications interprétées échappent à cette contrainte : le bytecode Java ou le code Python n'est pas exécuté directement par le CPU. C'est la machine virtuelle ou l'interpréteur, lui-même compilé pour ARM64, qui fait le travail. En revanche, les bibliothèques natives chargées par ces applications restent des binaires dépendants de l'architecture.",
+      "bullets": [
+        "Le code machine x86-64 n'est pas décodable par un CPU ARM64",
+        "L'ABI fixe les conventions d'appel, les tailles et les alignements",
+        "Sur ARM64, `char` est non signé par défaut (sauf option contraire)",
+        "Le bytecode est portable, mais les bibliothèques natives ne le sont pas"
+      ],
+      "code": [
+        "# Identifier l'architecture d'un binaire\nfile ./mon_application\nreadelf -h ./mon_application | grep Machine\n\n# Exemple de sortie x86 : Advanced Micro Devices X86-64\n# Exemple de sortie ARM : AArch64"
+      ],
+      "table": {
+        "headers": [
+          "Type d'application",
+          "Portage vers ARM64"
+        ],
+        "rows": [
+          [
+            "C/C++ compilé",
+            "Recompilation et correction du code"
+          ],
+          [
+            "Java pur (sans JNI)",
+            "Aucune recompilation du bytecode, JDK ARM64 requis"
+          ],
+          [
+            "Java avec bibliothèques natives",
+            "Recompiler les .so puis repackager le JAR"
+          ],
+          [
+            "Python avec extensions C",
+            "Recompiler les wheels ou utiliser des wheels aarch64"
+          ],
+          [
+            "Binaire sans source",
+            "Traduction dynamique avec ExaGear"
+          ]
+        ]
+      },
+      "tip": "Un fichier ELF valide ne garantit pas qu'il s'exécute : le champ « Machine » de l'en-tête ELF doit correspondre à l'architecture du CPU. Vérifiez-le avec `file` ou `readelf -h`."
+    },
+    {
+      "heading": "La méthode de migration en cinq phases",
+      "body": "Une migration réussie est un projet, pas une simple commande `make`. La démarche recommandée commence par l'évaluation : recenser les applications, leurs dépendances, les bibliothèques natives, les versions de runtime et les contraintes de performance. Cette phase produit une cartographie précise et une estimation de l'effort. Elle évite les mauvaises surprises, comme découvrir en production qu'un pilote propriétaire n'existe pas en ARM64.\n\nLa deuxième phase prépare l'environnement : serveur TaiShan ou cloud Kunpeng, openEuler, compilateurs, JDK, bases de données et outils DevKit. La troisième phase porte le code : recompilation, correction des erreurs, reconstruction des paquets et des images. La quatrième phase valide le fonctionnement et les performances par rapport à une référence x86. La cinquième phase optimise, documente et industrialise le déploiement.\n\nPorting Advisor automatise une partie de l'analyse : il évalue les paquets sans source, analyse les paquets source et propose des corrections, puis reconstruit des paquets x86 en paquets Kunpeng. Pour les logiciels sans code source, ExaGear peut traduire les instructions à l'exécution. Le choix entre portage natif et traduction dépend de la criticité et de la sensibilité à la performance.",
+      "bullets": [
+        "Cinq phases : évaluation, environnement, portage, validation, optimisation",
+        "L'évaluation couvre le code, les dépendances et les contraintes de performance",
+        "Porting Advisor : évaluation, analyse source et reconstruction de paquets",
+        "ExaGear est réservé aux binaires sans source ou aux charges peu sensibles"
+      ],
+      "code": [
+        "# Exemple de scan d'un paquet source avec l'outil de migration\nporting-advisor --help\n\n# Vérifier les dépendances dynamiques d'un binaire\nldd ./mon_application\nobjdump -p ./mon_application | grep NEEDED"
+      ],
+      "diagram": " 1. Evaluation          2. Environnement       3. Portage\n+----------------+     +----------------+     +----------------+\n| inventaire     | --> | TaiShan / cloud| --> | recompilation  |\n| dependances    |     | openEuler      |     | corrections    |\n| criticite      |     | JDK, GCC       |     | paquets/images |\n+----------------+     +----------------+     +----------------+\n                                                   |\n 5. Optimisation       4. Validation               v\n+----------------+     +----------------+     +----------------+\n| tuning         | <-- | tests fonction.| <-- | build aarch64  |\n| industrialisation|   | perf vs x86    |     | tests unitaires|\n+----------------+     +----------------+     +----------------+",
+      "tip": "L'ordre des phases est une question d'examen récurrente. On évalue avant de compiler, on valide avant d'optimiser, et on n'optimise jamais une application dont le comportement fonctionnel n'est pas prouvé."
+    },
+    {
+      "heading": "Compiler pour ARM64 : natif et croisé",
+      "body": "Deux approches coexistent. La compilation native s'effectue directement sur une machine Kunpeng : le compilateur, les bibliothèques et l'application ciblent la même architecture. C'est la méthode la plus fiable, car les tests s'exécutent immédiatement sur le matériel final. Sur openEuler, `gcc` produit par défaut du code aarch64.\n\nLa compilation croisée s'effectue depuis une machine x86 avec un compilateur dédié, par exemple `aarch64-linux-gnu-gcc`. Le préfixe indique la cible ; il faut aussi fournir un sysroot contenant les en-têtes et bibliothèques ARM64, sinon l'éditeur de liens cherchera des bibliothèques x86. Les projets CMake utilisent un fichier toolchain qui fixe le compilateur, le sysroot et l'architecture. Les projets conteneurisés peuvent utiliser `docker buildx` avec la plateforme `linux/arm64`.\n\nLes options comptent autant que le compilateur. `-march=armv8-a` cible le socle ARMv8-A, tandis que `-march=native` exploite les extensions du CPU local mais produit un binaire moins portable. `-mabi=lp64` remplace l'option x86 `-m64`. Enfin, `-fsigned-char` rétablit le comportement signé de `char` attendu par certains codes anciens.",
+      "bullets": [
+        "Compilation native : plus simple à valider, exécution sur le matériel cible",
+        "Compilation croisée : préfixe `aarch64-linux-gnu-` et sysroot ARM64 obligatoire",
+        "CMake : fichier toolchain ; Docker : `buildx --platform linux/arm64`",
+        "`-mabi=lp64` remplace `-m64` ; `-fsigned-char` corrige le signe de char"
+      ],
+      "code": [
+        "# Compilation native sur un serveur Kunpeng\ngcc -O2 -march=armv8-a -Wall main.c -o app\n\n# Compilation croisée depuis x86\n# (le sysroot doit contenir les libs aarch64)\naarch64-linux-gnu-gcc -O2 -march=armv8-a \\\n  --sysroot=/opt/aarch64-sysroot main.c -o app\n\n# Vérifier le résultat\nfile app\nreadelf -h app | grep Machine"
+      ],
+      "exercises": [
+        {
+          "prompt": "Écrivez une commande de compilation croisée qui transforme `libcalcul.c` en bibliothèque partagée `libcalcul.so` pour ARM64, avec optimisations et symbols exportables.",
+          "correction": "`aarch64-linux-gnu-gcc -O2 -fPIC -shared -march=armv8-a libcalcul.c -o libcalcul.so`. `-fPIC` produit du code position-independent, indispensable pour une bibliothèque partagée ; `-shared` demande à l'éditeur de liens de créer un .so ; `-march=armv8-a` cible le socle ARMv8-A. Vérifiez ensuite avec `file libcalcul.so` que l'architecture est bien AArch64."
+        }
+      ],
+      "tip": "`-m64` est une option x86 : elle n'a pas de sens sur ARM64 et peut provoquer une erreur. L'équivalent fonctionnel est `-mabi=lp64`, à ne pas confondre avec `-march` qui choisit le niveau du jeu d'instructions."
+    },
+    {
+      "heading": "Les pièges classiques du code C/C++",
+      "body": "La majorité des erreurs de portage ne viennent pas du compilateur mais d'hypothèses implicites du code. Le signe de `char` est le premier piège : sur ARM64, `char` est non signé par défaut. Un test `if (c < 0)` ou une conversion vers un entier peut changer de résultat. La correction consiste à écrire explicitement `signed char` ou à compiler avec `-fsigned-char`.\n\nL'assembleur en ligne et les intrinsics SIMD sont fortement liés au jeu d'instructions. Les instructions SSE/AVX et les en-têtes comme `<immintrin.h>` n'existent pas sur ARM ; il faut les remplacer par des intrinsics NEON (`<arm_neon.h>`) ou par du code C portable. Les opérations atomiques constituent un autre piège : les instructions ARM64 `ldaxr` et `stlxr` exigent des adresses alignées sur la taille de la variable. Une structure compactée avec `#pragma pack` peut donc provoquer une exception et un coredump.\n\nEnfin, la conversion d'un `double` hors plage vers un entier ne suit pas les mêmes règles : x86 produit une valeur indéfinie, ARM64 sature à la valeur maximale ou minimale représentable. Un code qui compte sur le comportement x86 doit être rendu explicite, par exemple avec des bornes avant conversion.",
+      "bullets": [
+        "`char` non signé par défaut sur ARM64 : utiliser `signed char` ou `-fsigned-char`",
+        "Remplacer SSE/AVX par NEON ou du C portable",
+        "`#pragma pack` peut désaligner les variables atomiques et provoquer un coredump",
+        "La conversion flottant vers entier sature sur ARM64 au lieu de produire une valeur indéfinie"
+      ],
+      "code": [
+        "# Forcer char signé lors de la compilation\ngcc -O2 -fsigned-char ancien_code.c -o app\n\n# Rechercher les zones à risque dans le code\ngrep -rn \"immintrin.h\\|__m128\\|_mm_\" src/\ngrep -rn \"#pragma pack\" src/\ngrep -rn \"asm *(\" src/"
+      ],
+      "table": {
+        "headers": [
+          "Symptôme",
+          "Cause probable",
+          "Correction"
+        ],
+        "rows": [
+          [
+            "Valeurs négatives incorrectes",
+            "`char` non signé sur ARM64",
+            "`signed char` ou `-fsigned-char`"
+          ],
+          [
+            "Erreur sur `-m64`",
+            "Option propre à x86",
+            "`-mabi=lp64`"
+          ],
+          [
+            "Coredump sur verrou",
+            "Variable atomique mal alignée",
+            "Retirer le pack ou réaligner"
+          ],
+          [
+            "Compilation SIMD impossible",
+            "Intrinsics SSE/AVX",
+            "Réécrire avec NEON"
+          ],
+          [
+            "Résultat différent en conversion",
+            "Saturation ARM64",
+            "Borner explicitement la valeur"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Ce code affiche 200 sur x86 mais -56 sur ARM64 : `char c = 200; printf(\"%d\", c);`. Expliquez et corrigez sans changer la valeur affectée.",
+          "correction": "Sur x86, `char` est signé : la valeur 200 dépasse 127 et son motif binaire est interprété comme -56. Sur ARM64, `char` est non signé, donc 200 reste 200. Pour obtenir le même comportement, déclarez `signed char c = 200;` ou compilez avec `-fsigned-char`. La bonne pratique est de choisir explicitement `signed char` ou `unsigned char` selon l'intention métier."
+        }
+      ],
+      "tip": "À l'examen, « le code compile mais le résultat change » pointe souvent vers le signe de char, l'alignement atomique ou la conversion flottant-entier. « Le code ne compile pas » pointe plutôt vers l'assembleur, les intrinsics ou une option x86."
+    },
+    {
+      "heading": "Java, Python et les dépendances natives",
+      "body": "Java est souvent présenté comme portable, ce qui est vrai au niveau du bytecode : un `.class` ou un `.jar` ne contient pas d'instructions x86. Il suffit d'un JVM ARM64, comme BiSheng JDK ou OpenJDK aarch64, pour l'exécuter. La nuance essentielle concerne les bibliothèques natives : si l'application utilise JNI pour appeler un `.so`, ce fichier est un binaire x86 et doit être recompilé pour ARM64 puis repackagé dans le JAR.\n\nMaven et Gradle compliquent parfois la situation. Un artefact peut contenir des classifieurs dépendant de l'architecture, et le dépôt local peut avoir mis en cache une version x86. Il faut forcer la résolution de la bonne variante, vérifier les dépendances transitives et reconstruire le package. Une erreur `UnsatisfiedLinkError` au démarrage est un symptôme classique d'un `.so` resté en x86.\n\nPython suit une logique comparable : l'interpréteur doit être ARM64, et les extensions C doivent être compilées ou installées sous forme de wheels aarch64. Sur ARM64, `pip` peut recompiler un paquet faute de wheel binaire, ce qui exige un compilateur et les en-têtes de développement. Les modules Node.js avec code natif, les gems Ruby et les bibliothèques Go en cgo sont soumis à la même règle.",
+      "bullets": [
+        "Le bytecode Java est portable, mais les `.so` JNI doivent être ARM64",
+        "Une `UnsatisfiedLinkError` révèle souvent une bibliothèque native x86",
+        "Python : interpréteur ARM64 et wheels/extensions C compatibles aarch64",
+        "Node.js, Ruby et Go/cgo peuvent embarquer du code natif à recompiler"
+      ],
+      "code": [
+        "# Vérifier l'architecture des bibliothèques natives d'un JAR\nunzip -l app.jar | grep '\\.so'\nunzip -p app.jar lib/libnative.so > /tmp/libnative.so\nfile /tmp/libnative.so\n\n# Installer une dépendance Python avec compilation locale\npip3 install --no-binary :all: mon-paquet"
+      ],
+      "table": {
+        "headers": [
+          "Runtime",
+          "Ce qui est portable",
+          "Ce qui doit être reconstruit"
+        ],
+        "rows": [
+          [
+            "Java",
+            "Bytecode, JAR pur",
+            "Bibliothèques JNI (.so)"
+          ],
+          [
+            "Python",
+            "Code .py",
+            "Extensions C, wheels binaires"
+          ],
+          [
+            "Node.js",
+            "JavaScript",
+            "Addons natifs (node-gyp)"
+          ],
+          [
+            "Go",
+            "Code source",
+            "Binaires et dépendances cgo"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Une application Spring Boot démarre sur x86 mais échoue sur Kunpeng avec `java.lang.UnsatisfiedLinkError: libcrypto_wrapper.so`. Le JAR contient ce fichier. Décrivez la démarche de correction.",
+          "correction": "Extraire le `.so` du JAR et vérifier son architecture avec `file` : il est probablement x86-64. Récupérer les sources de la bibliothèque ou une version ARM64, la recompiler avec GCC/Clang pour aarch64, remplacer le fichier dans le JAR, puis reconstruire et redéployer. Vérifier ensuite que le JDK utilisé est bien un JDK ARM64 et relancer les tests fonctionnels. Le bytecode Java n'était pas le problème."
+        }
+      ],
+      "tip": "« Java est portable » ne veut pas dire « toutes les applications Java se migrent sans rien faire ». Dès qu'un JAR contient un `.so`, un `.dll` ou un binaire externe, un portage natif est nécessaire."
+    },
+    {
+      "heading": "Conteneurs : reconstruire pour l'architecture cible",
+      "body": "Une image de conteneur n'est pas une machine virtuelle : elle contient un système de fichiers avec des binaires, et ces binaires sont compilés pour une architecture. Une image `nginx:latest` récupérée sur un registre peut être x86-64 ; lancée sur Kunpeng, elle échoue avec une erreur `exec format error`. Le noyau est partagé, mais le processus à l'intérieur doit parler le langage du CPU.\n\nLa solution consiste à reconstruire l'image pour `linux/arm64`. Avec Docker, `docker buildx build --platform linux/arm64` s'appuie sur l'émulation QEMU pour exécuter les étapes de build, puis produit une image ARM64. De nombreux projets publient des images multi-arch : le manifeste choisit automatiquement la variante correspondant à la plateforme de l'hôte. Il faut néanmoins vérifier que chaque couche, y compris les binaires téléchargés pendant le build, possède une version ARM64.\n\nDans l'écosystème openEuler, iSula propose le moteur iSulad et l'outil de build `isula-build`. Les principes restent les mêmes : partir d'une image de base aarch64, compiler pour la bonne cible et tester l'image sur un nœud Kunpeng. Épingler les images par digest plutôt que par le tag `latest` évite les mauvaises surprises lors des déploiements.",
+      "bullets": [
+        "Une image contient des binaires dépendants de l'architecture",
+        "`exec format error` signale généralement une image x86 lancée sur ARM64",
+        "`docker buildx --platform linux/arm64` construit l'image cible",
+        "Les manifestes multi-arch choisissent la variante adaptée à l'hôte"
+      ],
+      "code": [
+        "# Construire une image ARM64 avec buildx\ndocker buildx build --platform linux/arm64 \\\n  -t registry.example.com/monapp:arm64 --push .\n\n# Vérifier l'architecture d'une image\ndocker image inspect monapp:arm64 | grep -i architecture"
+      ],
+      "diagram": "        Registre multi-arch\n   +-----------------------------+\n   |  monapp:latest (manifest)   |\n   |   |-- linux/amd64          |\n   |   |-- linux/arm64  <----+  |\n   +-----------------------------+\n                              |\n   docker pull monapp:latest  |\n   sur Kunpeng ---------------+\n          |\n          v\n   +------------------+\n   | image ARM64      |\n   | binaires aarch64 |\n   +------------------+",
+      "tip": "Ne copiez jamais une image x86 sur un nœud Kunpeng en espérant qu'elle fonctionne : le noyau partagé ne traduit pas le code machine. Reconstruisez l'image ou utilisez un manifeste multi-arch."
+    },
+    {
+      "heading": "Valider et industrialiser la migration",
+      "body": "La validation ne se limite pas à un démarrage réussi. Il faut d'abord vérifier les fonctions : tests unitaires, tests d'intégration, parcours utilisateur et cas limites. Une application peut démarrer, répondre à une requête simple et échouer sur un calcul rare à cause d'un `char` ou d'un alignement. Les tests doivent donc couvrir les zones sensibles identifiées pendant l'analyse.\n\nVient ensuite la validation de performance. On compare les temps de réponse, le débit et l'empreinte mémoire avec la référence x86, dans un environnement aussi contrôlé que possible. Un écart de quelques pourcents peut être normal, mais une régression forte doit être expliquée avant la mise en production. Les benchmarks doivent être répétés et les résultats conservés pour servir de base aux optimisations ultérieures.\n\nL'industrialisation transforme ces vérifications en pipeline automatisé. Une matrice de build produit les artefacts amd64 et arm64, les tests s'exécutent sur les deux architectures, et le déploiement suit une stratégie progressive : canary, surveillance des indicateurs, puis montée en charge. Un plan de retour arrière doit être prêt avant le premier passage en production.",
+      "bullets": [
+        "Tests fonctionnels complets, y compris les cas limites",
+        "Comparaison de performance avec une référence x86 mesurée",
+        "Pipeline CI multi-architecture et artefacts versionnés",
+        "Déploiement canary avec indicateurs et rollback préparé"
+      ],
+      "code": [
+        "# Exemple de tests dans un pipeline\nmake test\nmake benchmark\n\n# Vérification de l'artefact avant publication\nfile build/app\nsha256sum build/app\n\n# Déploiement canary avec kubectl\nkubectl set image deployment/app app=registry/app:arm64-canary"
+      ],
+      "tip": "Un test de fumée réussi ne valide pas une migration. L'examen oppose souvent « l'application démarre » à « l'application est validée fonctionnellement et en performance » : la seconde formulation est la bonne."
+    }
+  ],
+  "key_points": [
+    "Un binaire x86-64 ne s'exécute pas nativement sur ARM64 à cause du jeu d'instructions et de l'ABI.",
+    "Le bytecode Java et le code Python sont portables, mais les bibliothèques natives doivent être recompilées.",
+    "La compilation croisée utilise `aarch64-linux-gnu-gcc` avec un sysroot ARM64.",
+    "`-mabi=lp64` remplace `-m64` ; `-fsigned-char` corrige le signe par défaut de `char`.",
+    "Les intrinsics SSE/AVX doivent être portés vers NEON ou remplacés par du C portable.",
+    "Les variables atomiques doivent être alignées : `#pragma pack` est une source de coredump.",
+    "Une image de conteneur doit être reconstruite pour `linux/arm64` ou tirée d'un manifeste multi-arch.",
+    "La validation comprend tests fonctionnels, comparaison de performance et déploiement canary."
+  ],
+  "traps": [
+    "`char` est non signé par défaut sur ARM64, alors qu'il est signé sur x86 : le code peut changer de comportement sans erreur de compilation.",
+    "NEON et SSE ne sont pas interchangeables : les intrinsics doivent être réécrits.",
+    "Un JAR Java pur n'a pas besoin d'être recompilé, mais ses bibliothèques JNI en `.so` doivent l'être.",
+    "`-m64` est une option x86 et n'est pas valide sur ARM64 ; utilisez `-mabi=lp64`.",
+    "Un conteneur partage le noyau de l'hôte mais pas l'architecture de ses binaires : une image x86 ne fonctionne pas sur ARM64."
+  ],
+  "quiz": [
+    {
+      "id": "hcia-kp-02-q01",
+      "type": "single",
+      "prompt": "Why does an x86-64 Linux binary fail to run natively on an ARM64 server?",
+      "options": [
+        "The machine instructions and ABI target a different CPU architecture",
+        "ARM64 servers cannot use shared libraries",
+        "The binary lacks a graphical interface",
+        "The ELF file format is not supported on Linux"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le binaire contient des instructions que seul un CPU x86 peut décoder, et il respecte l'ABI x86-64. Le format ELF est au contraire utilisé sur ARM64 Linux, les bibliothèques partagées existent, et l'interface graphique n'a aucun rapport avec l'exécution.",
+      "topic": "Architecture"
+    },
+    {
+      "id": "hcia-kp-02-q02",
+      "type": "single",
+      "prompt": "Which SIMD technology should replace SSE/AVX intrinsics on ARM64?",
+      "options": [
+        "AVX-512",
+        "NEON",
+        "MMX",
+        "AltiVec"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "NEON est le SIMD de l'architecture ARM, avec des registres vectoriels de 128 bits. MMX et AVX-512 sont des technologies x86, et AltiVec appartient à l'architecture PowerPC. Les intrinsics doivent donc être réécrits, pas simplement recompilés.",
+      "topic": "SIMD"
+    },
+    {
+      "id": "hcia-kp-02-q03",
+      "type": "single",
+      "prompt": "A pure Java application (no JNI, no native library) must run on Kunpeng. What is required?",
+      "options": [
+        "Recompilation of every .class file with GCC",
+        "A Windows ARM64 license",
+        "An ARM64 JDK and the same JAR",
+        "A complete rewrite in C++"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Le bytecode Java est indépendant de l'architecture : il suffit d'un JVM ARM64 pour l'exécuter. Une réécriture en C++ n'est pas nécessaire, GCC ne compile pas du bytecode Java, et Windows n'est pas la cible serveur Kunpeng.",
+      "topic": "Java"
+    },
+    {
+      "id": "hcia-kp-02-q04",
+      "type": "single",
+      "prompt": "Which task is performed by the Kunpeng Porting Advisor?",
+      "options": [
+        "Real-time translation of x86 instructions",
+        "Compilation of Java bytecode to ARM64 assembly",
+        "Monitoring of server temperature",
+        "Static analysis of source code and dependencies for ARM64 compatibility"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Porting Advisor analyse statiquement le code et les paquets pour identifier les incompatibilités et proposer des corrections. La traduction à l'exécution est le rôle d'ExaGear, la compilation Java est assurée par le JIT du JVM, et la température relève de l'iBMC.",
+      "topic": "Outils"
+    },
+    {
+      "id": "hcia-kp-02-q05",
+      "type": "single",
+      "prompt": "Which Huawei tool enables x86 Linux applications without source code to run on ARM64?",
+      "options": [
+        "ExaGear",
+        "iSulad",
+        "A-Tune",
+        "kswapd"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "ExaGear est un outil de traduction binaire dynamique qui convertit les instructions x86 en ARM64 à l'exécution. iSulad est un moteur de conteneurs, A-Tune un système de réglage automatique et kswapd un thread du noyau Linux.",
+      "topic": "Migration"
+    },
+    {
+      "id": "hcia-kp-02-q06",
+      "type": "single",
+      "prompt": "Which option replaces the x86-only `-m64` flag when compiling for ARM64?",
+      "options": [
+        "-m32",
+        "-mabi=lp64",
+        "-march=x86-64",
+        "-msse4.2"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "`-mabi=lp64` sélectionne le modèle de données LP64 attendu sur ARM64 Linux : int sur 32 bits, long et pointeurs sur 64 bits. `-march=x86-64` et `-msse4.2` ciblent x86, et `-m32` demande du 32 bits.",
+      "topic": "Compilation"
+    },
+    {
+      "id": "hcia-kp-02-q07",
+      "type": "multi",
+      "prompt": "Which items typically require recompilation when moving to ARM64? (Choose three.)",
+      "options": [
+        "A C++ executable",
+        "A native shared library (.so)",
+        "A Python C extension",
+        "A plain SQL migration script"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Les exécutables C++, les bibliothèques partagées natives et les extensions C Python contiennent du code machine dépendant de l'architecture. Un script SQL est interprété par le SGBD et ne contient aucune instruction processeur : il n'a pas besoin d'être recompilé.",
+      "topic": "Migration"
+    },
+    {
+      "id": "hcia-kp-02-q08",
+      "type": "multi",
+      "prompt": "Which problems are commonly encountered when porting x86 C/C++ code to ARM64? (Choose three.)",
+      "options": [
+        "Signedness of char",
+        "Inline x86 assembly",
+        "SSE/AVX intrinsics",
+        "Absence of the TCP/IP protocol"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Le signe de char, l'assembleur en ligne et les intrinsics SIMD sont des sources classiques d'incompatibilité. TCP/IP est un protocole réseau indépendant de l'architecture et reste disponible sur ARM64.",
+      "topic": "Code"
+    },
+    {
+      "id": "hcia-kp-02-q09",
+      "type": "multi",
+      "prompt": "Which practices are appropriate for migrating a container image to Kunpeng? (Choose three.)",
+      "options": [
+        "Rebuild the image for linux/arm64",
+        "Use a multi-architecture manifest when available",
+        "Test the resulting image on an ARM64 node",
+        "Copy the x86 image layers unchanged"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Reconstruire l'image pour linux/arm64, utiliser un manifeste multi-arch et tester sur un nœud ARM64 sont les bonnes pratiques. Copier les couches x86 telles quelles conduit à une erreur d'exécution, car les binaires restent x86.",
+      "topic": "Conteneurs"
+    },
+    {
+      "id": "hcia-kp-02-q10",
+      "type": "tf",
+      "prompt": "Under ARM64 Linux LP64, sizeof(long) is 8 bytes.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : le modèle LP64 signifie que long et les pointeurs occupent 64 bits, soit 8 octets. C'est aussi le cas sur x86-64 Linux, mais cela diffère de Windows 64 bits où long reste sur 32 bits.",
+      "topic": "ABI"
+    },
+    {
+      "id": "hcia-kp-02-q11",
+      "type": "tf",
+      "prompt": "Every public container image is available as a multi-architecture image.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : beaucoup d'images ne publient qu'une seule architecture, souvent amd64. Il faut vérifier le manifeste ou reconstruire l'image pour ARM64 avant de l'utiliser sur Kunpeng.",
+      "topic": "Conteneurs"
+    },
+    {
+      "id": "hcia-kp-02-q12",
+      "type": "tf",
+      "prompt": "A Java application that loads a JNI native library can run on ARM64 with the original x86 .so file.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : le bytecode est portable, mais le `.so` JNI est un binaire x86. Il doit être recompilé pour ARM64 puis repackagé dans le JAR, sinon le chargement échoue avec une UnsatisfiedLinkError.",
+      "topic": "Java"
+    },
+    {
+      "id": "hcia-kp-02-q13",
+      "type": "tf",
+      "prompt": "ARM64 Linux uses little-endian byte order by default.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : les plateformes ARM64 Linux courantes fonctionnent en little-endian, comme x86. L'endianness n'est donc généralement pas la cause principale d'une migration, contrairement au signe de char ou aux intrinsics SIMD.",
+      "topic": "Architecture"
+    },
+    {
+      "id": "hcia-kp-02-q14",
+      "type": "text",
+      "prompt": "Which GCC cross-compiler prefix targets 64-bit ARM Linux? (Enter the compiler name.)",
+      "accept": [
+        "aarch64-linux-gnu-gcc",
+        "aarch64-linux-gnu-gcc-12",
+        "aarch64-linux-gnu-gcc-11"
+      ],
+      "sample_answer": "aarch64-linux-gnu-gcc",
+      "explanation_fr": "Le préfixe `aarch64-linux-gnu-` désigne la cible ARM64 Linux avec la bibliothèque C GNU. Le compilateur complet s'appelle donc `aarch64-linux-gnu-gcc`, et les outils associés suivent le même préfixe.",
+      "topic": "Compilation"
+    },
+    {
+      "id": "hcia-kp-02-q15",
+      "type": "text",
+      "prompt": "Which GCC option forces char to be signed on a platform where it is unsigned by default? (Enter the flag.)",
+      "accept": [
+        "-fsigned-char",
+        "fsigned-char"
+      ],
+      "sample_answer": "-fsigned-char",
+      "explanation_fr": "`-fsigned-char` rétablit le comportement signé de char sur ARM64. L'alternative est de déclarer explicitement `signed char` dans le code, ce qui est souvent plus lisible et plus portable.",
+      "topic": "Code"
+    },
+    {
+      "id": "hcia-kp-02-q16",
+      "type": "text",
+      "prompt": "Which Huawei dynamic binary translation tool runs x86 Linux binaries on ARM64? (Enter the product name.)",
+      "accept": [
+        "exagear",
+        "ExaGear"
+      ],
+      "sample_answer": "ExaGear",
+      "explanation_fr": "ExaGear traduit les instructions x86 en ARM64 à l'exécution, sans recompilation ni code source. Il est adapté aux logiciels fermés ou aux charges peu sensibles à la performance, pas aux applications critiques nécessitant un portage natif.",
+      "topic": "Migration"
+    },
+    {
+      "id": "hcia-kp-02-q17",
+      "type": "single",
+      "prompt": "A JAR deployed on Kunpeng throws `UnsatisfiedLinkError` at startup. What is the most likely cause?",
+      "options": [
+        "The SQL database is read-only",
+        "The JAR contains too many .class files",
+        "The JAR bundles an x86 native library",
+        "The JVM lacks a graphical display"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "L'erreur signale qu'une méthode native n'a pas pu être liée : le `.so` embarqué est probablement x86. L'absence d'affichage, une base en lecture seule ou le nombre de classes n'empêchent pas le chargement d'une bibliothèque native.",
+      "topic": "Java"
+    },
+    {
+      "id": "hcia-kp-02-q18",
+      "type": "single",
+      "prompt": "What is the recommended first step before porting a large application?",
+      "options": [
+        "Rewrite all modules in assembly",
+        "Disable all security features",
+        "Deploy directly to production",
+        "Assess source code, dependencies and native libraries"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "L'évaluation initiale identifie les dépendances natives, les zones de code sensibles et l'effort nécessaire. Réécrire en assembleur, désactiver la sécurité ou déployer directement sont des approches risquées et non recommandées.",
+      "topic": "Méthode"
+    },
+    {
+      "id": "hcia-kp-02-q19",
+      "type": "single",
+      "prompt": "Which symptom usually indicates that an x86 container image was started on an ARM64 host?",
+      "options": [
+        "exec format error",
+        "disk full",
+        "permission denied on /tmp",
+        "DNS resolution timeout"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le noyau ne reconnaît pas le format exécutable des binaires x86 et renvoie `exec format error`. Un disque plein, un problème de permissions ou un timeout DNS produisent des messages différents et n'ont pas de lien direct avec l'architecture.",
+      "topic": "Conteneurs"
+    },
+    {
+      "id": "hcia-kp-02-q20",
+      "type": "single",
+      "prompt": "Which deployment strategy best limits risk after an ARM64 migration?",
+      "options": [
+        "Skipping performance tests",
+        "A canary release with monitoring and rollback",
+        "A simultaneous switch of all servers",
+        "Permanent removal of the x86 environment"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le canary expose une petite fraction du trafic, surveille les indicateurs et permet un retour arrière rapide. Un basculement simultané augmente l'impact, supprimer l'environnement x86 empêche la comparaison, et ignorer les tests de performance masque les régressions.",
+      "topic": "Validation"
+    }
+  ]
+}

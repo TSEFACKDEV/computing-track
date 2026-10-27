@@ -1,0 +1,27 @@
+{
+  "phase": "HCIP",
+  "subject": "Kunpeng",
+  "name": "Kunpeng — portage, conteneurs et migration",
+  "tagline": "DevKit, cloud native ARM64 et migration industrielle",
+  "weight": 20,
+  "chapters": [
+    {
+      "id": "hcip-kp-01",
+      "file": "ch01.json",
+      "title": "DevKit et optimisation avancée sur Kunpeng",
+      "minutes": 80
+    },
+    {
+      "id": "hcip-kp-02",
+      "file": "ch02.json",
+      "title": "Conteneurs et microservices sur ARM64",
+      "minutes": 85
+    },
+    {
+      "id": "hcip-kp-03",
+      "file": "ch03.json",
+      "title": "Migration industrielle et déploiement sur Kunpeng",
+      "minutes": 75
+    }
+  ]
+}

@@ -1,0 +1,654 @@
+{
+  "id": "hcip-og-03",
+  "phase": "HCIP",
+  "subject": "openGauss",
+  "number": 3,
+  "title_fr": "Sécurité avancée et sauvegarde professionnelle",
+  "title_en": "Advanced Security and Professional Backup",
+  "minutes": 60,
+  "source": "HCIP-openGauss V1.0 Training Material — Session 6 «Client Access Authentication · Audit · TDE · Ledger» + Session 3 (Backup) · Lab Guide",
+  "objectives": [
+    "Configurer pg_hba.conf et SSL/TLS pour n'ouvrir que les accès nécessaires",
+    "Appliquer le moindre privilège, l'héritage de rôles et la séparation des devoirs",
+    "Durcir les comptes avec les politiques de mots de passe et de verrouillage",
+    "Mettre en place un audit conforme, consultable et protégé",
+    "Comprendre TDE, la hiérarchie de clés et le chiffrement en colonne",
+    "Bâtir une stratégie de sauvegarde et de PITR, et prouver le RTO par des drills"
+  ],
+  "sections": [
+    {
+      "heading": "Authentification client et pg_hba.conf",
+      "body": "Avant d'exécuter la moindre requête, un client doit franchir le contrôle d'accès de openGauss. Le fichier pg_hba.conf décrit les règles d'authentification, une par ligne, avec la forme TYPE DATABASE USER ADDRESS METHOD. Les règles sont évaluées de haut en bas et la première qui correspond s'applique : placer une règle trop permissive en tête revient à annuler toutes les suivantes. Le TYPE vaut local pour une connexion Unix, host pour TCP, hostssl pour TCP chiffré et hostnossl pour TCP en clair.\n\nLa méthode sha256 est recommandée pour les connexions distantes ; cert s'appuie sur un certificat client et reject bloque explicitement une source. Les règles doivent être précises : base, utilisateur et plage d'adresses. Une règle host all all 0.0.0.0/0 trust ouvrirait la base à tout Internet. Le fichier se recharge avec gs_ctl reload ou gs_guc reload, sans redémarrage. En cas d'échec, l'ordre des règles, l'adresse source réelle et l'existence du compte sont les trois causes à vérifier en premier.",
+      "bullets": [
+        "Format : TYPE DATABASE USER ADDRESS METHOD",
+        "La première règle correspondante gagne : l'ordre est décisif",
+        "hostssl impose TLS, trust ne doit jamais exposer une base publique",
+        "sha256 pour les connexions distantes, cert pour l'authentification mutuelle"
+      ],
+      "code": [
+        "host    postgres    app_rw    10.10.0.0/24    sha256",
+        "hostssl postgres    app_ro    10.10.0.0/24    cert",
+        "host    all         all      0.0.0.0/0        reject",
+        "gs_guc reload -N all -I all -h \"host postgres app_rw 10.10.0.0/24 sha256\""
+      ],
+      "diagram": "Client\n  |\n  v\npg_hba.conf : première règle correspondante\n  |\n  +-- reject ------> connexion refusée\n  +-- trust  ------> identité non vérifiée\n  +-- sha256 ------> mot de passe (HMAC)\n  +-- cert   ------> certificat client + CA\n  |\n  v\nVérification du compte, de sa validité et de sa limite de connexions",
+      "table": {
+        "headers": [
+          "Type",
+          "Transport",
+          "Usage typique"
+        ],
+        "rows": [
+          [
+            "local",
+            "Socket Unix",
+            "Administration locale sur le serveur"
+          ],
+          [
+            "host",
+            "TCP, TLS ou non",
+            "Réseau interne"
+          ],
+          [
+            "hostssl",
+            "TCP avec TLS obligatoire",
+            "Connexions distantes sensibles"
+          ],
+          [
+            "hostnossl",
+            "TCP sans TLS",
+            "Refus ou dépannage contrôlé"
+          ]
+        ]
+      },
+      "tip": "Une règle host all all 0.0.0.0/0 trust placée avant les autres rend toutes les règles suivantes inutiles. Relisez toujours le fichier du haut vers le bas."
+    },
+    {
+      "heading": "Rôles, privilèges et séparation des devoirs",
+      "body": "openGauss distingue les privilèges système, portés par l'utilisateur ou le rôle, des privilèges objet, accordés sur des tables, vues, schémas ou fonctions. Les privilèges système ne s'héritent pas : un rôle membre d'un autre rôle n'obtient pas automatiquement CREATEDB ou SYSADMIN. Les privilèges objet, eux, peuvent être transmis par héritage de rôle. La bonne pratique consiste à créer des rôles métier sans LOGIN (app_ro, app_rw, dba_ops), à leur accorder les droits sur les objets, puis à rattacher les comptes utilisateurs à ces rôles.\n\nLe principe du moindre privilège impose de n'accorder que le nécessaire et de révoquer ce qui n'est plus utilisé. Le mode de séparation des devoirs, activé par enableSeparationOfDuty, retire au SYSADMIN les droits de gestion des comptes et d'audit, et rend CREATEROLE, AUDITADMIN et SYSADMIN mutuellement exclusifs. Un administrateur système ne peut alors plus créer d'utilisateur ni consulter les journaux d'audit à lui seul. La sécurité par ligne complète le dispositif : une politique RLS filtre les lignes visibles selon l'utilisateur courant, sans dupliquer les tables.",
+      "bullets": [
+        "Les privilèges système ne s'héritent pas ; les privilèges objet peuvent l'être",
+        "Rôles métier NOLOGIN + utilisateurs rattachés, pas de droits directs",
+        "Moindre privilège : accorder puis révoquer dès que le besoin disparaît",
+        "enableSeparationOfDuty sépare administration, comptes et audit"
+      ],
+      "code": [
+        "CREATE ROLE app_ro NOLOGIN;",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA sales TO app_ro;",
+        "CREATE USER alice WITH PASSWORD 'Gauss@2026';",
+        "GRANT app_ro TO alice;",
+        "ALTER SYSTEM SET enableSeparationOfDuty = on;",
+        "ALTER TABLE sales ENABLE ROW LEVEL SECURITY;",
+        "CREATE ROW LEVEL SECURITY POLICY sales_rls ON sales",
+        "USING (region = current_user);"
+      ],
+      "exercises": [
+        {
+          "prompt": "Un auditeur exige que l'administrateur système ne puisse ni créer d'utilisateurs ni consulter les journaux d'audit. Comment configurez-vous openGauss ?",
+          "correction": "On active enableSeparationOfDuty, ce qui restreint le SYSADMIN et rend SYSADMIN, CREATEROLE et AUDITADMIN exclusifs. On crée ensuite un compte CREATEROLE pour la gestion des utilisateurs et un compte AUDITADMIN pour l'audit, distincts du SYSADMIN. Les privilèges sont accordés nominativement et documentés. Il faut vérifier que les comptes existants ne cumulent pas plusieurs de ces attributs, puis tester les tentatives d'accès pour prouver la séparation."
+        }
+      ],
+      "tip": "SYSADMIN ne signifie pas « tous les droits » lorsqu'il est combiné à la séparation des devoirs. L'examen teste souvent cette nuance : CREATEROLE et AUDITADMIN deviennent alors des attributs distincts et exclusifs."
+    },
+    {
+      "heading": "Politique de mots de passe et durcissement des comptes",
+      "body": "Une authentification forte ne suffit pas si les comptes sont mal protégés. openGauss verrouille automatiquement un compte après failed_login_attempts échecs et le libère après password_lock_time. Un administrateur peut aussi verrouiller ou déverrouiller manuellement un compte. password_reuse_time et password_reuse_max empêchent la réutilisation d'anciens mots de passe, tandis que la complexité impose une longueur minimale et plusieurs catégories de caractères. password_encryption_type doit rester sur SHA-256 : MD5 est encore supporté mais considéré comme faible.\n\nLe durcissement couvre aussi le cycle de vie et les connexions. VALID BEGIN et VALID UNTIL bornent la période de validité d'un compte de service. Une limite de connexions par utilisateur ou par base évite qu'une application mal configurée sature les sessions. Les sessions inactives ou les transactions oubliées doivent être interrompues par des timeouts adaptés. Enfin, les comptes de service ne doivent pas être des superutilisateurs : on préfère un rôle dédié avec les seuls droits nécessaires, et on réserve les privilèges élevés à quelques comptes nominatifs audités.",
+      "bullets": [
+        "failed_login_attempts et password_lock_time limitent le brute force",
+        "password_reuse_time et password_reuse_max bloquent le recyclage",
+        "SHA-256 pour le stockage, jamais MD5 en production",
+        "VALID BEGIN et VALID UNTIL bornent les comptes de service",
+        "Limiter les connexions et couper les sessions inactives"
+      ],
+      "code": [
+        "ALTER SYSTEM SET failed_login_attempts = 5;",
+        "ALTER SYSTEM SET password_lock_time = 30;",
+        "ALTER SYSTEM SET password_encryption_type = 1;",
+        "CREATE USER svc_report WITH PASSWORD 'Report@2026'",
+        "VALID BEGIN '2026-01-01' VALID UNTIL '2027-01-01';",
+        "ALTER USER svc_report CONNECTION LIMIT 20;"
+      ],
+      "table": {
+        "headers": [
+          "Paramètre",
+          "Effet",
+          "Valeur de départ"
+        ],
+        "rows": [
+          [
+            "failed_login_attempts",
+            "Verrouillage après N échecs",
+            "5"
+          ],
+          [
+            "password_lock_time",
+            "Durée de verrouillage (minutes)",
+            "30"
+          ],
+          [
+            "password_reuse_time",
+            "Délai avant réutilisation",
+            "Selon politique"
+          ],
+          [
+            "password_encryption_type",
+            "Algorithme de stockage",
+            "SHA-256"
+          ],
+          [
+            "CONNECTION LIMIT",
+            "Sessions simultanées du compte",
+            "Selon application"
+          ]
+        ]
+      },
+      "tip": "Un compte verrouillé par failed_login_attempts ne se déverrouille pas en changeant le mot de passe : il faut attendre password_lock_time ou le déverrouiller explicitement."
+    },
+    {
+      "heading": "Audit : tracer sans dégrader",
+      "body": "L'audit enregistre les événements de sécurité et les opérations sensibles pour permettre l'investigation et la conformité. Le commutateur général est audit_enabled ; une fois activé, onze catégories configurables déterminent ce qui est journalisé. audit_login_logout vaut 7 par défaut et couvre les connexions et déconnexions, audit_database_process trace démarrage, arrêt et bascule, audit_system_object cible les DDL sur les objets système, et audit_dml_state ou audit_dml_state_select permettent de suivre les DML et les SELECT sur des tables sensibles.\n\nL'audit a un coût : chaque événement consomme du CPU et de l'espace. La méthode recommandée consiste à partir d'un périmètre large (catégories), puis à restreindre par objet et par utilisateur, plutôt que de tout journaliser. Les journaux sont soumis à rotation et à une politique de rétention ; on peut les interroger avec pg_query_audit sur une plage horaire et les purger avec pg_delete_audit. Une conservation de douze mois est fréquente pour les exigences réglementaires. Le transfert vers une SIEM externe protège contre l'effacement local et permet la corrélation avec les autres systèmes.",
+      "bullets": [
+        "audit_enabled est le commutateur général ; onze catégories le détaillent",
+        "audit_login_logout = 7 trace connexions et déconnexions",
+        "Commencer large puis restreindre par objet et utilisateur",
+        "pg_query_audit consulte, pg_delete_audit purge, la SIEM conserve",
+        "La rétention doit répondre à une exigence écrite, pas à l'habitude"
+      ],
+      "code": [
+        "gs_guc set -N all -I all -c \"audit_enabled=on\"",
+        "gs_guc reload -N all -I all -c \"audit_system_object=12295\"",
+        "SELECT time, type, result, username, database, object_name, detail_info",
+        "FROM pg_query_audit('2026-10-27 08:00:00','2026-10-27 09:00:00');",
+        "SELECT pg_delete_audit('2026-09-01 00:00:00','2026-09-30 23:59:59');"
+      ],
+      "tip": "Activer l'audit ne suffit pas : si la catégorie DML ou SELECT n'est pas configurée pour la table concernée, l'opération ne figurera pas dans les journaux. Vérifiez la portée avant l'incident."
+    },
+    {
+      "heading": "TDE : chiffrement transparent au repos",
+      "body": "TDE (Transparent Data Encryption) chiffre les fichiers de données au moment de l'écriture et les déchiffre à la lecture, sans modifier les applications. Un attaquant qui vole un disque ou copie un fichier de données ne peut pas lire les pages sans passer par le KMS et l'instance autorisée. openGauss s'appuie sur une hiérarchie de clés à trois niveaux : la root key (RK) protège la customer master key (CMK), qui protège à son tour les data encryption keys (DEK). Chaque table chiffrée possède son propre DEK ; le chiffré du DEK et l'identifiant de CMK sont stockés avec la table.\n\nL'activation se fait avec enable_tde et tde_cmk_id, la CMK étant fournie par le KMS. L'algorithme, AES_128_CTR ou SM4_CTR, est choisi à la création de la table et ne peut plus changer. La rotation des DEK est possible : les anciennes données restent déchiffrables avec l'ancienne clé, les nouvelles écritures utilisent la nouvelle. Les limites sont importantes : le chiffrement concerne les tables ligne stockées en heap, mais pas les index, les journaux WAL, les catalogues système ni les tables colonne ou Ustore. Le surcoût de stockage est d'environ 2,5 %.",
+      "bullets": [
+        "TDE chiffre les fichiers au repos, de façon transparente pour l'application",
+        "Hiérarchie RK → CMK → DEK, avec un DEK par table",
+        "Algorithmes AES_128_CTR ou SM4_CTR, figés à la création",
+        "Rotation des DEK sans réécriture immédiate de toutes les données",
+        "Index, WAL, catalogues et certains moteurs restent hors périmètre"
+      ],
+      "code": [
+        "ALTER SYSTEM SET enable_tde = on;",
+        "ALTER SYSTEM SET tde_cmk_id = '<cmk_id_fourni_par_le_kms>';",
+        "CREATE TABLE payment (",
+        "  id bigint,",
+        "  card_no varchar(19)",
+        ") WITH (encryption_type = 'AES_128_CTR');",
+        "SELECT relname, reloptions FROM pg_class WHERE relname = 'payment';"
+      ],
+      "table": {
+        "headers": [
+          "Élément",
+          "Rôle",
+          "Emplacement"
+        ],
+        "rows": [
+          [
+            "RK",
+            "Protège les CMK",
+            "KMS"
+          ],
+          [
+            "CMK",
+            "Protège les DEK d'une instance",
+            "KMS"
+          ],
+          [
+            "DEK",
+            "Chiffre les données d'une table",
+            "Chiffré dans la table"
+          ],
+          [
+            "DEK en clair",
+            "Accélère le déchiffrement",
+            "Mémoire uniquement"
+          ]
+        ]
+      },
+      "tip": "Sans le KMS et la CMK, une sauvegarde TDE est illisible. La disponibilité du KMS fait partie du plan de reprise : testez la restauration avec les clés, pas seulement les fichiers."
+    },
+    {
+      "heading": "Chiffrement en colonne et requêtes d'égalité chiffrée",
+      "body": "Le chiffrement en colonne protège des données sensibles avant même leur arrivée sur le serveur. Le client crée une customer master key (CMK) avec keytool, puis déclare une column encryption key (CEK) en SQL. La CEK est chiffrée par la CMK et stockée côté serveur ; le client chiffre les valeurs avec la CEK avant de les envoyer. Le serveur ne voit que du chiffré et exécute la comparaison sur les valeurs chiffrées. Le client déchiffre le résultat final.\n\nCette fonctionnalité repose sur un chiffrement déterministe : deux valeurs identiques produisent le même chiffré, ce qui permet l'égalité mais expose à des attaques par analyse de fréquence. Elle ne permet donc ni les plages, ni le tri, ni le LIKE sur les colonnes chiffrées. Le client gsql doit être lancé avec l'option -C pour activer le chiffrement. Les colonnes chiffrées acceptent des contraintes limitées, et les index ou partitions de plage ne sont pas autorisés. On réserve ce mécanisme aux identifiants, numéros de carte ou emails comparés par égalité, jamais aux colonnes utilisées dans des rapports agrégés.",
+      "bullets": [
+        "CMK créée par keytool, CEK déclarée en SQL et chiffrée par la CMK",
+        "Le serveur ne stocke et ne compare que du chiffré",
+        "Chiffrement déterministe : égalité seulement, pas de plage ni de tri",
+        "gsql -C active le chiffrement côté client",
+        "Risque d'analyse de fréquence : éviter les colonnes à distribution révélatrice"
+      ],
+      "code": [
+        "gsql -p 15400 postgres -r -C",
+        "CREATE CLIENT MASTER KEY crm_cmk WITH (",
+        "  KEY_STORE = localkms, KEY_PATH = 'crm_key', ALGORITHM = RSA_2048);",
+        "CREATE COLUMN ENCRYPTION KEY crm_cek WITH VALUES (",
+        "  CLIENT_MASTER_KEY = crm_cmk, ALGORITHM = AEAD_AES_256_CBC_HMAC_SHA256);",
+        "CREATE TABLE customer (",
+        "  id int,",
+        "  email text ENCRYPTED WITH (COLUMN_ENCRYPTION_KEY = crm_cek,",
+        "                             ENCRYPTION_TYPE = DETERMINISTIC));"
+      ],
+      "tip": "Une colonne chiffrée en mode déterministe ne peut pas servir à un BETWEEN ou à un ORDER BY. Si le besoin métier impose des plages, il faut un autre modèle de clé ou déchiffrer côté application."
+    },
+    {
+      "heading": "Sauvegardes logiques, physiques et gs_probackup",
+      "body": "openGauss propose trois familles de sauvegarde. La sauvegarde logique exporte des objets et des données sous forme de SQL ou d'archive : gs_dump pour une base ou un sous-ensemble, gs_dumpall pour tout le cluster, gs_restore pour réimporter une archive. Elle est portable et sélective, mais lente à restaurer sur de gros volumes. La sauvegarde physique copie les fichiers de données : gs_basebackup réalise une copie complète, gs_probackup gère un catalogue, des sauvegardes complètes et incrémentales, la validation et la restauration.\n\ngs_probackup s'utilise en quatre temps : init crée le dépôt, add-instance enregistre l'instance, backup produit une sauvegarde, restore la réapplique. Le mode incrémental PTRACK ne copie que les pages modifiées depuis la dernière sauvegarde ; il exige enable_cbm_tracking = on. Une sauvegarde incrémentale suppose une complète préalable. validate contrôle l'intégrité sans restaurer, mais seule une restauration réelle prouve la chaîne complète. La rétention se pilote avec les options de purge, et le dépôt doit être sur un volume distinct de celui des données.",
+      "bullets": [
+        "gs_dump et gs_dumpall pour le logique, gs_restore pour l'import",
+        "gs_basebackup pour une copie physique complète",
+        "gs_probackup : init, add-instance, backup, validate, restore",
+        "PTRACK ne copie que les pages modifiées, après une complète",
+        "Le dépôt de sauvegarde ne doit jamais partager le SAN des données"
+      ],
+      "code": [
+        "gs_probackup init -B /backup/og",
+        "gs_probackup add-instance -B /backup/og -D /data/openGauss/db1 --instance=db1",
+        "gs_probackup backup -B /backup/og --instance=db1 -b FULL",
+        "gs_probackup backup -B /backup/og --instance=db1 -b PTRACK",
+        "gs_probackup validate -B /backup/og --instance=db1",
+        "gs_probackup restore -B /backup/og --instance=db1 -D /data/restore/db1"
+      ],
+      "table": {
+        "headers": [
+          "Outil",
+          "Type",
+          "Point fort",
+          "Limite"
+        ],
+        "rows": [
+          [
+            "gs_dump",
+            "Logique",
+            "Sélectif et portable",
+            "Restauration lente"
+          ],
+          [
+            "gs_dumpall",
+            "Logique",
+            "Tout le cluster et les globaux",
+            "Volume et durée"
+          ],
+          [
+            "gs_basebackup",
+            "Physique",
+            "Copie binaire complète",
+            "Pas d'incrémental"
+          ],
+          [
+            "gs_probackup",
+            "Physique",
+            "Complet, incrémental, catalogue",
+            "Instance arrêtée pour restore"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Concevez une stratégie de sauvegarde pour une base de 2 To avec un RPO de 15 minutes et un RTO de 2 heures.",
+          "correction": "On combine une complète hebdomadaire, des incrémentales PTRACK quotidiennes ou pluriquotidiennes, et l'archivage continu des WAL pour permettre le PITR. Le RPO de 15 minutes est tenu par l'archivage WAL, pas par les seules incrémentales. Le RTO de 2 heures exige de mesurer la restauration complète plus le rejeu : on teste mensuellement sur un environnement de même classe. Le dépôt est répliqué hors site, les clés TDE sont sauvegardées séparément, et chaque sauvegarde est validée puis contrôlée par une restauration périodique."
+        }
+      ],
+      "tip": "Une sauvegarde complète et des incrémentales ne suffisent pas pour un RPO court : seul l'archivage continu des WAL permet de rejouer jusqu'à la minute près."
+    },
+    {
+      "heading": "PITR, points de restauration et exercices de reprise",
+      "body": "La restauration à un instant précis (PITR) combine une sauvegarde physique de base et le rejeu des journaux WAL archivés jusqu'à une cible. La cible peut être un horodatage, un identifiant de transaction ou un point de restauration nommé créé avec pg_create_restore_point. Ce marqueur est écrit dans le WAL : il permet de revenir juste avant une migration ou un chargement risqué. Il ne remplace pas une sauvegarde et peut devenir inutilisable si les WAL nécessaires ont été purgés.\n\nUn plan de reprise crédible repose sur la règle des copies séparées : sauvegarde, données et journaux ne doivent pas disparaître ensemble. Il faut connaître la fenêtre de rétention des WAL, car elle borne la profondeur du PITR. Le RTO se mesure en restaurant réellement, en rejouant les journaux et en vérifiant l'intégrité applicative. Un test mensuel documenté vaut mieux que dix procédures non exécutées. Enfin, le PITR complète la haute disponibilité : le standby protège d'une panne, la sauvegarde protège d'une erreur humaine ou d'une corruption logique.",
+      "bullets": [
+        "PITR = sauvegarde de base + WAL archivés + cible de récupération",
+        "pg_create_restore_point écrit un marqueur nommé dans le WAL",
+        "La rétention des WAL détermine la profondeur de restauration possible",
+        "Le RTO se prouve par un drill, pas par une estimation",
+        "La sauvegarde protège des erreurs humaines, le standby des pannes"
+      ],
+      "code": [
+        "SELECT pg_create_restore_point('before_migration_2026');",
+        "gs_probackup restore -B /backup/og --instance=db1 \\",
+        "  -D /data/restore/db1 --recovery-target-time='2026-10-27 03:00:00'",
+        "SELECT pg_is_in_recovery();",
+        "SHOW archive_mode;"
+      ],
+      "diagram": "Sauvegarde complète      WAL archivés en continu\n   (dimanche)             lundi ....... mercredi\n       |                        |\n       +--------+---------------+\n                |\n         Restauration de la base\n                |\n         Rejeu jusqu'à la cible\n                |\n      +---------+----------+\n      |                    |\n  Cible atteinte      Erreur détectée\n  (heures/minutes)    (arrêt du rejeu)",
+      "exercises": [
+        {
+          "prompt": "À 10 h 05, un développeur supprime par erreur la table commandes. La sauvegarde complète date de la veille à 2 h et les WAL sont archivés. Décrivez la restauration.",
+          "correction": "On identifie l'heure exacte de la suppression dans les journaux, puis on restaure la sauvegarde complète sur une instance isolée. On rejoue les WAL jusqu'à 10 h 04, juste avant le DROP, avec une cible temporelle ou un point de restauration s'il existait. On vérifie la présence et la cohérence de la table, puis on extrait les données vers la production ou on bascule l'instance selon la procédure. Il faut surtout ne pas restaurer par-dessus l'instance en production sans sauvegarder l'état courant, et documenter le RTO réellement observé."
+        }
+      ],
+      "tip": "Un point de restauration n'est pas une sauvegarde : il ne vit que dans les WAL. Si la rétention purge les journaux nécessaires, le marqueur devient inexploitable."
+    }
+  ],
+  "key_points": [
+    "pg_hba.conf applique la première règle correspondante : l'ordre est critique",
+    "sha256 pour les connexions distantes, cert pour l'authentification mutuelle",
+    "Les privilèges système ne s'héritent pas, les privilèges objet peuvent l'être",
+    "La séparation des devoirs rend SYSADMIN, CREATEROLE et AUDITADMIN exclusifs",
+    "failed_login_attempts, password_lock_time et SHA-256 durcissent les comptes",
+    "L'audit se configure par catégories et se consulte avec pg_query_audit",
+    "TDE repose sur RK, CMK et DEK, avec un DEK par table chiffrée",
+    "gs_probackup gère complet, PTRACK, validation et restauration ; le PITR exige les WAL archivés"
+  ],
+  "traps": [
+    "audit_enabled est le commutateur général ; audit_enable n'existe pas sous cette forme dans la documentation officielle",
+    "TDE ne chiffre pas les index, les WAL ni les catalogues système : le périmètre est la table ligne stockée en heap",
+    "Une sauvegarde validée n'est pas une sauvegarde restaurée : seul un drill prouve le RTO et la chaîne de clés",
+    "Le chiffrement déterministe permet l'égalité mais interdit les plages, le tri et le LIKE sur la colonne chiffrée",
+    "Un point de restauration dépend des WAL conservés : il ne remplace jamais une sauvegarde complète"
+  ],
+  "quiz": [
+    {
+      "id": "hcip-og-03-q01",
+      "type": "single",
+      "prompt": "Which feature encrypts openGauss data files on storage media transparently to applications?",
+      "options": [
+        "TDE (Transparent Data Encryption)",
+        "SSL/TLS sessions",
+        "Database audit",
+        "Row-level security"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "TDE chiffre les fichiers de données au repos et les déchiffre à la lecture, sans changement applicatif. SSL protège les flux réseau, pas les fichiers. L'audit journalise les opérations et la sécurité par ligne filtre les lignes visibles, sans chiffrer le stockage. Seule TDE répond à la fuite de données par vol de disque ou de sauvegarde.",
+      "topic": "TDE"
+    },
+    {
+      "id": "hcip-og-03-q02",
+      "type": "single",
+      "prompt": "Which gs_probackup mode copies only data pages changed since the previous backup?",
+      "options": [
+        "FULL",
+        "PTRACK",
+        "STREAM",
+        "LOGICAL"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "PTRACK s'appuie sur le suivi des pages modifiées pour produire une sauvegarde incrémentale légère. FULL copie tout et LOGICAL n'est pas un mode de gs_probackup. STREAM désigne un mode de transmission, pas un mode de sauvegarde incrémentale. PTRACK exige enable_cbm_tracking et une sauvegarde complète préalable.",
+      "topic": "gs_probackup"
+    },
+    {
+      "id": "hcip-og-03-q03",
+      "type": "single",
+      "prompt": "Which parameter locks an account after a number of failed login attempts?",
+      "options": [
+        "audit_enabled",
+        "wal_level",
+        "failed_login_attempts",
+        "idle_in_transaction_session_timeout"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "failed_login_attempts fixe le nombre d'échecs avant verrouillage, et password_lock_time la durée du verrouillage. idle_in_transaction_session_timeout coupe les transactions inactives, sans lien avec les échecs d'authentification. audit_enabled active la journalisation et wal_level règle le volume de WAL. Seul failed_login_attempts répond au brute force.",
+      "topic": "Politique de mots de passe"
+    },
+    {
+      "id": "hcip-og-03-q04",
+      "type": "single",
+      "prompt": "How does openGauss choose among multiple matching rules in pg_hba.conf?",
+      "options": [
+        "All matching rules are combined",
+        "The most specific rule wins",
+        "The last matching rule wins",
+        "The first matching rule wins"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "pg_hba.conf est évalué de haut en bas et la première règle correspondante s'applique. Ce n'est ni la plus spécifique ni la dernière qui l'emporte, et les règles ne se combinent pas. Une règle permissive placée en tête annule donc les restrictions suivantes. Il faut ordonner le fichier du plus restrictif au plus général.",
+      "topic": "Authentification"
+    },
+    {
+      "id": "hcip-og-03-q05",
+      "type": "single",
+      "prompt": "Which role attribute is required to enable auditing and manage audit logs?",
+      "options": [
+        "AUDITADMIN",
+        "CREATEDB",
+        "MONADMIN",
+        "SYSADMIN"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "AUDITADMIN autorise l'activation de l'audit, sa configuration et la consultation des journaux. SYSADMIN administre le système mais perd ces droits lorsque la séparation des devoirs est active. CREATEDB permet de créer des bases et MONADMIN donne accès aux vues de supervision. La gestion de l'audit est donc confiée à un rôle distinct.",
+      "topic": "Audit et séparation des devoirs"
+    },
+    {
+      "id": "hcip-og-03-q06",
+      "type": "single",
+      "prompt": "Which gs_probackup subcommand checks backup integrity without restoring it?",
+      "options": [
+        "check",
+        "validate",
+        "verify",
+        "fsck"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "validate contrôle les fichiers, les sommes de contrôle et les métadonnées du catalogue sans restaurer. check, verify et fsck ne sont pas les sous-commandes documentées pour cet usage. La validation reste imparfaite : elle ne prouve pas que la restauration et le rejeu aboutiront. Un drill de restauration complète demeure nécessaire.",
+      "topic": "Validation des sauvegardes"
+    },
+    {
+      "id": "hcip-og-03-q07",
+      "type": "single",
+      "prompt": "What is required, in addition to a base backup, to perform point-in-time recovery?",
+      "options": [
+        "An export of pg_statistic",
+        "A logical gs_dump of every table",
+        "Archived WAL segments covering the target time",
+        "A second standby node"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Le PITR restaure la base puis rejoue les WAL archivés jusqu'à la cible. Un dump logique ne contient pas les journaux nécessaires au rejeu et ne permet pas de viser une seconde précise. Un standby améliore la disponibilité mais ne remplace pas les archives WAL. pg_statistic contient des statistiques, pas l'historique des modifications.",
+      "topic": "PITR"
+    },
+    {
+      "id": "hcip-og-03-q08",
+      "type": "single",
+      "prompt": "Why does encrypted equality query require deterministic encryption?",
+      "options": [
+        "To allow range scans on encrypted columns",
+        "To avoid storing any key on the server",
+        "To compress ciphertext more efficiently",
+        "To produce identical ciphertext for identical plaintext, enabling equality comparison"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Le chiffrement déterministe garantit que deux valeurs identiques donnent le même chiffré, ce qui permet au serveur de comparer sans déchiffrer. Il ne permet ni les plages ni le tri, et n'a aucun effet de compression. Les clés et métadonnées restent nécessaires côté serveur, même si les données sont chiffrées côté client. Le compromis est le risque d'analyse de fréquence.",
+      "topic": "Chiffrement en colonne"
+    },
+    {
+      "id": "hcip-og-03-q09",
+      "type": "single",
+      "prompt": "When separation of duties is enabled, which combination is NOT allowed for a single role?",
+      "options": [
+        "SYSADMIN and AUDITADMIN",
+        "CREATEDB and CONNECTION LIMIT",
+        "MONADMIN and LOGIN",
+        "CREATEDB and LOGIN"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "La séparation des devoirs rend SYSADMIN, CREATEROLE et AUDITADMIN mutuellement exclusifs : un même rôle ne peut pas cumuler administration système et audit. CREATEDB avec LOGIN, une limite de connexions ou MONADMIN avec LOGIN restent possibles. L'objectif est d'empêcher qu'un administrateur puisse à la fois agir et effacer ses traces.",
+      "topic": "Séparation des devoirs"
+    },
+    {
+      "id": "hcip-og-03-q10",
+      "type": "single",
+      "prompt": "What does pg_create_restore_point('before_migration') create?",
+      "options": [
+        "A full physical backup",
+        "A named WAL marker usable as a recovery target",
+        "A logical dump of the database",
+        "A new standby node"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "La fonction écrit un marqueur nommé dans le WAL, que l'on peut viser lors d'une restauration. Ce n'est ni une sauvegarde complète ni un dump logique : sans les WAL et une base de départ, le marqueur ne sert à rien. Elle ne crée pas non plus de standby. C'est un point de repère temporaire pour une opération risquée.",
+      "topic": "Points de restauration"
+    },
+    {
+      "id": "hcip-og-03-q11",
+      "type": "multi",
+      "prompt": "Which elements are required for PITR to a precise second? (Choose 3)",
+      "options": [
+        "A base backup",
+        "Archived WAL segments",
+        "A recovery target time",
+        "Only a logical gs_dump file"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Le PITR combine une sauvegarde physique, les WAL archivés et une cible temporelle ou nommée. Ces trois éléments permettent de rejouer jusqu'à l'instant voulu. Un dump logique seul ne contient pas les journaux de modifications et ne permet pas de viser une seconde précise. Il peut servir de secours pour des objets, pas de mécanisme PITR.",
+      "topic": "PITR"
+    },
+    {
+      "id": "hcip-og-03-q12",
+      "type": "multi",
+      "prompt": "Which practices belong to a credible backup strategy? (Choose 3)",
+      "options": [
+        "Validate backups after each run",
+        "Run periodic restore drills",
+        "Store backups on a separate storage system",
+        "Keep backups on the same SAN as the data files"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "La validation détecte les corruptions précoces, les drills prouvent le RTO, et un stockage séparé protège d'une panne ou d'un sinistre du SAN principal. Conserver les sauvegardes sur le même SAN que les données fait disparaître les deux en cas d'incident majeur. La règle des copies séparées est un principe de base de la continuité.",
+      "topic": "Stratégie de sauvegarde"
+    },
+    {
+      "id": "hcip-og-03-q13",
+      "type": "multi",
+      "prompt": "Which statements about openGauss TDE are correct? (Choose 3)",
+      "options": [
+        "It uses a three-level key hierarchy RK, CMK and DEK",
+        "Each encrypted table has its own DEK",
+        "The encryption algorithm is chosen when the table is created",
+        "It encrypts indexes, WAL and system catalogs by default"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "TDE s'appuie sur RK, CMK et DEK, avec un DEK par table, et l'algorithme est figé à la création. En revanche, les index, les journaux WAL et les catalogues système ne sont pas chiffrés par ce mécanisme. Cette dernière proposition est donc fausse. Le périmètre est la table ligne stockée en heap.",
+      "topic": "TDE"
+    },
+    {
+      "id": "hcip-og-03-q14",
+      "type": "tf",
+      "prompt": "gs_probackup validate can verify a backup without restoring it.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : validate contrôle l'intégrité des fichiers et des métadonnées du catalogue sans restaurer. Cela détecte une corruption évidente et rassure sur la complétude. Cela ne prouve pas que le rejeu des WAL ni que la restauration applicative aboutiront. Le drill de restauration reste la preuve finale du RTO.",
+      "topic": "Validation des sauvegardes"
+    },
+    {
+      "id": "hcip-og-03-q15",
+      "type": "tf",
+      "prompt": "pg_create_restore_point writes a marker into the WAL that can be used as a recovery target.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : la fonction inscrit un point nommé dans le WAL, exploitable comme cible de récupération. Le marqueur dépend de la conservation des journaux : si les WAL sont purgés, il devient inutilisable. Il ne constitue pas une sauvegarde et ne protège pas d'une perte du stockage. C'est un repère temporaire, pas une stratégie de sauvegarde.",
+      "topic": "Points de restauration"
+    },
+    {
+      "id": "hcip-og-03-q16",
+      "type": "tf",
+      "prompt": "TDE protects data at rest, but it does not protect data in transit between client and server.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : TDE chiffre les fichiers sur les supports de stockage. Les échanges réseau sont protégés par SSL/TLS, configuré séparément avec les certificats et pg_hba.conf. Activer TDE ne dispense donc pas d'activer hostssl et de vérifier les certificats. Les deux mécanismes sont complémentaires et répondent à des menaces différentes.",
+      "topic": "TDE et SSL"
+    },
+    {
+      "id": "hcip-og-03-q17",
+      "type": "text",
+      "prompt": "Which gs_probackup subcommand verifies backup integrity without restoring it? (one word)",
+      "accept": [
+        "validate",
+        "VALIDATE",
+        "Validate"
+      ],
+      "sample_answer": "validate",
+      "explanation_fr": "validate contrôle les fichiers, les sommes de contrôle et les métadonnées d'une sauvegarde dans le catalogue. Il s'exécute sans arrêter l'instance et sans restaurer les données. Un résultat positif ne remplace pas un test de restauration complet, car il ne rejoue pas les WAL. C'est néanmoins un contrôle systématique après chaque sauvegarde.",
+      "topic": "Validation des sauvegardes"
+    },
+    {
+      "id": "hcip-og-03-q18",
+      "type": "text",
+      "prompt": "Give the SQL call that creates a restore point named before_migration.",
+      "accept": [
+        "pg_create_restore_point('before_migration')",
+        "SELECT pg_create_restore_point('before_migration');",
+        "select pg_create_restore_point('before_migration')",
+        "SELECT pg_create_restore_point('before_migration')"
+      ],
+      "sample_answer": "SELECT pg_create_restore_point('before_migration');",
+      "explanation_fr": "L'appel pg_create_restore_point('before_migration') écrit un marqueur nommé dans le WAL et renvoie le LSN associé. On peut ensuite viser ce nom lors d'une restauration, à condition que les WAL nécessaires soient conservés. La fonction ne crée ni sauvegarde ni copie de données. Elle sert à baliser une opération risquée comme une migration.",
+      "topic": "Points de restauration"
+    },
+    {
+      "id": "hcip-og-03-q19",
+      "type": "text",
+      "prompt": "Which GUC parameter must be enabled before creating an encrypted table with TDE? (parameter name only)",
+      "accept": [
+        "enable_tde",
+        "ENABLE_TDE",
+        "Enable_TDE"
+      ],
+      "sample_answer": "enable_tde",
+      "explanation_fr": "enable_tde active la fonction TDE et doit être positionné à on avant de créer une table chiffrée. tde_cmk_id fournit l'identifiant de la CMK gérée par le KMS, mais n'active pas la fonction à lui seul. Sans enable_tde, la clause de chiffrement ne peut pas être appliquée. Le paramètre se change avec ALTER SYSTEM puis un rechargement ou un redémarrage selon le contexte.",
+      "topic": "TDE"
+    },
+    {
+      "id": "hcip-og-03-q20",
+      "type": "text",
+      "prompt": "Which pg_hba.conf connection type accepts only SSL-encrypted TCP connections? (one word)",
+      "accept": [
+        "hostssl",
+        "HOSTSSL",
+        "HostSSL"
+      ],
+      "sample_answer": "hostssl",
+      "explanation_fr": "hostssl n'accepte que les connexions TCP négociées avec TLS, contrairement à host qui accepte les deux et hostnossl qui impose l'absence de chiffrement. local concerne les sockets Unix. Utiliser hostssl garantit qu'un client ne peut pas contourner le chiffrement de transport. Cela complète TDE, qui protège le stockage et non le réseau.",
+      "topic": "Authentification et SSL"
+    }
+  ]
+}

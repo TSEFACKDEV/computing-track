@@ -1,0 +1,668 @@
+{
+  "id": "hcia-oe-03",
+  "phase": "HCIA",
+  "subject": "openEuler",
+  "number": 3,
+  "title_fr": "Utilisateurs, paquets DNF et systemd",
+  "title_en": "Users, DNF Packages, and systemd",
+  "minutes": 50,
+  "source": "HCIA-openEuler V2.0 Training Material — Session «User and Permission Management» · Lab Guide (utilisateurs, DNF, systemd)",
+  "objectives": [
+    "Gérer comptes, groupes et mots de passe avec les fichiers et commandes adaptés",
+    "Calculer et appliquer des permissions symboliques, octales et spéciales",
+    "Déléguer l'administration avec sudo et le groupe wheel",
+    "Installer, rechercher et interroger des paquets avec DNF et RPM",
+    "Créer, activer et diagnostiquer un service systemd",
+    "Lire le journal et envoyer le bon signal à un processus"
+  ],
+  "sections": [
+    {
+      "heading": "1. Utilisateurs, groupes et fichiers d'identité",
+      "body": "Linux est un système multi-utilisateur : chaque personne et chaque service dispose d'une identité. Un utilisateur possède un nom, un UID numérique, un groupe primaire (GID) et éventuellement des groupes secondaires. Le noyau raisonne en UID et GID ; les noms ne servent qu'à la lisibilité. C'est pourquoi un fichier peut afficher un UID à la place d'un nom si le compte a été supprimé.\n\nTrois fichiers structurent cette base. /etc/passwd contient les comptes au format nom:x:UID:GID:commentaire:home:shell. Le x signifie que le mot de passe n'est pas stocké ici mais dans /etc/shadow, lisible uniquement par root et contenant le hash ainsi que la politique de vieillissement. /etc/group associe les noms de groupes à leurs GID et à leurs membres secondaires.\n\nuseradd crée un compte, passwd définit ou change son mot de passe, usermod modifie ses attributs, userdel le supprime et groupadd crée un groupe. id affiche l'identité complète. L'option -m de useradd crée le répertoire personnel ; sans elle, le compte peut exister sans /home. On vérifie toujours le résultat avec id et getent passwd nom.",
+      "bullets": [
+        "Un utilisateur = nom, UID, GID primaire et groupes secondaires",
+        "/etc/passwd décrit les comptes, /etc/shadow stocke les hashs",
+        "/etc/group décrit les groupes et leurs membres",
+        "useradd crée, usermod modifie, userdel supprime",
+        "id et getent vérifient l'identité réellement appliquée"
+      ],
+      "code": [
+        "useradd -m -s /bin/bash alice",
+        "passwd alice",
+        "id alice",
+        "getent passwd alice",
+        "usermod -aG wheel alice"
+      ],
+      "table": {
+        "headers": [
+          "Fichier",
+          "Contenu",
+          "Accès"
+        ],
+        "rows": [
+          [
+            "/etc/passwd",
+            "Comptes, UID, GID, home, shell",
+            "Lisible par tous"
+          ],
+          [
+            "/etc/shadow",
+            "Hash du mot de passe et vieillissement",
+            "Root uniquement"
+          ],
+          [
+            "/etc/group",
+            "Groupes, GID et membres secondaires",
+            "Lisible par tous"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Crée l'utilisatrice alice avec un répertoire personnel et Bash comme shell, puis ajoute-la au groupe wheel sans supprimer ses groupes existants. Donne les commandes et la vérification.",
+          "correction": "useradd -m -s /bin/bash alice ; passwd alice ; usermod -aG wheel alice ; id alice. L'option -m crée /home/alice, -s définit le shell de connexion et -aG ajoute wheel en conservant les autres groupes secondaires. Sans -a, -G remplacerait toute la liste. La commande id doit afficher le groupe wheel parmi les groupes de l'utilisatrice."
+        }
+      ],
+      "tip": "Ne modifie jamais /etc/passwd ou /etc/shadow à la main pour ajouter un compte : utilise useradd et passwd, qui mettent à jour les fichiers de façon cohérente et verrouillent correctement les accès concurrents."
+    },
+    {
+      "heading": "2. Permissions, umask et bits spéciaux",
+      "body": "Chaque fichier possède trois catégories d'acteurs : le propriétaire (u), le groupe (g) et les autres (o). Les droits sont lus (r, 4), écrits (w, 2) et exécutés (x, 1). Pour un répertoire, r permet de lister, w de créer ou supprimer des entrées, et x de le traverser, c'est-à-dire d'accéder aux fichiers dont on connaît le nom. Un répertoire sans x est donc pratiquement inaccessible même si r est présent.\n\nchmod modifie les droits. La forme symbolique u+x ajoute l'exécution au propriétaire, g-w la retire au groupe. La forme octale 644 donne rw- au propriétaire et r-- au groupe et aux autres ; 755 donne rwxr-xr-x, classique pour un répertoire ou un script. chown change le propriétaire, chgrp le groupe ; -R applique récursivement.\n\numask définit les droits retirés par défaut à la création. Un umask 022 produit 755 pour un répertoire et 644 pour un fichier. Les bits spéciaux SUID, SGID et sticky ajoutent des comportements particuliers : exécution avec l'identité du propriétaire, héritage du groupe, ou protection contre la suppression dans /tmp.",
+      "bullets": [
+        "r = 4, w = 2, x = 1 ; les chiffres s'additionnent par catégorie",
+        "Sur un répertoire, x autorise la traversée et w la création ou suppression",
+        "chmod 644 = rw-r--r--, chmod 755 = rwxr-xr-x",
+        "umask 022 retire l'écriture au groupe et aux autres",
+        "SUID, SGID et sticky modifient le comportement des exécutions et des répertoires"
+      ],
+      "code": [
+        "chmod 640 /etc/app/config",
+        "chmod u+x deploy.sh",
+        "chown alice:developers /data/app",
+        "umask",
+        "ls -ld /tmp     # le t final indique le sticky bit"
+      ],
+      "table": {
+        "headers": [
+          "Valeur",
+          "Droits",
+          "Usage typique"
+        ],
+        "rows": [
+          [
+            "644",
+            "rw-r--r--",
+            "Fichier de configuration lisible par tous"
+          ],
+          [
+            "600",
+            "rw-------",
+            "Fichier privé, par exemple une clé SSH"
+          ],
+          [
+            "755",
+            "rwxr-xr-x",
+            "Répertoire ou script exécutable"
+          ],
+          [
+            "700",
+            "rwx------",
+            "Répertoire strictement privé"
+          ],
+          [
+            "1777",
+            "rwxrwxrwt",
+            "Répertoire partagé comme /tmp"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un fichier de configuration contient des identifiants. Il doit être lisible et modifiable par son propriétaire, lisible par le groupe, et inaccessible aux autres. Donne le mode octal et la commande.",
+          "correction": "Le mode est 640 : 6 = rw- pour le propriétaire, 4 = r-- pour le groupe, 0 = aucun droit pour les autres. La commande est chmod 640 fichier. On vérifie avec ls -l, puis on s'assure que le fichier appartient bien au bon utilisateur et au bon groupe avec chown."
+        }
+      ],
+      "tip": "777 n'est presque jamais la bonne réponse. Donner tous les droits à tout le monde ouvre une faille. Pour un répertoire partagé, préfère 1777 (sticky bit) ; pour un script, 755."
+    },
+    {
+      "heading": "3. Déléguer avec sudo et sécuriser les comptes",
+      "body": "Travailler en root en permanence est dangereux : une faute de frappe peut détruire le système, et l'action n'est pas attribuable à une personne. sudo permet d'exécuter une commande avec les privilèges d'un autre compte, généralement root, après authentification et selon une politique écrite.\n\nLa politique se trouve dans /etc/sudoers et dans les fichiers inclus par /etc/sudoers.d/. On la modifie avec visudo, qui verrouille le fichier et vérifie la syntaxe avant d'enregistrer : une erreur dans sudoers peut rendre sudo inutilisable. Une règle classique est %wheel ALL=(ALL) ALL, qui autorise les membres du groupe wheel à lancer n'importe quelle commande après saisie de leur propre mot de passe. La variante NOPASSWD: ALL supprime cette demande et doit rester exceptionnelle.\n\nSur openEuler, l'utilisateur créé à l'installation peut être ajouté au groupe wheel avec usermod -aG wheel alice. L'option -a est essentielle : sans elle, -G remplace la liste des groupes secondaires au lieu de l'étendre. sudo -l liste les commandes autorisées pour l'utilisateur courant.",
+      "bullets": [
+        "sudo exécute une commande privilégiée de façon traçable",
+        "La politique est dans /etc/sudoers et /etc/sudoers.d/",
+        "visudo verrouille le fichier et contrôle la syntaxe",
+        "%wheel ALL=(ALL) ALL autorise le groupe wheel",
+        "usermod -aG ajoute un groupe sans écraser les autres"
+      ],
+      "code": [
+        "visudo",
+        "usermod -aG wheel alice",
+        "sudo -l",
+        "sudo systemctl restart sshd"
+      ],
+      "table": {
+        "headers": [
+          "Règle",
+          "Signification"
+        ],
+        "rows": [
+          [
+            "%wheel ALL=(ALL) ALL",
+            "Le groupe wheel peut tout exécuter, avec mot de passe"
+          ],
+          [
+            "alice ALL=(ALL) NOPASSWD: ALL",
+            "alice peut tout exécuter sans mot de passe (à éviter)"
+          ],
+          [
+            "%ops ALL=(root) /usr/bin/systemctl",
+            "Le groupe ops ne peut lancer que systemctl en root"
+          ]
+        ]
+      },
+      "tip": "Le piège d'examen est usermod -G sans -a : la liste des groupes secondaires est remplacée, et l'utilisateur perd ses autres appartenances. Retiens -aG pour ajouter."
+    },
+    {
+      "heading": "4. DNF, RPM et dépôts logiciels",
+      "body": "DNF est le gestionnaire de paquets d'openEuler. Il télécharge des paquets RPM depuis des dépôts, résout les dépendances et vérifie les signatures. La commande dnf install nginx installe un paquet et tout ce dont il dépend ; dnf remove le désinstalle ; dnf update actualise les paquets installés ; dnf search mot-clé cherche dans les noms et descriptions.\n\ndnf provides /usr/bin/vim répond à une question fréquente : quel paquet fournit ce fichier ? dnf repolist liste les dépôts actifs, dnf clean all vide le cache des métadonnées, et dnf info paquet détaille version, taille et provenance. rpm reste utile pour interroger la base locale : rpm -qa liste les paquets installés et rpm -qf fichier indique le paquet propriétaire d'un fichier.\n\nLes dépôts sont décrits dans /etc/yum.repos.d/*.repo. Chaque section contient un nom, une baseurl ou un mirrorlist, enabled=1 et gpgcheck=1. Si gpgcheck est actif, la clé publique du dépôt doit être importée, sinon l'installation échoue avec une erreur de signature. Désactiver la vérification GPG pour contourner le problème est une mauvaise pratique de sécurité.",
+      "bullets": [
+        "DNF installe des RPM et résout les dépendances",
+        "install, remove, update, search, provides, repolist sont les commandes de base",
+        "rpm -qa interroge la base locale ; rpm -qf identifie le paquet d'un fichier",
+        "Les dépôts sont décrits dans /etc/yum.repos.d/*.repo",
+        "gpgcheck=1 impose la vérification de signature"
+      ],
+      "code": [
+        "dnf install -y nginx",
+        "dnf provides /usr/bin/vim",
+        "dnf repolist",
+        "dnf clean all",
+        "rpm -qf /usr/bin/vim"
+      ],
+      "table": {
+        "headers": [
+          "Besoin",
+          "Commande"
+        ],
+        "rows": [
+          [
+            "Installer un paquet",
+            "dnf install nom"
+          ],
+          [
+            "Supprimer un paquet",
+            "dnf remove nom"
+          ],
+          [
+            "Chercher un paquet",
+            "dnf search mot-clé"
+          ],
+          [
+            "Trouver le paquet d'un fichier",
+            "dnf provides /chemin/fichier"
+          ],
+          [
+            "Lister les paquets installés",
+            "rpm -qa"
+          ],
+          [
+            "Vider le cache",
+            "dnf clean all"
+          ]
+        ]
+      },
+      "tip": "dnf provides fonctionne même si le paquet n'est pas installé, car il interroge les métadonnées des dépôts. rpm -qf exige que le fichier soit déjà présent sur le disque."
+    },
+    {
+      "heading": "5. systemd : unités et gestion des services",
+      "body": "systemd est le premier processus lancé par le noyau : il porte le PID 1 et supervise le démarrage ainsi que les services. Il remplace les anciens scripts SysV par des unités déclaratives. Une unité de service décrit un programme, son mode de démarrage, son redémarrage en cas d'échec et ses dépendances. Les fichiers se trouvent dans /usr/lib/systemd/system/ pour les paquets et /etc/systemd/system/ pour les personnalisations.\n\nLes commandes essentielles sont systemctl start, stop, restart, status, enable et disable. start lance maintenant, enable inscrit le service au démarrage, et enable --now combine les deux. disable n'arrête pas un service déjà lancé : il faut aussi stop. status affiche l'état, le PID et les dernières lignes de journal.\n\nAprès avoir modifié ou créé un fichier d'unité, systemctl daemon-reload recharge la configuration de systemd. Sans cette étape, systemd continue d'utiliser l'ancienne définition. Les sections d'un service sont [Unit] pour les métadonnées et les dépendances, [Service] pour ExecStart, Restart et User, et [Install] pour WantedBy.",
+      "bullets": [
+        "systemd est PID 1 et supervise les services",
+        "start agit maintenant, enable inscrit au démarrage, enable --now fait les deux",
+        "disable n'arrête pas un service en cours",
+        "daemon-reload est requis après modification d'une unité",
+        "[Unit], [Service] et [Install] structurent un fichier de service"
+      ],
+      "code": [
+        "systemctl status sshd",
+        "systemctl enable --now sshd",
+        "systemctl disable sshd",
+        "systemctl daemon-reload",
+        "systemctl --failed"
+      ],
+      "diagram": "[Unit]\nDescription=Mon application\nAfter=network.target\n\n[Service]\nExecStart=/opt/app/server --port 8080\nRestart=on-failure\nUser=appuser\n\n[Install]\nWantedBy=multi-user.target",
+      "tip": "enable ne démarre pas et start n'active pas au boot. Si un service fonctionne après start mais disparaît après redémarrage, c'est que enable a été oublié."
+    },
+    {
+      "heading": "6. Targets et journalisation avec journald",
+      "body": "Les targets systemd regroupent des unités pour représenter un état du système. multi-user.target correspond à un démarrage serveur sans interface graphique, graphical.target à un démarrage avec bureau. systemctl get-default affiche la cible par défaut et systemctl set-default la modifie. Changer de cible immédiatement se fait avec systemctl isolate, opération qui arrête les services absents de la nouvelle cible.\n\nLe journal de systemd, journald, collecte les messages du noyau, des services et des applications. journalctl les affiche. -u sshd filtre sur une unité, -f suit en temps réel, -b limite au démarrage courant, --since et --until filtrent par date, et -p err ne montre que les erreurs et niveaux supérieurs. Les journaux binaires sont stockés dans /var/log/journal/ lorsque la persistance est activée, sinon dans un répertoire volatil.\n\nLes journaux classiques restent présents : /var/log/messages pour les messages généraux, /var/log/secure pour l'authentification. Les fichiers sont souvent rotationnés par logrotate, sinon ils finissent par saturer /var. journalctl --disk-usage indique l'espace occupé par le journal.",
+      "bullets": [
+        "multi-user.target = serveur sans bureau ; graphical.target = bureau",
+        "get-default lit la cible, set-default la modifie, isolate l'applique",
+        "journalctl -u filtre par unité, -f suit, -b limite au boot courant",
+        "--since et --until filtrent par date, -p err par priorité",
+        "/var/log/messages et /var/log/secure complètent le journal"
+      ],
+      "code": [
+        "systemctl get-default",
+        "systemctl set-default multi-user.target",
+        "journalctl -u sshd -b",
+        "journalctl -f -p err",
+        "journalctl --since '2026-10-01' --until '2026-10-02'",
+        "journalctl --disk-usage"
+      ],
+      "table": {
+        "headers": [
+          "Option",
+          "Effet"
+        ],
+        "rows": [
+          [
+            "-u unité",
+            "Limite à un service"
+          ],
+          [
+            "-f",
+            "Suit les nouveaux messages"
+          ],
+          [
+            "-b",
+            "Journal du démarrage courant"
+          ],
+          [
+            "--since / --until",
+            "Filtre par date"
+          ],
+          [
+            "-p err",
+            "Priorité erreur et plus grave"
+          ]
+        ]
+      },
+      "tip": "set-default ne change pas la cible de la session en cours : il modifie seulement le prochain démarrage. Pour basculer tout de suite, utilise isolate, en sachant que des services seront arrêtés."
+    },
+    {
+      "heading": "7. Processus, priorité et signaux",
+      "body": "Un processus est un programme en cours d'exécution, identifié par un PID. ps affiche un instantané : ps -ef montre tous les processus avec leur PPID, et ps aux ajoute l'usage CPU et mémoire. top ou htop actualisent en continu. pgrep cherche par nom, pstree affiche la filiation et jobs liste les tâches du shell courant.\n\nkill envoie un signal à un processus. SIGTERM (15) demande un arrêt propre et laisse le programme fermer ses fichiers ; SIGKILL (9) tue immédiatement sans possibilité de nettoyage. On commence donc toujours par SIGTERM, puis on attend, avant d'utiliser SIGKILL. SIGINT (2) correspond à Ctrl+C, SIGHUP (1) est souvent utilisé pour recharger une configuration, et SIGSTOP suspend un processus.\n\nnice et renice ajustent la priorité. nohup et la commande bg permettent de survivre à la fermeture du terminal, tandis que disown détache une tâche du shell. Un processus zombie n'occupe plus de mémoire mais garde une entrée dans la table tant que son parent n'a pas lu son code de retour.",
+      "bullets": [
+        "ps -ef donne PID et PPID ; pgrep cherche par nom",
+        "SIGTERM (15) permet un arrêt propre, SIGKILL (9) est immédiat",
+        "SIGINT (2) = Ctrl+C ; SIGHUP (1) sert souvent à recharger",
+        "nice et renice ajustent la priorité",
+        "nohup et disown détachent une tâche du terminal"
+      ],
+      "code": [
+        "ps -ef | grep nginx",
+        "pgrep -a nginx",
+        "kill -15 1234",
+        "kill -9 1234",
+        "renice +10 -p 1234"
+      ],
+      "table": {
+        "headers": [
+          "Signal",
+          "Numéro",
+          "Effet"
+        ],
+        "rows": [
+          [
+            "SIGHUP",
+            "1",
+            "Souvent interprété comme un rechargement de configuration"
+          ],
+          [
+            "SIGINT",
+            "2",
+            "Interruption, équivalent de Ctrl+C"
+          ],
+          [
+            "SIGTERM",
+            "15",
+            "Demande d'arrêt propre, signal par défaut de kill"
+          ],
+          [
+            "SIGKILL",
+            "9",
+            "Arrêt immédiat, non interceptable"
+          ],
+          [
+            "SIGSTOP",
+            "19",
+            "Suspension, non interceptable"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un service répond mal et tu veux l'arrêter proprement avant de le relancer. Quelle séquence de commandes utilises-tu, et pourquoi éviter kill -9 d'emblée ?",
+          "correction": "On identifie le PID avec systemctl status service ou pgrep -a service, puis on envoie kill -15 PID, ou mieux systemctl stop service pour que systemd suive l'état. SIGTERM laisse le programme fermer ses fichiers et libérer ses ressources. kill -9 ne peut pas être intercepté : le processus meurt sans nettoyage, ce qui peut laisser des fichiers verrouillés ou des données incohérentes. On ne l'utilise qu'en dernier recours."
+        }
+      ],
+      "tip": "kill n'est pas réservé à la mort d'un processus : c'est l'envoi d'un signal. kill -15 est poli, kill -9 est brutal. Commence toujours par 15."
+    }
+  ],
+  "key_points": [
+    "/etc/passwd décrit les comptes, /etc/shadow protège les hashs, /etc/group gère les groupes",
+    "usermod -aG ajoute un groupe secondaire sans écraser les autres",
+    "Les permissions octales additionnent r=4, w=2, x=1 par catégorie",
+    "umask 022 produit 755 pour un répertoire et 644 pour un fichier",
+    "DNF résout les dépendances ; dnf provides identifie le paquet d'un fichier",
+    "systemctl enable --now démarre et active un service",
+    "journalctl -u filtre par service, -f suit, -b limite au démarrage courant",
+    "SIGTERM permet un arrêt propre, SIGKILL est immédiat et non interceptable"
+  ],
+  "traps": [
+    "Confondre /etc/passwd (comptes) et /etc/shadow (mots de passe hashés)",
+    "Utiliser usermod -G au lieu de -aG et perdre les groupes existants",
+    "Croire que systemctl disable arrête le service immédiatement",
+    "Oublier systemctl daemon-reload après modification d'une unité",
+    "Envoyer SIGKILL en premier et empêcher tout nettoyage"
+  ],
+  "quiz": [
+    {
+      "id": "hcia-oe-03-q01",
+      "type": "single",
+      "prompt": "Which file stores the hashed passwords of Linux users?",
+      "options": [
+        "/etc/shadow",
+        "/etc/group",
+        "/etc/sudoers",
+        "/etc/passwd"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "/etc/shadow héberge les mots de passe hashés et la politique de vieillissement, avec une lecture réservée à root. /etc/passwd contient les comptes mais pas le hash, /etc/group décrit les groupes et /etc/sudoers la politique de délégation.",
+      "topic": "Users"
+    },
+    {
+      "id": "hcia-oe-03-q02",
+      "type": "single",
+      "prompt": "In openEuler, which tool manages RPM packages and resolves dependencies?",
+      "options": [
+        "apt",
+        "DNF",
+        "zypper",
+        "pacman"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "openEuler utilise DNF, avec l'alias yum pour compatibilité. APT est associé à Debian et Ubuntu, zypper à openSUSE et SUSE, pacman à Arch Linux : aucun de ces trois n'est le gestionnaire natif d'openEuler.",
+      "topic": "DNF"
+    },
+    {
+      "id": "hcia-oe-03-q03",
+      "type": "single",
+      "prompt": "Which command configures the default boot target in systemd?",
+      "options": [
+        "init 5",
+        "grub2-set-default",
+        "systemctl set-default",
+        "reboot -t 5"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "systemctl set-default graphical.target, par exemple, inscrit la cible de démarrage par défaut. init 5 ne change que la session courante, reboot -t règle un délai de redémarrage et grub2-set-default choisit une entrée de menu GRUB, pas une target systemd.",
+      "topic": "systemd targets"
+    },
+    {
+      "id": "hcia-oe-03-q04",
+      "type": "multi",
+      "prompt": "Which commands belong to the DNF package management family? (Choose three.)",
+      "options": [
+        "dnf repolist",
+        "dnf provides",
+        "dpkg -i",
+        "dnf install"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "install, repolist et provides sont des sous-commandes DNF : installation, liste des dépôts et recherche du paquet fournissant un fichier. dpkg -i appartient à la famille Debian et n'est pas l'outil de gestion de paquets d'openEuler.",
+      "topic": "DNF"
+    },
+    {
+      "id": "hcia-oe-03-q05",
+      "type": "multi",
+      "prompt": "Which statements about the systemd journal are correct? (Choose two.)",
+      "options": [
+        "journalctl -u sshd filters messages by unit",
+        "journalctl -f follows new messages in real time",
+        "journald stores its binary records in /etc/hosts",
+        "journalctl cannot filter by time"
+      ],
+      "answer": [
+        0,
+        1
+      ],
+      "explanation_fr": "L'option -u limite l'affichage à une unité et -f suit les nouveaux messages en temps réel. journald stocke ses enregistrements binaires dans /var/log/journal, pas dans /etc/hosts, et les options --since et --until permettent justement de filtrer par date.",
+      "topic": "journald"
+    },
+    {
+      "id": "hcia-oe-03-q06",
+      "type": "tf",
+      "prompt": "systemd is process ID 1 on openEuler.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : systemd est lancé par le noyau comme premier processus et porte le PID 1. Il initialise le système, monte les unités nécessaires et supervise les services pendant toute la durée de vie de la machine.",
+      "topic": "systemd"
+    },
+    {
+      "id": "hcia-oe-03-q07",
+      "type": "tf",
+      "prompt": "Sending SIGKILL allows a process to save its state before exiting.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : SIGKILL (9) est immédiat et ne peut pas être intercepté, donc le processus ne peut ni sauvegarder son état ni fermer proprement ses fichiers. C'est SIGTERM (15) qui demande un arrêt propre et laisse au programme la possibilité de se nettoyer.",
+      "topic": "Signals"
+    },
+    {
+      "id": "hcia-oe-03-q08",
+      "type": "text",
+      "prompt": "Which single command immediately starts the sshd service and enables it at boot? (systemctl syntax)",
+      "accept": [
+        "systemctl enable --now sshd",
+        "systemctl enable --now sshd.service",
+        "systemctl enable --now sshd.service."
+      ],
+      "sample_answer": "systemctl enable --now sshd",
+      "explanation_fr": "enable --now combine l'enregistrement au démarrage et le démarrage immédiat du service. systemctl start seul ne l'active pas au boot, et systemctl enable seul ne le démarre pas dans la session courante.",
+      "topic": "systemctl"
+    },
+    {
+      "id": "hcia-oe-03-q09",
+      "type": "text",
+      "prompt": "Which command line adds user alice to the existing group wheel without removing her other secondary groups?",
+      "accept": [
+        "usermod -aG wheel alice",
+        "usermod -a -G wheel alice",
+        "usermod --append --groups wheel alice"
+      ],
+      "sample_answer": "usermod -aG wheel alice",
+      "explanation_fr": "L'option -a (append) associée à -G ajoute le groupe à la liste existante. Sans -a, -G réécrit entièrement les groupes secondaires et fait perdre à alice ses autres appartenances. La vérification se fait avec id alice.",
+      "topic": "Users"
+    },
+    {
+      "id": "hcia-oe-03-q10",
+      "type": "single",
+      "prompt": "In the numeric permissions 755, what do the permissions of other users look like?",
+      "options": [
+        "rw-",
+        "--x",
+        "rwx",
+        "r-x"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "755 se lit 7 (rwx) pour le propriétaire, 5 (r-x) pour le groupe et 5 (r-x) pour les autres. Les autres propositions correspondent à 7, 6 ou 1, pas à 5.",
+      "topic": "Permissions"
+    },
+    {
+      "id": "hcia-oe-03-q11",
+      "type": "single",
+      "prompt": "Which file contains the list of secondary members of each group?",
+      "options": [
+        "/etc/group",
+        "/etc/gshadow",
+        "/etc/passwd",
+        "/etc/shadow"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "/etc/group contient le nom du groupe, son GID et la liste de ses membres secondaires. /etc/passwd ne stocke que le GID primaire, /etc/shadow les mots de passe et /etc/gshadow les mots de passe de groupe : aucun ne remplace la liste de /etc/group.",
+      "topic": "Users"
+    },
+    {
+      "id": "hcia-oe-03-q12",
+      "type": "single",
+      "prompt": "What do the permissions 644 mean for a regular file?",
+      "options": [
+        "r--r--r--",
+        "rw-r--r--",
+        "rwxr--r--",
+        "rw-rw-rw-"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "6 = rw- pour le propriétaire, 4 = r-- pour le groupe et 4 = r-- pour les autres, soit rw-r--r--. 744 donnerait rwxr--r--, 666 donnerait rw-rw-rw- et 444 r--r--r--.",
+      "topic": "Permissions"
+    },
+    {
+      "id": "hcia-oe-03-q13",
+      "type": "single",
+      "prompt": "With umask 022, what permissions does a newly created directory receive?",
+      "options": [
+        "700",
+        "775",
+        "755",
+        "644"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Un répertoire part de 777 et l'umask 022 retire l'écriture au groupe et aux autres, ce qui donne 755 (rwxr-xr-x). Pour un fichier, le calcul part de 666 et donne 644. 700 correspondrait à un umask 077 et 775 à un umask 002.",
+      "topic": "Permissions"
+    },
+    {
+      "id": "hcia-oe-03-q14",
+      "type": "multi",
+      "prompt": "Which statements about process signals are correct? (Choose two.)",
+      "options": [
+        "SIGKILL cannot be caught or ignored by the process",
+        "SIGKILL always lets the process flush its buffers",
+        "SIGINT is the signal used to reload a configuration",
+        "SIGTERM allows a process to clean up before exiting"
+      ],
+      "answer": [
+        0,
+        3
+      ],
+      "explanation_fr": "SIGTERM demande un arrêt propre et laisse le programme fermer ses ressources, tandis que SIGKILL est traité directement par le noyau et ne peut être intercepté. SIGKILL ne permet donc aucun vidage de tampon, et c'est SIGHUP, pas SIGINT, qui sert le plus souvent à recharger une configuration.",
+      "topic": "Signals"
+    },
+    {
+      "id": "hcia-oe-03-q15",
+      "type": "tf",
+      "prompt": "chmod 777 gives read, write and execute permissions to the owner, the group and other users.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : chaque chiffre 7 vaut rwx, et les trois chiffres couvrent respectivement le propriétaire, le groupe et les autres. C'est généralement une mauvaise pratique, car tout utilisateur peut modifier le fichier ou le script.",
+      "topic": "Permissions"
+    },
+    {
+      "id": "hcia-oe-03-q16",
+      "type": "text",
+      "prompt": "Which command reloads systemd unit definitions after a unit file has been edited? (Give the full command.)",
+      "accept": [
+        "systemctl daemon-reload",
+        "systemctl daemon-reload."
+      ],
+      "sample_answer": "systemctl daemon-reload",
+      "explanation_fr": "systemctl daemon-reload fait relire à systemd ses fichiers d'unités. Sans cette commande, les modifications restent ignorées jusqu'au prochain démarrage. Elle ne redémarre pas les services déjà actifs : il faut ensuite les redémarrer explicitement.",
+      "topic": "systemd"
+    },
+    {
+      "id": "hcia-oe-03-q17",
+      "type": "text",
+      "prompt": "Which command lists systemd units that are currently in a failed state? (Give the full command.)",
+      "accept": [
+        "systemctl --failed",
+        "systemctl list-units --failed",
+        "systemctl --failed --all"
+      ],
+      "sample_answer": "systemctl --failed",
+      "explanation_fr": "systemctl --failed filtre la liste des unités et n'affiche que celles dont l'état est failed. C'est le premier réflexe après un démarrage pour repérer un service qui n'a pas pu se lancer. journalctl -p err complète le diagnostic en montrant les messages d'erreur.",
+      "topic": "systemd"
+    },
+    {
+      "id": "hcia-oe-03-q18",
+      "type": "single",
+      "prompt": "Why should /etc/sudoers be edited with visudo?",
+      "options": [
+        "Because only visudo can add the wheel group",
+        "Because visudo restarts sudo automatically",
+        "Because visudo encrypts the file",
+        "Because visudo locks the file and validates its syntax before saving"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "visudo verrouille le fichier pour éviter les modifications concurrentes et vérifie la syntaxe avant d'enregistrer. Une erreur de syntaxe non contrôlée peut empêcher toute utilisation de sudo. visudo ne chiffre pas le fichier, n'est pas le seul moyen d'ajouter un groupe et ne redémarre pas de service.",
+      "topic": "sudo"
+    },
+    {
+      "id": "hcia-oe-03-q19",
+      "type": "single",
+      "prompt": "Which journalctl option limits the output to messages from the current boot?",
+      "options": [
+        "-b",
+        "-f",
+        "-u",
+        "-p"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "-b sélectionne le démarrage courant. -f suit les nouveaux messages, -u filtre sur une unité et -p filtre sur un niveau de priorité : ces options répondent à d'autres besoins et ne limitent pas au boot courant.",
+      "topic": "journald"
+    },
+    {
+      "id": "hcia-oe-03-q20",
+      "type": "single",
+      "prompt": "Which command finds the package that provides the file /usr/bin/vim?",
+      "options": [
+        "dnf repolist /usr/bin/vim",
+        "dnf provides /usr/bin/vim",
+        "dnf install /usr/bin/vim",
+        "rpm -qa /usr/bin/vim"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "dnf provides interroge les métadonnées des dépôts et indique quel paquet contient ce fichier, même si le paquet n'est pas installé. dnf install attend un nom de paquet, rpm -qa liste les paquets installés sans prendre un chemin en argument, et repolist n'accepte pas de chemin de fichier.",
+      "topic": "DNF"
+    }
+  ]
+}

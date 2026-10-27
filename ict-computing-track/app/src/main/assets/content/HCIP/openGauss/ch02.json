@@ -1,0 +1,622 @@
+{
+  "id": "hcip-og-02",
+  "phase": "HCIP",
+  "subject": "openGauss",
+  "number": 2,
+  "title_fr": "Optimisation des performances openGauss",
+  "title_en": "Performance Optimization",
+  "minutes": 60,
+  "source": "HCIP-openGauss V1.0 Training Material — Sessions 3 «Checking Database Performance» + 4 «Advanced SQL Syntax»",
+  "objectives": [
+    "Conduire une démarche de tuning mesurée et documentée",
+    "Dimensionner shared_buffers, work_mem et effective_cache_size sans risque mémoire",
+    "Lire un plan EXPLAIN ANALYZE et identifier l'opérateur ou le prédicat fautif",
+    "Maintenir des statistiques fiables et choisir le bon type d'index",
+    "Concevoir un partitionnement efficace et maîtriser VACUUM ainsi que le bloat",
+    "Choisir entre moteur ligne, colonne et MOT selon la charge"
+  ],
+  "sections": [
+    {
+      "heading": "Méthodologie : mesurer avant de tuner",
+      "body": "Optimiser sans mesure revient à modifier des paramètres au hasard. La démarche openGauss commence par l'observation : gs_checkperf fournit une photographie du cluster (CPU de l'hôte, ratio de cache partagé, lectures et écritures physiques, nombre de sessions actives), tandis que pg_stat_activity révèle les requêtes en cours et leur état d'attente. Pour les tendances, activez pg_stat_statements afin d'agréger les temps d'exécution par requête, et exploitez les WDR pour comparer deux périodes.\n\nLa deuxième étape identifie les requêtes les plus coûteuses, pas seulement les plus lentes : une requête appelée mille fois par minute avec dix millisecondes peut peser plus qu'un rapport de trente secondes exécuté une fois par jour. On classe par temps total, par nombre d'appels et par lectures de buffers. Vient ensuite l'analyse du plan avec EXPLAIN (ANALYZE, BUFFERS), puis une seule modification à la fois : index, statistiques, réécriture ou paramètre. On mesure de nouveau, dans les mêmes conditions, et on documente le gain. Le tuning est un cycle, pas une configuration définitive.",
+      "bullets": [
+        "gs_checkperf donne les indicateurs matériels et de cache du cluster",
+        "pg_stat_statements classe les requêtes par coût cumulé",
+        "Les WDR comparent deux fenêtres d'activité pour objectiver les régressions",
+        "Une seule variable modifiée à la fois, avec mesure avant et après"
+      ],
+      "code": [
+        "gs_checkperf -i pmk -U omm",
+        "SELECT query, calls, mean_exec_time, total_exec_time",
+        "FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;",
+        "SELECT pid, state, wait_status, query FROM pg_stat_activity",
+        "WHERE state <> 'idle' ORDER BY query_start;"
+      ],
+      "diagram": "  Mesurer          Identifier        Analyser\ngs_checkperf  -->  top requêtes  -->  EXPLAIN\npg_stat_*          (temps total)      BUFFERS\n     ^                                   |\n     |                                   v\n  Valider       <--  Modifier UN      Choisir\n  benchmark          paramètre        index / SQL",
+      "exercises": [
+        {
+          "prompt": "Une application se plaint de lenteur à 9 h. gs_checkperf montre un ratio de cache partagé de 99,9 % et un CPU hôte à 15 %. Par où commencez-vous ?",
+          "correction": "Le cache et le CPU ne sont pas les goulots. Il faut interroger pg_stat_activity pour repérer les sessions actives et leur wait_status, puis pg_stat_statements pour classer les requêtes par temps total sur la fenêtre 8 h 45 - 9 h 15. Un WDR comparant 8 h et 9 h confirmera la dégradation. On cherche ensuite les verrous, les attentes d'I/O ou une requête nouvellement déployée, plutôt que d'augmenter shared_buffers sans preuve."
+        }
+      ],
+      "tip": "Le ratio de cache élevé ne prouve pas que tout va bien : il peut masquer un scan répété qui hit le cache mais consomme du CPU. Mesurez toujours le temps et les buffers, pas seulement le hit ratio."
+    },
+    {
+      "heading": "Mémoire : shared_buffers, work_mem et effective_cache_size",
+      "body": "La mémoire d'une instance openGauss se répartit en plusieurs zones aux rôles distincts. shared_buffers est le cache de pages partagé par toutes les sessions ; il absorbe les lectures répétées et amortit les écritures. work_mem n'est pas un cache global : chaque tri, hachage ou jointure peut consommer jusqu'à cette valeur, et plusieurs opérations peuvent être simultanées dans une même requête. maintenance_work_mem accélère VACUUM, CREATE INDEX et ANALYZE, mais n'est pas alloué en permanence. max_process_memory plafonne la mémoire d'un nœud et doit rester cohérent avec la RAM réelle.\n\neffective_cache_size n'alloue rien : c'est une estimation transmise à l'optimiseur pour qu'il évalue le coût d'un parcours d'index. Une valeur trop basse pousse au Seq Scan, une valeur trop haute favorise excessivement l'index. Sur un serveur dédié, on dimensionne shared_buffers autour d'un quart de la RAM, on laisse le reste au système, et on calcule le pire cas de work_mem : connexions simultanées multipliées par opérations par requête.",
+      "bullets": [
+        "shared_buffers : cache partagé, allocation fixe au démarrage",
+        "work_mem : budget par opération de tri ou de hachage, pas par session",
+        "effective_cache_size : indication pour l'optimiseur, sans allocation",
+        "maintenance_work_mem : accélérateur ponctuel des opérations de maintenance"
+      ],
+      "code": [
+        "ALTER SYSTEM SET shared_buffers = '8GB';",
+        "ALTER SYSTEM SET work_mem = '64MB';",
+        "ALTER SYSTEM SET effective_cache_size = '24GB';",
+        "ALTER SYSTEM SET max_process_memory = '32GB';",
+        "SELECT pg_reload_conf();",
+        "SHOW work_mem;"
+      ],
+      "table": {
+        "headers": [
+          "Paramètre",
+          "Nature",
+          "Risque si trop élevé"
+        ],
+        "rows": [
+          [
+            "shared_buffers",
+            "Cache partagé alloué",
+            "Pression mémoire, swap, OOM"
+          ],
+          [
+            "work_mem",
+            "Par opération et par session",
+            "Explosion mémoire avec les connexions"
+          ],
+          [
+            "maintenance_work_mem",
+            "Par opération de maintenance",
+            "Concurrence avec le trafic"
+          ],
+          [
+            "effective_cache_size",
+            "Estimation seulement",
+            "Choix d'index irréalistes"
+          ],
+          [
+            "max_process_memory",
+            "Plafond par nœud",
+            "Refus d'allocation, erreurs"
+          ]
+        ]
+      },
+      "tip": "work_mem se multiplie par le nombre d'opérations simultanées, pas seulement par le nombre de sessions. Une requête avec trois tris peut consommer trois fois work_mem."
+    },
+    {
+      "heading": "Lire et corriger un plan d'exécution",
+      "body": "EXPLAIN affiche le plan estimé ; EXPLAIN ANALYZE exécute réellement la requête et confronte les lignes estimées aux lignes réelles. L'option BUFFERS ajoute les pages lues dans le cache et sur disque, ce qui distingue un plan rapide d'un plan qui martèle le stockage. On lit un plan de bas en haut : les nœuds les plus profonds produisent les lignes, les nœuds supérieurs les consument. Un écart important entre estimated rows et actual rows révèle des statistiques obsolètes ou une corrélation entre colonnes.\n\nLes opérateurs racontent la stratégie choisie. Seq Scan parcourt toute la table et devient coûteux sur les gros volumes ; Index Scan convient quand peu de lignes sont retournées ; Nested Loop excelle sur de petites entrées mais explose sur des volumes moyens ; Hash Join et Merge Join traitent les grandes jointures. Un tri qui déborde sur disque, signalé par des blocs temporaires, indique un work_mem insuffisant ou un index d'ordre absent. Enfin, une fonction appliquée à une colonne indexée, un cast implicite ou un OR mal formulé peuvent rendre un index inutilisable : réécrivez le prédicat ou créez un index d'expression.",
+      "bullets": [
+        "EXPLAIN ANALYZE exécute la requête et révèle les écarts d'estimation",
+        "BUFFERS distingue lectures en cache et lectures physiques",
+        "Nested Loop pour de petites entrées, Hash Join pour les gros volumes",
+        "Fonction sur colonne ou cast implicite peut invalider un index"
+      ],
+      "code": [
+        "EXPLAIN (ANALYZE, BUFFERS)",
+        "SELECT * FROM orders WHERE customer_id = 42 AND status = 'open';",
+        "CREATE INDEX idx_orders_customer_status ON orders(customer_id, status);",
+        "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders",
+        "WHERE date_trunc('day', created_at) = DATE '2026-10-27';"
+      ],
+      "table": {
+        "headers": [
+          "Opérateur",
+          "Quand il est adapté",
+          "Signal d'alerte"
+        ],
+        "rows": [
+          [
+            "Seq Scan",
+            "Petite table ou forte proportion de lignes",
+            "Grosse table avec filtre sélectif"
+          ],
+          [
+            "Index Scan",
+            "Peu de lignes retournées",
+            "Milliers d'accès aléatoires"
+          ],
+          [
+            "Nested Loop",
+            "Entrée externe très petite",
+            "Boucles internes répétées"
+          ],
+          [
+            "Hash Join",
+            "Deux volumes moyens à grands",
+            "Hash spill sur disque"
+          ],
+          [
+            "Merge Join",
+            "Entrées déjà triées",
+            "Tri préalable coûteux"
+          ]
+        ]
+      },
+      "tip": "EXPLAIN ANALYZE exécute vraiment la requête. Pour un UPDATE ou DELETE lourd, enveloppez-le dans BEGIN ... ROLLBACK, ou utilisez EXPLAIN seul pour éviter une modification réelle."
+    },
+    {
+      "heading": "Statistiques, index et lutte contre le bloat",
+      "body": "L'optimiseur choisit un plan à partir des statistiques collectées par ANALYZE et stockées dans pg_statistic. Des statistiques périmées après un chargement massif produisent des estimations fausses et des choix désastreux. On ajuste la précision par colonne avec ALTER TABLE ... ALTER COLUMN ... SET STATISTICS, surtout pour les colonnes très asymétriques ou corrélées, puis on relance ANALYZE. Le paramètre default_statistics_target fixe la valeur par défaut, mais une colonne à forte cardinalité mérite un réglage plus fin.\n\nLes index ne sont pas gratuits : chacun ralentit les écritures et occupe de l'espace. Un B-tree couvre l'égalité et les plages ; GIN sert au texte, aux tableaux et au JSON ; GiST convient aux données géométriques et aux recherches de proximité ; un index partiel cible un sous-ensemble récurrent. CREATE INDEX CONCURRENTLY évite de bloquer les écritures en production. Surveillez pg_stat_user_indexes : un index dont idx_scan reste à zéro est un candidat à la suppression. Les suppressions massives créent du bloat d'index, que REINDEX corrige.",
+      "bullets": [
+        "ANALYZE alimente pg_statistic, base des estimations du plan",
+        "SET STATISTICS renforce la précision sur les colonnes sensibles",
+        "GIN pour JSON et texte, GiST pour les données géométriques",
+        "CREATE INDEX CONCURRENTLY évite le verrou d'écriture",
+        "Un index jamais scanné coûte sans servir : mesurez avant de supprimer"
+      ],
+      "code": [
+        "ANALYZE orders;",
+        "ALTER TABLE orders ALTER COLUMN status SET STATISTICS 500;",
+        "ANALYZE orders (status);",
+        "CREATE INDEX CONCURRENTLY idx_open_orders",
+        "ON orders(status) WHERE status = 'open';",
+        "SELECT indexrelname, idx_scan FROM pg_stat_user_indexes",
+        "ORDER BY idx_scan ASC LIMIT 10;",
+        "REINDEX INDEX idx_orders_customer_status;"
+      ],
+      "exercises": [
+        {
+          "prompt": "Après la suppression de 70 % des lignes d'une table, les requêtes ralentissent alors que le plan reste identique. Quelle est la cause probable et que faites-vous ?",
+          "correction": "Les lignes mortes et le bloat d'index augmentent le nombre de pages lues, même si le plan ne change pas. Il faut lancer VACUUM ANALYZE pour recycler l'espace et rafraîchir les statistiques, puis vérifier le taux de bloat. Si l'index est très gonflé, REINDEX le reconstruit. Un VACUUM FULL réduirait physiquement le fichier mais prend un verrou exclusif : à réserver à une fenêtre de maintenance."
+        }
+      ],
+      "tip": "Un index partiel n'est utilisé que si la requête contient exactement le prédicat compatible. Un WHERE status = 'OPEN' ne déclenche pas forcément l'index créé sur status = 'open'."
+    },
+    {
+      "heading": "Partitionnement et élagage des partitions",
+      "body": "Le partitionnement découpe une grande table en sous-tables plus petites, chacune avec ses index et ses statistiques. openGauss propose le partitionnement par plage (RANGE), par liste (LIST) et par hachage (HASH). Le choix dépend des requêtes : une table d'historique se partitionne par mois, une table de commandes par région, une table à forte cardinalité par hachage pour équilibrer les volumes. Le bénéfice principal est l'élagage : si la clause WHERE porte sur la clé de partitionnement, le plan ne scanne que les partitions concernées.\n\nLe partitionnement n'est pas la distribution. Dans un cluster distribué, DISTRIBUTE BY HASH répartit les lignes entre les nœuds de données, tandis que PARTITION BY découpe une table en partitions à l'intérieur de chaque nœud. Confondre les deux mène à des plans inattendus. Pour l'archivage, on détache ou on supprime une partition entière, opération bien moins coûteuse qu'un DELETE massif. Attention aux index globaux et aux contraintes : vérifiez leur comportement lors du détachement. Un partitionnement mal choisi peut aussi dégrader les insertions si toutes les lignes tombent dans une seule partition.",
+      "bullets": [
+        "RANGE pour les dates, LIST pour les catégories, HASH pour équilibrer",
+        "Le pruning ne s'active que si le filtre porte sur la clé de partition",
+        "PARTITION BY découpe la table ; DISTRIBUTE BY répartit entre nœuds",
+        "Détacher une partition archive sans DELETE massif"
+      ],
+      "code": [
+        "CREATE TABLE sales (id bigint, sale_date date, amount numeric)",
+        "PARTITION BY RANGE (sale_date) (",
+        "  PARTITION p2026_09 VALUES LESS THAN ('2026-10-01'),",
+        "  PARTITION p2026_10 VALUES LESS THAN ('2026-11-01'),",
+        "  PARTITION pmax VALUES LESS THAN (MAXVALUE));",
+        "EXPLAIN SELECT * FROM sales WHERE sale_date >= '2026-10-01';",
+        "ALTER TABLE sales DETACH PARTITION p2026_09;"
+      ],
+      "diagram": "Table sales (non partitionnée)\n+------+------------+--------+\n| id   | sale_date  | amount |\n+------+------------+--------+\n          | PARTITION BY RANGE\n          v\n+-------------+  +-------------+  +------+\n| p2026_09    |  | p2026_10    |  | pmax |\n| sept.       |  | octobre     |  | ...  |\n+-------------+  +-------------+  +------+\nWHERE sale_date >= '2026-10-01'  -->  seules p2026_10 et pmax sont lues",
+      "exercises": [
+        {
+          "prompt": "Une table de logs de 2 milliards de lignes est filtrée presque toujours par jour. Comment la partitionner et quel piège éviter ?",
+          "correction": "On la partitionne par RANGE sur la colonne de date, avec une partition par jour ou par mois selon le volume et la rétention. Les requêtes portant sur une date bénéficieront du pruning. Le piège est d'appliquer une fonction sur la colonne dans le WHERE, par exemple date_trunc('day', log_time) = ..., ce qui empêche l'élagage ; il faut écrire une plage log_time >= ... AND log_time < .... On prévoit aussi une partition par défaut et une politique de détachement des anciennes partitions."
+        }
+      ],
+      "tip": "Le pruning exige un prédicat sur la colonne de partitionnement elle-même, pas sur une expression calculée. Vérifiez toujours avec EXPLAIN que les partitions inutiles disparaissent."
+    },
+    {
+      "heading": "VACUUM, autovacuum et entretien des tables",
+      "body": "Le moteur ligne d'openGauss utilise MVCC : une mise à jour crée une nouvelle version du tuple et laisse l'ancienne sur la page. Les lignes mortes ne disparaissent pas immédiatement, ce qui évite des lectures bloquantes mais gonfle les tables. VACUUM recycle l'espace des tuples morts et met à jour la carte de visibilité, sans rendre l'espace au système d'exploitation. VACUUM FULL réécrit la table et restitue l'espace, mais prend un verrou exclusif et bloque les accès : il se planifie en fenêtre de maintenance.\n\nAutovacuum automatise VACUUM et ANALYZE à partir de seuils de lignes modifiées. Le laisser actif est une bonne pratique, mais ses seuils doivent être ajustés sur les grosses tables à forte rotation. Il faut aussi surveiller l'âge des transactions : un VACUUM en retard expose au wraparound des identifiants de transaction, incident grave qui force l'arrêt des écritures. Les suppressions répétées gonflent aussi les index ; REINDEX reconstruit un index efficace. Une routine saine combine autovacuum, VACUUM ANALYZE après les chargements massifs et surveillance du bloat.",
+      "bullets": [
+        "VACUUM recycle les tuples morts sans rendre l'espace au système",
+        "VACUUM FULL réécrit la table avec un verrou exclusif",
+        "Autovacuum déclenche VACUUM et ANALYZE selon des seuils",
+        "Surveiller l'âge des transactions pour éviter le wraparound",
+        "REINDEX corrige le bloat d'index après des suppressions massives"
+      ],
+      "code": [
+        "VACUUM (ANALYZE, VERBOSE) orders;",
+        "VACUUM FULL orders;",
+        "SELECT relname, n_live_tup, n_dead_tup, last_autovacuum",
+        "FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 10;",
+        "REINDEX TABLE orders;"
+      ],
+      "table": {
+        "headers": [
+          "Opération",
+          "Espace rendu au système",
+          "Verrou"
+        ],
+        "rows": [
+          [
+            "VACUUM",
+            "Non",
+            "Faible, compatible avec DML"
+          ],
+          [
+            "VACUUM FULL",
+            "Oui",
+            "Exclusif, bloque la table"
+          ],
+          [
+            "ANALYZE",
+            "Sans objet",
+            "Lecture des données"
+          ],
+          [
+            "REINDEX",
+            "Reconstruit l'index",
+            "Selon la variante utilisée"
+          ]
+        ]
+      },
+      "tip": "VACUUM ne peut pas s'exécuter dans un bloc de transaction. Un BEGIN suivi de VACUUM échoue : lancez la commande en autocommit."
+    },
+    {
+      "heading": "MOT, stockage colonne et choix du moteur",
+      "body": "openGauss propose plusieurs moteurs pour épouser des charges différentes. Le moteur ligne, orienté OLTP, gère les transactions courtes et les mises à jour aléatoires. Le moteur colonne, orienté OLAP, stocke les données par colonnes compressées et accélère les agrégats sur de grands volumes. MOT (Memory-Optimized Tables) place les données en mémoire avec une structure Masstree et un contrôle de concurrence léger : selon la charge, il multiplie le débit transactionnel par trois à dix. Il ne faut pas en conclure que les données sont volatiles : MOT s'appuie sur des journaux et un stockage persistant, la mémoire n'étant que le support d'exécution.\n\nLe choix du moteur est un choix de conception, pas un réglage après coup. MOT convient aux tables de session, aux files d'attente et aux compteurs très chauds, pas aux rapports analytiques qui balayent des millions de lignes. Le colonne convient aux entrepôts et aux agrégations, mais supporte moins bien les mises à jour unitaires fréquentes. Une architecture HTAP combine souvent les deux : ligne pour le transactionnel, colonne pour l'analyse, avec une réplication ou une synchronisation maîtrisée.",
+      "bullets": [
+        "Ligne pour l'OLTP, colonne pour l'OLAP, MOT pour le transactionnel extrême",
+        "MOT s'appuie sur Masstree et un contrôle de concurrence allégé",
+        "MOT est persistant : la mémoire n'est pas le seul support",
+        "Le moteur se choisit à la conception, pas comme un index"
+      ],
+      "code": [
+        "-- Le moteur MOT est activé par configuration (mot.conf)",
+        "CREATE FOREIGN TABLE mot_session (",
+        "  session_id bigint NOT NULL,",
+        "  payload text",
+        ") SERVER mot_server;",
+        "SELECT * FROM pg_tables WHERE tablename = 'mot_session';"
+      ],
+      "table": {
+        "headers": [
+          "Moteur",
+          "Charge cible",
+          "Point faible"
+        ],
+        "rows": [
+          [
+            "Ligne (Astore)",
+            "OLTP, mises à jour aléatoires",
+            "Bloat et lectures analytiques"
+          ],
+          [
+            "Colonne (Cstore)",
+            "OLAP, agrégats, compression",
+            "Mises à jour unitaires"
+          ],
+          [
+            "MOT",
+            "Transactions très chaudes en mémoire",
+            "Volume limité par la RAM"
+          ]
+        ]
+      },
+      "tip": "MOT ne veut pas dire « sans durabilité ». Le piège classique consiste à croire qu'un redémarrage efface les tables MOT : les journaux et le stockage persistent les données."
+    }
+  ],
+  "key_points": [
+    "Mesurer avec gs_checkperf, pg_stat_activity et pg_stat_statements avant toute modification",
+    "EXPLAIN (ANALYZE, BUFFERS) confronte estimation et réalité, et révèle les I/O",
+    "shared_buffers est un cache alloué, effective_cache_size une estimation, et work_mem se multiplie par opération",
+    "ANALYZE et SET STATISTICS conditionnent la qualité des plans",
+    "CREATE INDEX CONCURRENTLY évite de bloquer les écritures en production",
+    "Le partitionnement RANGE, LIST ou HASH active le pruning sur la clé filtrée",
+    "VACUUM recycle l'espace, VACUUM FULL le rend au système mais verrouille la table",
+    "MOT et le stockage colonne répondent à des charges distinctes, pas universelles"
+  ],
+  "traps": [
+    "PARTITION BY découpe une table en partitions ; DISTRIBUTE BY répartit les lignes entre nœuds : ce sont deux mécanismes différents",
+    "EXPLAIN ANALYZE exécute réellement la requête : sur un DML lourd, utilisez une transaction annulée",
+    "Le hit ratio de cache élevé ne prouve pas l'absence de problème : une requête peut consommer du CPU sans I/O",
+    "Un index partiel n'est utilisé que si le prédicat de la requête est compatible avec sa clause WHERE",
+    "VACUUM FULL bloque la table : ne le confondez pas avec VACUUM, qui reste en ligne"
+  ],
+  "quiz": [
+    {
+      "id": "hcip-og-02-q01",
+      "type": "single",
+      "prompt": "Which parameter gives the planner an estimate of OS cache without allocating any memory?",
+      "options": [
+        "effective_cache_size",
+        "maintenance_work_mem",
+        "shared_buffers",
+        "work_mem"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "effective_cache_size est une indication de coût destinée à l'optimiseur ; elle n'alloue rien. work_mem limite la mémoire d'un tri ou d'un hachage par opération, et maintenance_work_mem accélère les opérations de maintenance. shared_buffers, lui, est réellement alloué au démarrage. Confondre ces paramètres conduit à surestimer la mémoire disponible.",
+      "topic": "Mémoire et optimiseur"
+    },
+    {
+      "id": "hcip-og-02-q02",
+      "type": "single",
+      "prompt": "Which EXPLAIN option executes the query and reports actual rows plus buffer usage?",
+      "options": [
+        "EXPLAIN (FORMAT JSON)",
+        "EXPLAIN (ANALYZE, BUFFERS)",
+        "EXPLAIN (VERBOSE)",
+        "EXPLAIN (COSTS OFF)"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "ANALYZE exécute la requête et affiche les lignes réelles et les temps, tandis que BUFFERS ajoute les pages lues en cache et sur disque. VERBOSE détaille les colonnes sans exécuter, COSTS OFF masque les coûts, et FORMAT JSON change seulement la présentation. Seule la combinaison ANALYZE et BUFFERS fournit les mesures d'exécution et d'I/O.",
+      "topic": "Plans d'exécution"
+    },
+    {
+      "id": "hcip-og-02-q03",
+      "type": "single",
+      "prompt": "Which index type is best suited to JSON containment and full-text style searches?",
+      "options": [
+        "Hash",
+        "B-tree",
+        "GIN",
+        "GiST"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "GIN indexe des contenus composites comme les documents JSON et les tableaux, et prend en charge les opérateurs de containment. Le B-tree convient à l'égalité et aux plages scalaires, GiST aux données géométriques et spatiales, et le Hash seulement à l'égalité. GIN est donc le choix adapté aux recherches textuelles et JSON.",
+      "topic": "Types d'index"
+    },
+    {
+      "id": "hcip-og-02-q04",
+      "type": "single",
+      "prompt": "How is work_mem accounted for in openGauss?",
+      "options": [
+        "As a fixed global cache shared by all sessions",
+        "Only during VACUUM and CREATE INDEX",
+        "Once per connection, regardless of operations",
+        "Per sort or hash operation, possibly several times per query"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "work_mem est un budget par opération : une requête avec plusieurs tris ou hachages peut le consommer plusieurs fois, et plusieurs sessions peuvent le faire simultanément. Ce n'est pas un cache global comme shared_buffers, ni une allocation unique par connexion. La consommation de maintenance est régie par maintenance_work_mem, un paramètre distinct.",
+      "topic": "Mémoire et tri"
+    },
+    {
+      "id": "hcip-og-02-q05",
+      "type": "single",
+      "prompt": "What is required for partition pruning to eliminate irrelevant partitions?",
+      "options": [
+        "The WHERE clause must filter on the partition key",
+        "The table must be distributed by HASH",
+        "All partitions must have a global index",
+        "The query must use a subquery"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "L'élagage compare les prédicats au découpage des partitions : il faut filtrer sur la clé de partitionnement, sans fonction qui masque la colonne. La distribution HASH est un mécanisme distinct qui répartit les lignes entre nœuds. Les index globaux et les sous-requêtes ne conditionnent pas le pruning. Une expression comme date_trunc(colonne) peut au contraire l'empêcher.",
+      "topic": "Partitionnement"
+    },
+    {
+      "id": "hcip-og-02-q06",
+      "type": "single",
+      "prompt": "Which maintenance operation reclaims space to the operating system but takes an exclusive lock?",
+      "options": [
+        "VACUUM",
+        "VACUUM FULL",
+        "ANALYZE",
+        "CREATE INDEX CONCURRENTLY"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "VACUUM FULL réécrit la table dans un nouveau fichier et restitue l'espace au système, au prix d'un verrou exclusif qui bloque les accès. VACUUM recycle les tuples morts sans rendre l'espace et reste en ligne. ANALYZE ne fait que collecter des statistiques. CREATE INDEX CONCURRENTLY évite justement le blocage des écritures.",
+      "topic": "Maintenance des tables"
+    },
+    {
+      "id": "hcip-og-02-q07",
+      "type": "single",
+      "prompt": "For which workload is the MOT storage engine primarily designed?",
+      "options": [
+        "Full-text search over documents",
+        "Large analytical scans with heavy compression",
+        "High-throughput OLTP with very hot small transactions",
+        "Archiving cold historical data"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "MOT place les données en mémoire avec une structure Masstree et un contrôle de concurrence léger, ce qui convient aux transactions OLTP très chaudes. Les scans analytiques massifs relèvent plutôt du stockage colonne, l'archivage du partitionnement et de la sauvegarde, et la recherche textuelle des index GIN. MOT n'est donc pas un moteur universel.",
+      "topic": "Moteur MOT"
+    },
+    {
+      "id": "hcip-og-02-q08",
+      "type": "single",
+      "prompt": "Which object aggregates execution statistics per normalized SQL statement?",
+      "options": [
+        "pg_locks",
+        "pg_class",
+        "pg_stat_activity",
+        "pg_stat_statements"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "pg_stat_statements regroupe les requêtes normalisées et fournit appels, temps moyen et temps total, ce qui permet de classer les coûts. pg_stat_activity montre les sessions en cours mais pas l'historique agrégé. pg_locks décrit les verrous et pg_class les objets de catalogue. Pour identifier la requête la plus coûteuse cumulée, pg_stat_statements est l'outil approprié.",
+      "topic": "Diagnostic de performance"
+    },
+    {
+      "id": "hcip-og-02-q09",
+      "type": "single",
+      "prompt": "After massive deletions, which operation best repairs a bloated B-tree index?",
+      "options": [
+        "REINDEX",
+        "VACUUM FULL on the table only",
+        "TRUNCATE",
+        "ANALYZE"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "REINDEX reconstruit l'index et élimine les pages partiellement vides causées par les suppressions. ANALYZE ne fait que rafraîchir les statistiques. VACUUM FULL sur la table réécrit les données mais ne reconstruit pas spécifiquement l'index, et TRUNCATE supprimerait toutes les lignes. Pour le bloat d'index, REINDEX est la réponse directe.",
+      "topic": "Index et bloat"
+    },
+    {
+      "id": "hcip-og-02-q10",
+      "type": "single",
+      "prompt": "On a dedicated database server, what is a common starting point for shared_buffers?",
+      "options": [
+        "About 5 % of RAM",
+        "About 25 % of RAM",
+        "About 90 % of RAM",
+        "Equal to work_mem times connections"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un quart de la RAM est un point de départ classique, le reste étant laissé au système et au cache de fichiers. Cinq pour cent sous-utilise la mémoire, tandis que quatre-vingt-dix pour cent expose au swap et à l'OOM. La multiplication de work_mem par les connexions ne dimensionne pas shared_buffers mais révèle un risque mémoire distinct. La valeur finale se valide par la mesure.",
+      "topic": "Dimensionnement mémoire"
+    },
+    {
+      "id": "hcip-og-02-q11",
+      "type": "multi",
+      "prompt": "Which conditions can prevent a plain B-tree index from being used? (Choose 3)",
+      "options": [
+        "A function is applied to the indexed column",
+        "An implicit type cast changes the comparison type",
+        "The query filters with a compatible equality predicate",
+        "A leading wildcard pattern is used with LIKE"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Une fonction sur la colonne, un cast implicite ou un LIKE commençant par un joker empêchent l'exploitation normale du B-tree. Une égalité compatible, au contraire, est précisément le cas d'usage de cet index. Pour ces situations, on peut créer un index d'expression, aligner les types ou utiliser un index GIN avec trigrammes.",
+      "topic": "Index inutilisables"
+    },
+    {
+      "id": "hcip-og-02-q12",
+      "type": "multi",
+      "prompt": "Which statements about partitioning in openGauss are correct? (Choose 3)",
+      "options": [
+        "RANGE partitioning is suitable for date-based history",
+        "Partition pruning depends on filters on the partition key",
+        "Detaching a partition is cheaper than a massive DELETE",
+        "A partitioned table must always be distributed by HASH"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Le partitionnement RANGE convient aux historiques datés, le pruning s'appuie sur la clé de partition, et détacher une partition évite un DELETE massif. En revanche, le partitionnement et la distribution sont indépendants : une table partitionnée n'a pas l'obligation d'être distribuée par HASH. Cette dernière affirmation est donc fausse.",
+      "topic": "Partitionnement"
+    },
+    {
+      "id": "hcip-og-02-q13",
+      "type": "multi",
+      "prompt": "Which practices belong to a sound performance tuning method? (Choose 3)",
+      "options": [
+        "Measure a baseline before changing anything",
+        "Change one parameter or index at a time",
+        "Validate gains with a repeatable benchmark",
+        "Raise every memory parameter to its maximum"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Une base de mesure, une modification isolée et une validation reproductible permettent d'attribuer les gains et d'éviter les régressions. Tout pousser au maximum est une anti-méthode : cela provoque des tensions mémoire et des choix d'optimiseur aberrants. Le tuning est un cycle documenté, pas une collection de valeurs extrêmes.",
+      "topic": "Méthodologie"
+    },
+    {
+      "id": "hcip-og-02-q14",
+      "type": "tf",
+      "prompt": "EXPLAIN ANALYZE executes the statement for real.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : ANALYZE exécute la requête pour collecter les lignes réelles et les temps. Sur un UPDATE ou un DELETE volumineux, cela modifie réellement les données. Il faut donc l'encadrer d'une transaction annulée ou se contenter d'EXPLAIN simple. Cette propriété est souvent testée car elle oppose plan estimé et plan réel.",
+      "topic": "EXPLAIN"
+    },
+    {
+      "id": "hcip-og-02-q15",
+      "type": "tf",
+      "prompt": "VACUUM can be executed inside an explicit transaction block.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : VACUUM ne peut pas s'exécuter dans un bloc de transaction et doit être lancé en autocommit. Cette restriction évite de maintenir des verrous et des snapshots pendant le recyclage. VACUUM FULL, lui, prend un verrou exclusif sur la table. ANALYZE, en revanche, peut être appelé dans une transaction.",
+      "topic": "VACUUM"
+    },
+    {
+      "id": "hcip-og-02-q16",
+      "type": "tf",
+      "prompt": "Tables stored with the MOT engine lose all their data after a database restart.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : MOT est un moteur en mémoire pour l'exécution, mais il assure la persistance par les journaux et un stockage durable. Un redémarrage n'efface donc pas les données. La confusion vient du mot « memory » : il décrit le support de travail, pas une absence de durabilité. Il faut néanmoins dimensionner la mémoire pour le volume actif.",
+      "topic": "Moteur MOT"
+    },
+    {
+      "id": "hcip-og-02-q17",
+      "type": "text",
+      "prompt": "Which keyword allows CREATE INDEX to build without blocking writes? (one word)",
+      "accept": [
+        "concurrently",
+        "CONCURRENTLY",
+        "Concurrently"
+      ],
+      "sample_answer": "CONCURRENTLY",
+      "explanation_fr": "CREATE INDEX CONCURRENTLY construit l'index en plusieurs passes sans bloquer les écritures sur la table. L'opération est plus longue et peut échouer en laissant un index invalide, qu'il faut alors supprimer et reconstruire. En production, ce compromis est souvent préférable à un verrou bloquant. Le mot-clé s'écrit après CREATE INDEX.",
+      "topic": "Création d'index"
+    },
+    {
+      "id": "hcip-og-02-q18",
+      "type": "text",
+      "prompt": "Which system view aggregates calls and execution time per normalized SQL statement? (view name only)",
+      "accept": [
+        "pg_stat_statements",
+        "Pg_Stat_Statements"
+      ],
+      "sample_answer": "pg_stat_statements",
+      "explanation_fr": "pg_stat_statements agrège les requêtes normalisées avec le nombre d'appels, le temps moyen et le temps total. C'est la vue de référence pour classer les coûts cumulés. pg_stat_activity ne montre que l'instant présent, et pg_stat_user_tables concerne les accès aux tables. L'extension doit être chargée via shared_preload_libraries.",
+      "topic": "Diagnostic de performance"
+    },
+    {
+      "id": "hcip-og-02-q19",
+      "type": "text",
+      "prompt": "Which SQL command refreshes optimizer statistics for a table? (one word)",
+      "accept": [
+        "analyze",
+        "ANALYZE",
+        "analyse",
+        "ANALYSE"
+      ],
+      "sample_answer": "ANALYZE",
+      "explanation_fr": "ANALYZE parcourt la table et met à jour pg_statistic, ce qui améliore les estimations de cardinalité. Sans statistiques fraîches, l'optimiseur peut choisir un mauvais type de jointure ou un Seq Scan. VACUUM recycle l'espace mais ne remplace pas toujours la collecte de statistiques, même si VACUUM ANALYZE combine les deux. La commande doit être relancée après un chargement massif.",
+      "topic": "Statistiques"
+    },
+    {
+      "id": "hcip-og-02-q20",
+      "type": "text",
+      "prompt": "Which openGauss tool reports host CPU, shared buffer hit ratio and session count for performance checks? (tool name only)",
+      "accept": [
+        "gs_checkperf",
+        "GS_CHECKPERF"
+      ],
+      "sample_answer": "gs_checkperf",
+      "explanation_fr": "gs_checkperf produit une synthèse de performance : CPU de l'hôte, ratio de cache partagé, lectures et écritures physiques, nombre de sessions et de requêtes actives. Il ne remplace pas l'analyse des plans, mais donne une première orientation. gs_check vérifie la santé du cluster et gs_collector rassemble les journaux. C'est l'outil de diagnostic rapide à connaître.",
+      "topic": "Outils de diagnostic"
+    }
+  ]
+}

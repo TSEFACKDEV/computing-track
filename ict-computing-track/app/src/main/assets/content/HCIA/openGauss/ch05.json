@@ -1,0 +1,545 @@
+{
+  "id": "hcia-og-05",
+  "phase": "HCIA",
+  "subject": "openGauss",
+  "number": 5,
+  "title_fr": "Rôles, utilisateurs et privilèges",
+  "title_en": "Roles, Users and Privileges",
+  "minutes": 40,
+  "source": "HCIA-openGauss V2.0 Training Material — Session 4 «User Roles» + Session 2 «Connection and Authentication»",
+  "objectives": [
+    "Distinguer un rôle, un utilisateur et un groupe de rôles",
+    "Créer et modifier des comptes avec les attributs adaptés",
+    "Accorder et retirer des privilèges au niveau base, schéma et objet",
+    "Configurer l'authentification et les politiques de mots de passe",
+    "Activer et consulter l'audit pour la conformité"
+  ],
+  "sections": [
+    {
+      "heading": "1. Rôles, utilisateurs et groupes",
+      "body": "Dans openGauss comme dans PostgreSQL, un utilisateur est un rôle qui possède l'attribut LOGIN. La distinction est conceptuelle : CREATE USER crée un rôle avec LOGIN, tandis que CREATE ROLE crée un rôle sans LOGIN par défaut, utilisable comme groupe de privilèges. Les deux objets vivent dans le même catalogue, pg_authid, et partagent le même espace de noms.\n\nUn rôle de groupe ne se connecte pas : il porte des privilèges que d'autres rôles héritent. Par exemple, app_manager reçoit SELECT et INSERT sur les tables applicatives, puis GRANT app_manager TO alice donne à alice ces droits par héritage. Cette indirection simplifie l'administration : on modifie le groupe, pas chaque utilisateur.\n\nPourquoi ne pas tout donner directement aux utilisateurs ? Parce que les droits deviennent impossibles à auditer et à maintenir. Une matrice de rôles par fonction (développeur, support, application, auditeur) rend les changements prévisibles. L'attribut INHERIT, actif par défaut, permet à un membre d'utiliser immédiatement les privilèges du groupe ; SET ROLE permet de basculer explicitement vers un rôle dont on est membre.",
+      "bullets": [
+        "Utilisateur = rôle avec LOGIN ; rôle sans LOGIN = groupe",
+        "pg_authid stocke les rôles au niveau du cluster",
+        "GRANT groupe TO utilisateur : héritage des privilèges",
+        "INHERIT et SET ROLE contrôlent l'usage des rôles hérités"
+      ],
+      "code": [
+        "CREATE ROLE app_manager NOLOGIN;",
+        "CREATE USER alice WITH PASSWORD 'Str0ng#Pass1';",
+        "GRANT app_manager TO alice;",
+        "SET ROLE app_manager;",
+        "RESET ROLE;"
+      ],
+      "diagram": "        role app_manager (NOLOGIN)\n          |  SELECT, INSERT sur app.*\n          |\n   GRANT app_manager TO ...\n      /          \\\n   alice        bob\n   (LOGIN)      (LOGIN)\n      \\          /\n     heritage des privileges",
+      "tip": "CREATE USER et CREATE ROLE créent le même type d'objet. La seule différence initiale est l'attribut LOGIN, que l'on peut ajouter ou retirer ensuite avec ALTER ROLE."
+    },
+    {
+      "heading": "2. Attributs et gestion des comptes",
+      "body": "Un rôle se caractérise par des attributs. LOGIN autorise la connexion, CREATEDB permet de créer des bases, CREATEROLE de créer des rôles, AUDITADMIN de gérer l'audit et SYSADMIN de contourner les contrôles d'accès. D'autres attributs contrôlent la réplication ou la persistance. Chaque attribut doit être accordé consciemment : cumuler CREATEDB, CREATEROLE et SYSADMIN sur un compte applicatif annule l'intérêt du contrôle d'accès.\n\nLa création d'un utilisateur s'accompagne dans openGauss d'un schéma portant son nom. Comme le search_path par défaut contient \"$user\", cet utilisateur travaille d'abord dans son propre schéma, ce qui évite qu'il crée ses objets dans public. On peut fixer ses paramètres de session avec ALTER USER ... SET search_path, ou poser une limite de validité avec VALID UNTIL.\n\nLa suppression mérite prudence. DROP ROLE échoue si le rôle possède encore des objets ; il faut d'abord transférer la propriété avec REASSIGN OWNED ou ALTER ... OWNER TO, puis DROP OWNED pour nettoyer ses privilèges. Supprimer un compte sans traiter ses objets laisse la base dans un état difficile à administrer.",
+      "bullets": [
+        "Attributs : LOGIN, CREATEDB, CREATEROLE, AUDITADMIN, SYSADMIN",
+        "Un schéma du même nom que l'utilisateur est créé automatiquement",
+        "ALTER USER ... SET search_path ou VALID UNTIL pour encadrer le compte",
+        "DROP ROLE exige de transférer ou supprimer d'abord les objets possédés"
+      ],
+      "code": [
+        "CREATE USER app_svc WITH PASSWORD 'SvC#2026pass' CREATEDB;",
+        "ALTER USER app_svc WITH VALID UNTIL '2027-01-01';",
+        "ALTER USER app_svc SET search_path TO app, public;",
+        "REASSIGN OWNED BY app_svc TO app_manager;",
+        "DROP USER app_svc;"
+      ],
+      "table": {
+        "headers": [
+          "Attribut",
+          "Effet",
+          "Risque si mal accordé"
+        ],
+        "rows": [
+          [
+            "LOGIN",
+            "Autorise la connexion",
+            "Compte exploitable par un tiers"
+          ],
+          [
+            "CREATEDB",
+            "Créer des bases",
+            "Prolifération de bases non gérées"
+          ],
+          [
+            "CREATEROLE",
+            "Créer et modifier des rôles",
+            "Escalade de privilèges"
+          ],
+          [
+            "AUDITADMIN",
+            "Gérer l'audit",
+            "Altération des traces"
+          ],
+          [
+            "SYSADMIN",
+            "Contourner les contrôles",
+            "Compromission totale"
+          ]
+        ]
+      },
+      "tip": "openGauss parle de SYSADMIN, pas de SUPERUSER. Un QCM qui propose SUPERUSER comme attribut natif d'openGauss teste cette nuance de vocabulaire."
+    },
+    {
+      "heading": "3. Privilèges au niveau base, schéma et objet",
+      "body": "Les privilèges se répartissent en trois niveaux. Au niveau base : CONNECT pour se connecter, CREATE pour y créer des objets, TEMPORARY pour les tables temporaires. Au niveau schéma : USAGE pour accéder aux objets et CREATE pour en créer. Au niveau objet : SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER pour les tables ; USAGE et SELECT pour les séquences ; EXECUTE pour les fonctions.\n\nCes niveaux se cumulent. Donner SELECT sur une table ne suffit pas si le rôle n'a pas USAGE sur le schéma qui la contient : la requête échoue avec une erreur de permission sur le schéma. C'est une cause fréquente de confusion, car l'administrateur croit avoir accordé le droit sur la table.\n\nPour les séquences, nextval exige USAGE ; un INSERT sur une table dont l'identifiant provient d'une séquence échoue donc si USAGE manque, même avec INSERT accordé. Les droits peuvent être accordés sur un objet précis, sur tous les objets d'un schéma avec ALL TABLES IN SCHEMA, ou préparés pour les futurs objets avec ALTER DEFAULT PRIVILEGES. Cette dernière option évite d'oublier chaque nouvelle table.",
+      "bullets": [
+        "Base : CONNECT, CREATE, TEMPORARY",
+        "Schéma : USAGE et CREATE, indispensables en complément des droits objet",
+        "Table : SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER",
+        "Séquence : USAGE pour nextval ; ALTER DEFAULT PRIVILEGES pour les futurs objets"
+      ],
+      "code": [
+        "GRANT CONNECT ON DATABASE sales TO app_manager;",
+        "GRANT USAGE ON SCHEMA app TO app_manager;",
+        "GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA app TO app_manager;",
+        "GRANT USAGE ON ALL SEQUENCES IN SCHEMA app TO app_manager;",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO readonly;"
+      ],
+      "exercises": [
+        {
+          "prompt": "Le rôle reporting possède SELECT sur toutes les tables du schéma app, mais une requête renvoie « permission denied for schema app ». Pourquoi et que faire ?",
+          "correction": "Le privilège SELECT sur les tables ne donne pas accès au schéma qui les contient. Il faut accorder USAGE sur le schéma : GRANT USAGE ON SCHEMA app TO reporting; éventuellement complété par GRANT SELECT ON ALL TABLES IN SCHEMA app TO reporting; si ce n'est pas déjà fait. Il faut aussi vérifier que le search_path inclut app ou qualifier les tables avec app. Pour les futures tables, ajouter ALTER DEFAULT PRIVILEGES."
+        }
+      ],
+      "tip": "Accorder SELECT sans USAGE sur le schéma est l'erreur la plus fréquente. Les deux grants vont ensemble : USAGE ouvre le schéma, SELECT ouvre la table."
+    },
+    {
+      "heading": "4. GRANT, REVOKE et propriété",
+      "body": "GRANT accorde un privilège, REVOKE le retire. La syntaxe générale est GRANT privilège ON objet TO rôle, avec l'option WITH GRANT OPTION pour autoriser le bénéficiaire à accorder à son tour. REVOKE ... CASCADE retire aussi les privilèges que le bénéficiaire avait lui-même accordés, tandis que RESTRICT refuse l'opération si des dépendances existent.\n\nRévoquer un privilège ne restaure pas un état antérieur : si alice avait déjà SELECT par un autre rôle, retirer un grant direct ne lui enlève pas l'accès effectif. Il faut examiner tous les chemins d'héritage avec les vues information_schema.role_table_grants, information_schema.table_privileges ou pg_auth_members. C'est une nuance que les QCM exploitent souvent.\n\nLe propriétaire d'un objet possède implicitement tous les droits et peut le supprimer. Changer de propriétaire avec ALTER TABLE ... OWNER TO est donc une opération sensible : elle transfère le contrôle. Le rôle PUBLIC, quant à lui, représente tous les utilisateurs : un GRANT à PUBLIC est un droit accordé à tout le monde, y compris aux comptes futurs. Par défaut, openGauss restreint déjà certains droits, mais il faut vérifier les grants résiduels après une migration.",
+      "bullets": [
+        "GRANT et REVOKE, avec WITH GRANT OPTION et CASCADE",
+        "REVOKE ne restaure pas un état antérieur : vérifier tous les héritages",
+        "Le propriétaire possède implicitement tous les droits",
+        "PUBLIC = tous les rôles ; éviter les grants trop larges"
+      ],
+      "code": [
+        "GRANT SELECT ON app.orders TO reporting WITH GRANT OPTION;",
+        "REVOKE SELECT ON app.orders FROM reporting CASCADE;",
+        "ALTER TABLE app.orders OWNER TO app_manager;",
+        "SELECT grantee, privilege_type FROM information_schema.role_table_grants WHERE table_name = 'orders';"
+      ],
+      "exercises": [
+        {
+          "prompt": "Après REVOKE SELECT ON app.orders FROM alice, alice peut toujours lire la table. Donne deux explications possibles et la méthode de diagnostic.",
+          "correction": "Alice peut hériter de SELECT via un rôle de groupe, par exemple app_manager, ou avoir reçu le droit avec WITH GRANT OPTION et l'avoir accordé à un autre rôle dont elle est membre. Elle peut aussi être propriétaire de la table, auquel cas les droits sont implicites. On diagnostique avec information_schema.role_table_grants, pg_auth_members et la colonne relowner de pg_class, puis on révoque le bon chemin ou on change la propriété."
+        }
+      ],
+      "tip": "Un REVOKE qui semble sans effet signale presque toujours un héritage de rôle ou une propriété d'objet. Cherche le chemin, pas seulement le grant direct."
+    },
+    {
+      "heading": "5. Authentification, SSL et politiques de mots de passe",
+      "body": "L'authentification combine pg_hba.conf et les paramètres de mot de passe. pg_hba.conf choisit la méthode selon la base, l'utilisateur et l'adresse source ; les méthodes modernes sont sha256 et sm3, md5 restant supporté pour compatibilité. Le paramètre password_encryption_type détermine le format de stockage : 0 pour md5, 1 pour sha256, 2 pour sm3. Un changement de méthode impose souvent de redéfinir les mots de passe pour régénérer les condensats.\n\nopenGauss applique une politique de complexité contrôlée par password_policy et des paramètres associés : longueur minimale, présence de majuscules, minuscules, chiffres et caractères spéciaux, réutilisation interdite, durée de validité. failed_login_attempts et password_lock_time verrouillent un compte après plusieurs échecs, ce qui ralentit les attaques par force brute. Ces réglages sont stricts par défaut et expliquent pourquoi un mot de passe simple est refusé à la création.\n\nPour les connexions distantes sensibles, SSL/TLS chiffre le trafic. Le serveur active ssl avec un certificat et une clé, et le client peut imposer sslmode=require ou verify-full. Sans TLS, le mot de passe et les données circulent en clair sur le réseau, même si l'authentification est correcte.",
+      "bullets": [
+        "sha256 par défaut, sm3 disponible, md5 hérité",
+        "password_policy et paramètres de complexité, réutilisation, expiration",
+        "failed_login_attempts et password_lock_time contre la force brute",
+        "SSL/TLS pour chiffrer le trafic ; sslmode côté client"
+      ],
+      "code": [
+        "# postgresql.conf",
+        "password_encryption_type = 1",
+        "password_policy = 1",
+        "failed_login_attempts = 5",
+        "password_lock_time = 1",
+        "ssl = on",
+        "ALTER USER alice WITH PASSWORD 'N3w#Str0ngPass';"
+      ],
+      "tip": "Changer password_encryption_type ne réécrit pas les condensats existants. Il faut redéfinir les mots de passe pour qu'ils soient stockés dans le nouveau format."
+    },
+    {
+      "heading": "6. Audit et traçabilité",
+      "body": "L'audit répond à une question simple : qui a fait quoi, quand et depuis où ? openGauss active l'audit avec audit_enable, puis sélectionne les catégories à tracer : connexions et déconnexions, DDL, DML, accès à des objets sensibles, échecs d'authentification ou changements de rôle. Trop auditer produit des volumes énormes et masque les événements utiles ; trop peu auditer rend l'investigation impossible.\n\nLes enregistrements sont écrits dans des fichiers dédiés sous le répertoire de journaux, généralement $GAUSSLOG/pg_audit, et peuvent être interrogés avec la fonction pg_query_audit(start, end). On y retrouve l'utilisateur, la base, l'adresse IP, l'horodatage, le type d'opération et le résultat. La fonction pg_delete_audit permet de purger selon la politique de rétention, opération elle-même à protéger.\n\nL'audit n'est utile que s'il est indépendant. Un administrateur qui peut modifier les journaux et les privilèges peut effacer ses traces : la séparation des duties recommande de confier l'audit à un rôle distinct, de copier les journaux vers un serveur distant et de restreindre l'accès en lecture. L'attribut AUDITADMIN doit être réservé à des comptes nominatifs.",
+      "bullets": [
+        "audit_enable active l'audit ; les catégories se choisissent finement",
+        "Journaux dans $GAUSSLOG/pg_audit, consultation via pg_query_audit",
+        "Champs utiles : utilisateur, IP, horodatage, opération, résultat",
+        "Séparer les rôles et exporter les journaux pour éviter l'altération"
+      ],
+      "code": [
+        "ALTER SYSTEM SET audit_enable TO on;",
+        "ALTER SYSTEM SET audit_ddl TO on;",
+        "SELECT * FROM pg_query_audit('2026-01-01 00:00:00', '2026-01-31 23:59:59');",
+        "SHOW audit_enable;"
+      ],
+      "tip": "Activer audit_enable sans choisir les catégories peut produire des volumes ingérables. À l'inverse, auditer uniquement les connexions ne trace pas les modifications de données sensibles."
+    },
+    {
+      "heading": "7. Matrice de droits et bonnes pratiques",
+      "body": "Une administration saine commence par une matrice : quels rôles, quels objets, quels privilèges. On distingue généralement un rôle d'administration (création des objets, gestion des rôles), un rôle applicatif (SELECT, INSERT, UPDATE, DELETE sur les tables métier, USAGE sur les séquences), un rôle de lecture (SELECT seulement) et un rôle d'audit (lecture des journaux, sans accès aux données).\n\nLe principe du moindre privilège consiste à n'accorder que le nécessaire, pour la durée nécessaire. Un compte de service applicatif ne doit pas pouvoir créer des tables ni modifier des schémas ; un développeur ne doit pas accéder aux données de production sans justification. Les comptes nominatifs facilitent la traçabilité, tandis que les comptes partagés rendent l'imputation impossible.\n\nEnfin, la revue périodique est indispensable : rechercher les rôles sans LOGIN oubliés, les grants à PUBLIC, les comptes dont le mot de passe n'expire jamais et les attributs excessifs. Les vues pg_roles, pg_auth_members et information_schema fournissent la matière. Une revue trimestrielle documentée vaut mieux qu'un durcissement ponctuel jamais réévalué.",
+      "bullets": [
+        "Matrice par fonction : admin, applicatif, lecture, audit",
+        "Moindre privilège et durée limitée pour les grants temporaires",
+        "Comptes nominatifs pour la traçabilité, comptes de service identifiés",
+        "Revue périodique des rôles, grants à PUBLIC et attributs"
+      ],
+      "code": [
+        "SELECT rolname, rolsuper, rolcanlogin FROM pg_roles ORDER BY rolname;",
+        "SELECT r.rolname AS role, m.rolname AS member FROM pg_auth_members am JOIN pg_roles r ON r.oid = am.roleid JOIN pg_roles m ON m.oid = am.member;",
+        "SELECT grantee, table_schema, table_name, privilege_type FROM information_schema.table_privileges WHERE grantee = 'PUBLIC';"
+      ],
+      "table": {
+        "headers": [
+          "Rôle type",
+          "Droits",
+          "Interdictions"
+        ],
+        "rows": [
+          [
+            "Admin",
+            "CREATE, ALTER, DROP, gestion des rôles",
+            "Usage quotidien des données métier"
+          ],
+          [
+            "Applicatif",
+            "SELECT, INSERT, UPDATE, DELETE, USAGE séquences",
+            "DDL, accès aux autres schémas"
+          ],
+          [
+            "Lecture",
+            "SELECT, USAGE sur le schéma",
+            "Écritures et DDL"
+          ],
+          [
+            "Audit",
+            "Lecture des journaux d'audit",
+            "Accès aux tables métier"
+          ]
+        ]
+      },
+      "tip": "Un rôle créé sans LOGIN ne peut pas se connecter : c'est un groupe de privilèges, pas un compte utilisateur. Ne le supprime pas en croyant à un compte oublié sans vérifier ses membres."
+    }
+  ],
+  "key_points": [
+    "Un utilisateur est un rôle avec LOGIN ; un rôle sans LOGIN sert de groupe de privilèges.",
+    "Les rôles sont stockés dans pg_authid et visibles via pg_roles et pg_auth_members.",
+    "Les privilèges se cumulent entre base, schéma et objet ; USAGE sur le schéma est indispensable.",
+    "nextval exige USAGE sur la séquence, même si INSERT est accordé sur la table.",
+    "sha256 est la méthode moderne par défaut ; sm3 et md5 existent pour des contextes particuliers.",
+    "La politique de mot de passe et le verrouillage après échecs limitent la force brute.",
+    "L'audit doit être activé par catégories et protégé par une séparation des rôles."
+  ],
+  "traps": [
+    "REVOKE ne restaure pas un état antérieur : il faut inspecter les héritages de rôles.",
+    "SYSADMIN remplace SUPERUSER dans openGauss ; ne pas confondre les deux termes.",
+    "Le schéma par défaut est public, pas main ni dbo.",
+    "Un GRANT à PUBLIC s'applique à tous les rôles, y compris ceux créés plus tard.",
+    "Changer password_encryption_type n'altère pas les condensats déjà stockés."
+  ],
+  "quiz": [
+    {
+      "id": "hcia-og-05-q01",
+      "type": "single",
+      "prompt": "What primarily distinguishes a user from a role created with CREATE ROLE?",
+      "options": [
+        "A user has the LOGIN attribute by default",
+        "A user cannot own objects",
+        "A role cannot receive privileges",
+        "A role exists only inside one database"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "CREATE USER crée un rôle doté de LOGIN, alors que CREATE ROLE crée par défaut un rôle sans connexion, utilisable comme groupe. Un utilisateur peut posséder des objets et un rôle peut recevoir des privilèges. Tous deux sont des objets du cluster, pas d'une seule base.",
+      "topic": "Rôles"
+    },
+    {
+      "id": "hcia-og-05-q02",
+      "type": "single",
+      "prompt": "Which statement grants SELECT on every table of schema app to role dev?",
+      "options": [
+        "GRANT USAGE ON app TO dev;",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA app TO dev;",
+        "GRANT SELECT TO dev ON SCHEMA app;",
+        "ALTER ROLE dev GRANT SELECT;"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "La syntaxe correcte est GRANT SELECT ON ALL TABLES IN SCHEMA app TO dev. La deuxième inverserait l'ordre des mots-clés, la troisième n'est pas une instruction valide et la quatrième accorderait seulement USAGE sur un objet mal désigné, sans droit de lecture sur les tables.",
+      "topic": "Privilèges"
+    },
+    {
+      "id": "hcia-og-05-q03",
+      "type": "single",
+      "prompt": "Which password hashing method is the modern default in openGauss?",
+      "options": [
+        "plain text",
+        "md5",
+        "sha256",
+        "base64"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "sha256 est la méthode moderne par défaut, et sm3 est également disponible. md5 est conservé pour compatibilité mais considéré comme hérité. base64 est un encodage réversible, pas un hachage, et le stockage en clair n'est jamais acceptable.",
+      "topic": "Authentification"
+    },
+    {
+      "id": "hcia-og-05-q04",
+      "type": "single",
+      "prompt": "Which catalog view records role membership relationships?",
+      "options": [
+        "pg_roles",
+        "pg_database",
+        "pg_settings",
+        "pg_auth_members"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "pg_auth_members associe un rôle (roleid) à ses membres (member), ce qui permet de reconstruire les héritages. pg_roles décrit les attributs des rôles mais pas les appartenances, pg_database liste les bases et pg_settings les paramètres.",
+      "topic": "Rôles"
+    },
+    {
+      "id": "hcia-og-05-q05",
+      "type": "single",
+      "prompt": "Which privilege is required on a schema before a role can access its tables?",
+      "options": [
+        "USAGE",
+        "SELECT",
+        "CONNECT",
+        "EXECUTE"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "USAGE sur le schéma autorise l'accès aux objets qu'il contient ; sans lui, un SELECT sur une table échoue avec une erreur de permission sur le schéma. SELECT est un privilège de table, CONNECT un privilège de base et EXECUTE un privilège de fonction.",
+      "topic": "Privilèges"
+    },
+    {
+      "id": "hcia-og-05-q06",
+      "type": "single",
+      "prompt": "Which privilege must a role hold on a sequence to call nextval?",
+      "options": [
+        "REFERENCES",
+        "USAGE",
+        "SELECT",
+        "INSERT"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "nextval exige USAGE sur la séquence, et SELECT permet de lire currval ou la valeur courante. INSERT sur une table ne suffit donc pas si la séquence n'est pas accessible. REFERENCES concerne les clés étrangères, pas les séquences.",
+      "topic": "Privilèges"
+    },
+    {
+      "id": "hcia-og-05-q07",
+      "type": "single",
+      "prompt": "What does WITH GRANT OPTION allow a grantee to do?",
+      "options": [
+        "Drop the object without being its owner",
+        "Change the object owner",
+        "Grant the same privilege to other roles",
+        "Bypass all privilege checks"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "WITH GRANT OPTION autorise le bénéficiaire à transmettre le privilège qu'il a reçu. Il ne donne pas les pouvoirs d'un SYSADMIN, ne permet pas de supprimer l'objet et ne transfère pas la propriété : ces actions relèvent d'autres attributs ou de ALTER ... OWNER TO.",
+      "topic": "Privilèges"
+    },
+    {
+      "id": "hcia-og-05-q08",
+      "type": "single",
+      "prompt": "Which command changes the password of an existing user without recreating the account?",
+      "options": [
+        "CREATE USER alice WITH PASSWORD 'New#Pass1';",
+        "DROP ROLE alice;",
+        "GRANT PASSWORD TO alice;",
+        "ALTER USER alice WITH PASSWORD 'New#Pass1';"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "ALTER USER ... WITH PASSWORD met à jour le condensat tout en conservant le rôle, ses objets et ses privilèges. Recréer l'utilisateur échouerait car il existe déjà, le supprimer détruirait ses droits et GRANT PASSWORD n'est pas une instruction valide.",
+      "topic": "Comptes"
+    },
+    {
+      "id": "hcia-og-05-q09",
+      "type": "single",
+      "prompt": "What is the effect of granting a privilege to PUBLIC?",
+      "options": [
+        "Every role, including future roles, receives the privilege",
+        "Only the current user receives it",
+        "Only roles with LOGIN receive it",
+        "The privilege is granted for one session only"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "PUBLIC est un pseudo-rôle qui représente tous les utilisateurs, présents et futurs. Un grant à PUBLIC est donc très large et doit être évité sur des données sensibles. Il ne se limite ni à l'utilisateur courant, ni aux comptes avec LOGIN, ni à une session.",
+      "topic": "Privilèges"
+    },
+    {
+      "id": "hcia-og-05-q10",
+      "type": "single",
+      "prompt": "Which attribute allows a role to bypass access-control checks in openGauss?",
+      "options": [
+        "INHERIT",
+        "SYSADMIN",
+        "CREATEDB",
+        "AUDITADMIN"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "SYSADMIN est l'attribut administratif qui contourne les contrôles, équivalent du SUPERUSER de PostgreSQL. CREATEDB permet de créer des bases, AUDITADMIN de gérer l'audit et INHERIT d'hériter des privilèges des rôles membres. Aucun de ces trois derniers ne donne les pleins pouvoirs.",
+      "topic": "Rôles"
+    },
+    {
+      "id": "hcia-og-05-q11",
+      "type": "multi",
+      "prompt": "Which of these are role attributes rather than object privileges? (Choose three.)",
+      "options": [
+        "SELECT",
+        "CREATEDB",
+        "CREATEROLE",
+        "AUDITADMIN"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "CREATEDB, CREATEROLE et AUDITADMIN sont des attributs portés par le rôle lui-même. SELECT est un privilège accordé sur un objet précis, comme une table ou une vue, et n'a pas de sens comme attribut de rôle.",
+      "topic": "Rôles"
+    },
+    {
+      "id": "hcia-og-05-q12",
+      "type": "multi",
+      "prompt": "Which settings are used to trace sensitive operations? (Choose two.)",
+      "options": [
+        "wal_level",
+        "audit_enable",
+        "audit_dml_state",
+        "autovacuum"
+      ],
+      "answer": [
+        1,
+        2
+      ],
+      "explanation_fr": "audit_enable active l'audit et audit_dml_state contrôle la journalisation des DML. autovacuum concerne la maintenance des lignes mortes et wal_level la quantité de WAL nécessaire à la réplication : aucun des deux ne produit de trace d'audit.",
+      "topic": "Audit"
+    },
+    {
+      "id": "hcia-og-05-q13",
+      "type": "multi",
+      "prompt": "Which statements about REVOKE are correct? (Choose two.)",
+      "options": [
+        "It restores the privileges the role had before the grant",
+        "It drops the object if no privilege remains",
+        "It removes a privilege that was previously granted",
+        "It can cascade to privileges granted by the grantee"
+      ],
+      "answer": [
+        2,
+        3
+      ],
+      "explanation_fr": "REVOKE retire un privilège, et l'option CASCADE propage le retrait aux grants accordés par le bénéficiaire. Il ne restaure pas un état antérieur, car d'autres chemins d'héritage peuvent subsister. Il ne supprime jamais l'objet : seul DROP le fait.",
+      "topic": "Privilèges"
+    },
+    {
+      "id": "hcia-og-05-q14",
+      "type": "tf",
+      "prompt": "Granting role app_manager to user alice lets alice inherit the privileges of app_manager.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai. L'appartenance à un rôle transmet ses privilèges, à condition que l'héritage soit actif, ce qui est le cas par défaut avec INHERIT. alice peut aussi basculer explicitement avec SET ROLE app_manager. Le grant ne copie pas les droits, il les rend effectifs par appartenance.",
+      "topic": "Rôles"
+    },
+    {
+      "id": "hcia-og-05-q15",
+      "type": "tf",
+      "prompt": "The default schema of a new openGauss database is called main.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux. Le schéma par défaut s'appelle public, comme dans PostgreSQL. main est une convention Oracle et dbo une convention SQL Server. Le schéma système, qui contient les catalogues, s'appelle pg_catalog.",
+      "topic": "Schémas"
+    },
+    {
+      "id": "hcia-og-05-q16",
+      "type": "tf",
+      "prompt": "A role with the SYSADMIN attribute can bypass ordinary privilege checks.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai. SYSADMIN est l'attribut administratif suprême d'openGauss : il contourne les contrôles de privilèges ordinaires. Il doit donc être réservé à quelques comptes nominatifs, surveillés et audités, car sa compromission expose toute l'instance.",
+      "topic": "Rôles"
+    },
+    {
+      "id": "hcia-og-05-q17",
+      "type": "text",
+      "prompt": "Write the SQL statement that removes all privileges on database sales from user bob.",
+      "accept": [
+        "revoke all on database sales from bob",
+        "revoke all on database sales from bob;",
+        "revoke all privileges on database sales from bob",
+        "REVOKE ALL PRIVILEGES ON DATABASE sales FROM bob;"
+      ],
+      "sample_answer": "REVOKE ALL ON DATABASE sales FROM bob;",
+      "explanation_fr": "La syntaxe est REVOKE ALL [PRIVILEGES] ON DATABASE sales FROM bob. Elle retire les droits au niveau de la base, notamment CONNECT et CREATE. Elle ne supprime pas les privilèges que bob possède sur des tables via un rôle hérité.",
+      "topic": "Privilèges"
+    },
+    {
+      "id": "hcia-og-05-q18",
+      "type": "text",
+      "prompt": "Which catalog view lists role memberships and inheritance links?",
+      "accept": [
+        "pg_auth_members",
+        "pg auth members",
+        "pg_auth_members view"
+      ],
+      "sample_answer": "pg_auth_members",
+      "explanation_fr": "pg_auth_members contient les couples roleid et member, avec les options d'administration. Il permet de savoir quels rôles héritent de quels autres. pg_roles donne les attributs des rôles, mais pas les relations d'appartenance.",
+      "topic": "Rôles"
+    },
+    {
+      "id": "hcia-og-05-q19",
+      "type": "text",
+      "prompt": "Which hashing algorithm is used by default to store openGauss passwords?",
+      "accept": [
+        "sha256",
+        "sha-256",
+        "sha 256"
+      ],
+      "sample_answer": "sha256",
+      "explanation_fr": "sha256 est la valeur par défaut de password_encryption_type, avec sm3 comme alternative et md5 conservé pour compatibilité. Le choix se configure, mais changer de méthode impose de redéfinir les mots de passe pour régénérer les condensats.",
+      "topic": "Authentification"
+    },
+    {
+      "id": "hcia-og-05-q20",
+      "type": "text",
+      "prompt": "Give the SQL statement that sets a new password for existing user alice.",
+      "accept": [
+        "alter user alice with password 'newpass'",
+        "alter user alice with password 'newpass';",
+        "ALTER USER alice WITH PASSWORD 'New#Pass1';",
+        "alter role alice with password 'newpass'"
+      ],
+      "sample_answer": "ALTER USER alice WITH PASSWORD 'New#Pass1';",
+      "explanation_fr": "ALTER USER ... WITH PASSWORD met à jour le mot de passe sans recréer le compte, ce qui préserve les objets possédés et les privilèges. ALTER ROLE fonctionne également car un utilisateur est un rôle avec LOGIN. Une recréation détruirait les dépendances.",
+      "topic": "Comptes"
+    }
+  ]
+}

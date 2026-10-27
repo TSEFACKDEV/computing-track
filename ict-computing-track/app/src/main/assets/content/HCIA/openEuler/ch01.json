@@ -1,0 +1,561 @@
+{
+  "id": "hcia-oe-01",
+  "phase": "HCIA",
+  "subject": "openEuler",
+  "number": 1,
+  "title_fr": "Écosystème openEuler, IA et installation",
+  "title_en": "openEuler Ecosystem, AI, and Installation",
+  "minutes": 45,
+  "source": "HCIA-openEuler V2.0 Training Material — Sessions «Introduction to the Linux OS», «Installing the Open Source openEuler OS», «Using the openEuler OS» + annexe openEuler Intelligence · Lab Guide (installation)",
+  "objectives": [
+    "Expliquer ce qu'est openEuler et à quels besoins il répond",
+    "Distinguer les versions Innovation et LTS, et les licences open source",
+    "Décrire les fonctions d'openEuler Intelligence et le rôle du RAG",
+    "Préparer et réaliser une installation openEuler (média, profil, partitions, root)",
+    "Se connecter et utiliser les raccourcis essentiels du shell Bash"
+  ],
+  "sections": [
+    {
+      "heading": "1. openEuler : un système d'exploitation pour le calcul diversifié",
+      "body": "openEuler est un système d'exploitation libre et open source porté par la communauté openEuler. Son noyau est Linux, mais sa vocation dépasse le simple serveur : il est conçu pour le calcul diversifié, c'est-à-dire l'exploitation de processeurs aux architectures différentes. On y trouve x86, ARM avec Kunpeng, SW64, RISC-V, LoongArch et PowerPC. Cette diversité permet d'installer la même distribution sur un serveur d'entreprise, une machine de laboratoire ou une plate-forme embarquée.\n\nUne distribution Linux n'est pas seulement un noyau : c'est un assemblage cohérent d'un noyau, de bibliothèques, d'outils système, d'un gestionnaire de paquets et de logiciels applicatifs. openEuler ajoute à cet ensemble des optimisations matérielles et un écosystème certifié, notamment autour des bases de données comme openGauss et des charges big data ou intelligence artificielle.\n\nPour retenir la différence avec Ubuntu ou Debian, pense à une boîte à outils : les outils de base se ressemblent, mais openEuler a été réglé pour le matériel Huawei et pour des scénarios de production variés. En compétition, openEuler est le socle sur lequel tu déploies les services : savoir l'installer et le diagnostiquer est donc un prérequis.",
+      "bullets": [
+        "OS open source à noyau Linux, soutenu par la communauté openEuler",
+        "Supporte x86, ARM/Kunpeng, SW64, RISC-V, LoongArch et PowerPC",
+        "Cible le serveur, le cloud, l'edge, l'embarqué, la base de données, le big data et l'IA",
+        "Une distribution = noyau + outils + paquets + écosystème applicatif"
+      ],
+      "code": [
+        "uname -m          # architecture du processeur (x86_64, aarch64...)",
+        "cat /etc/os-release   # nom et version de la distribution"
+      ],
+      "diagram": "Applications (openGauss, conteneurs, outils métier)\n------------------------------------------------\nBibliothèques et outils système (glibc, systemd, DNF)\n------------------------------------------------\nNoyau Linux optimisé\n------------------------------------------------\nx86   ARM/Kunpeng   SW64   RISC-V   LoongArch   PowerPC",
+      "tip": "Un QCM peut opposer openEuler et openGauss : openEuler est le système d'exploitation, openGauss la base de données qui tourne dessus."
+    },
+    {
+      "heading": "2. Linux, GNU et le rôle des licences",
+      "body": "Linux est le nom du noyau publié par Linus Torvalds en 1991. Un noyau seul ne permet pas d'utiliser une machine : il faut des outils pour dialoguer avec lui. C'est le rôle du projet GNU, lancé par Richard Stallman en 1984, qui fournit le compilateur GCC, le shell Bash, les utilitaires de base et de nombreuses bibliothèques. Un système complet associe donc noyau Linux, outils GNU, logiciels et gestionnaire de paquets : on parle de GNU/Linux.\n\nLe numéro de version du noyau suit la forme majeur.mineur.correctif, par exemple 4.19.90. Par convention, un numéro mineur pair désigne une branche stable, un numéro impair une branche de développement. Cette règle explique pourquoi les distributions de production restent souvent sur des branches paires.\n\nLes licences définissent ce que tu peux faire du code. GPL est un copyleft fort : tout dérivé distribué doit rester sous GPL. LGPL cible les bibliothèques : une application propriétaire peut lier une bibliothèque LGPL, mais les modifications de la bibliothèque restent libres. BSD et Mulan sont permissives : tu peux intégrer le code dans un produit fermé, à condition de conserver la mention de copyright. Le choix de licence n'est donc pas un détail juridique : il conditionne la stratégie d'un éditeur.",
+      "bullets": [
+        "Linux = le noyau ; GNU/Linux = noyau + outils GNU + logiciels",
+        "Version du noyau : majeur.mineur.correctif ; mineur pair = stable",
+        "GPL : copyleft fort, le dérivé distribué doit rester open source",
+        "LGPL : adaptée aux bibliothèques, le code appelant peut rester propriétaire",
+        "BSD et Mulan : permissives, favorables à l'intégration commerciale"
+      ],
+      "code": [
+        "uname -r                     # version du noyau en cours",
+        "cat /etc/openEuler-release   # version de la distribution openEuler"
+      ],
+      "table": {
+        "headers": [
+          "Licence",
+          "Nature",
+          "Conséquence pratique"
+        ],
+        "rows": [
+          [
+            "GPL",
+            "Copyleft fort",
+            "Un dérivé distribué doit rester sous GPL"
+          ],
+          [
+            "LGPL",
+            "Copyleft faible",
+            "L'application liée peut rester propriétaire ; la bibliothèque modifiée reste LGPL"
+          ],
+          [
+            "BSD",
+            "Permissive",
+            "Réutilisation y compris dans un produit fermé"
+          ],
+          [
+            "Mulan",
+            "Permissive",
+            "Licence d'origine chinoise, adaptée à la réutilisation commerciale"
+          ]
+        ]
+      },
+      "tip": "Ne confonds pas GPL et LGPL. Le piège typique : « LGPL oblige à open-sourcer l'application qui utilise la bibliothèque » → FAUX."
+    },
+    {
+      "heading": "3. Versions Innovation et LTS : quel cycle de vie ?",
+      "body": "openEuler publie deux familles de versions. Les versions Innovation sortent à un rythme rapide, environ tous les six mois, et embarquent les dernières fonctionnalités du noyau, des outils et de l'écosystème. Elles servent à tester, à développer et à préparer l'avenir. Les versions LTS (Long Term Support) sont publiées moins souvent et maintenues plusieurs années, généralement quatre ans dans le cycle communautaire. Elles privilégient la stabilité et les correctifs de sécurité, ce qui en fait le choix naturel de la production et des environnements d'examen.\n\nLe piège classique consiste à croire que LTS signifie « plus récent ». C'est l'inverse : une LTS est souvent plus ancienne en fonctionnalités, mais plus fiable et supportée plus longtemps. Une Innovation peut contenir un logiciel que la LTS n'a pas encore.\n\nLes dépôts logiciels complètent ce tableau. Un dépôt est un serveur qui héberge des paquets RPM et leurs métadonnées. openEuler les déclare dans des fichiers .repo sous /etc/yum.repos.d/. DNF lit ces fichiers pour savoir où télécharger les paquets et vérifier leurs signatures. Si un dépôt est désactivé ou si son URL est erronée, les installations échouent même avec une connexion réseau correcte.",
+      "bullets": [
+        "Innovation : nouveautés fréquentes, adaptée au test et au développement",
+        "LTS : stabilité et support long, adaptée à la production",
+        "Les dépôts sont déclarés dans /etc/yum.repos.d/*.repo",
+        "DNF s'appuie sur ces dépôts et sur les signatures GPG des paquets"
+      ],
+      "code": [
+        "cat /etc/os-release",
+        "dnf repolist          # liste les dépôts actifs",
+        "dnf repolist --all    # inclut les dépôts désactivés"
+      ],
+      "table": {
+        "headers": [
+          "Famille",
+          "Rythme",
+          "Usage recommandé"
+        ],
+        "rows": [
+          [
+            "Innovation",
+            "Environ tous les six mois",
+            "Tests, veille, développement"
+          ],
+          [
+            "LTS",
+            "Moins fréquent, support pluriannuel",
+            "Production et environnement d'examen"
+          ]
+        ]
+      },
+      "tip": "LTS ne veut pas dire « dernière version ». LTS veut dire support long et stabilité. Une Innovation est plus récente mais moins adaptée à la production."
+    },
+    {
+      "heading": "4. openEuler Intelligence : l'assistant fondé sur le RAG",
+      "body": "openEuler Intelligence est l'assistant intelligent intégré à l'écosystème. Il ne s'agit pas d'un simple chatbot : le service combine un modèle de fondation avec une base de connaissances propre à openEuler, contenant du code, de la documentation et des procédures d'exploitation. Deux points d'entrée sont proposés : une interface web et un shell intelligent, utilisable directement depuis le terminal.\n\nLa technique centrale est le RAG, Retrieval-Augmented Generation. Au lieu de répondre uniquement à partir de ce que le modèle a mémorisé, le système commence par rechercher les documents pertinents, puis génère une réponse en s'appuyant sur ces extraits. Cette étape de recherche réduit les hallucinations et permet d'utiliser des données internes à une entreprise sans réentraîner le modèle.\n\nLes usages couvrent le questions-réponses technique, la recommandation de tâches, la gouvernance du corpus, l'optimisation guidée en langage naturel et le diagnostic. Le diagnostic suit trois temps : inspection de l'état du système, démarcation pour isoler la couche fautive, puis localisation de la cause racine. L'assistant peut aussi préparer des environnements de conteneurs pour reproduire un incident.",
+      "bullets": [
+        "Deux points d'entrée : interface web et shell intelligent",
+        "RAG : recherche documentaire avant la génération de la réponse",
+        "Fonctions : Q&A, recommandation, optimisation, diagnostic, environnements de conteneurs",
+        "Diagnostic en trois temps : inspection, démarcation, localisation de la cause racine"
+      ],
+      "diagram": "Question de l'administrateur\n        |\n        v\nRecherche dans la base de connaissances openEuler\n        |  extraits pertinents\n        v\nModèle de fondation + contexte\n        |\n        v\nRéponse argumentée (et sources)\n\nDiagnostic : inspection -> démarcation -> cause racine",
+      "tip": "La question officielle du module est un vrai/faux : « la plateforme intelligente openEuler propose deux entrées : web et shell intelligent » → VRAI.",
+      "code": []
+    },
+    {
+      "heading": "5. Préparer l'installation : média, profil et architecture",
+      "body": "Avant de lancer l'installation, deux vérifications évitent la majorité des mauvaises surprises : l'architecture du processeur et le scénario d'usage. La commande uname -m indique l'architecture de la machine, par exemple x86_64 ou aarch64. Il faut ensuite télécharger l'image ISO correspondante : une ISO x86 ne démarre pas sur un serveur Kunpeng ARM.\n\nLes médias possibles sont la clé USB, le CD/DVD, le démarrage réseau PXE et l'image ISO montée dans une machine virtuelle. En entreprise, PXE permet d'installer des dizaines de serveurs sans clé USB, à condition de disposer d'un serveur DHCP et TFTP correctement configurés.\n\nLe programme d'installation propose des profils : minimal, serveur, hyperviseur, station de travail. Plus le profil embarque de logiciels, plus l'espace disque requis et la surface d'attaque augmentent. En production, on part d'une installation minimale, puis on ajoute uniquement les paquets nécessaires avec DNF. C'est le principe du moindre privilège appliqué au système.\n\nDeux éléments sont obligatoires : le mot de passe root et, en mode UEFI, une partition EFI. La création d'un utilisateur standard reste optionnelle, mais elle est fortement recommandée pour travailler sans être root en permanence.",
+      "bullets": [
+        "Vérifier l'architecture (uname -m) avant de choisir l'ISO",
+        "Médias : USB, CD/DVD, PXE, ISO en machine virtuelle",
+        "Profils : minimal, serveur, hyperviseur, station de travail",
+        "Le mot de passe root est obligatoire ; l'utilisateur standard est recommandé",
+        "Une installation minimale réduit l'espace utilisé et la surface d'attaque"
+      ],
+      "code": [
+        "uname -m                       # x86_64 ou aarch64",
+        "sha256sum openEuler-*.iso     # vérifier l'intégrité de l'image"
+      ],
+      "exercises": [
+        {
+          "prompt": "Tu dois installer openEuler sur un serveur Kunpeng ARM avec 16 Go de RAM et deux disques de 2 To en UEFI. Décris les vérifications préalables et le profil d'installation à choisir.",
+          "correction": "Vérifier l'architecture avec uname -m : elle doit indiquer aarch64, puis télécharger l'ISO aarch64 et contrôler son empreinte sha256sum. Choisir une version LTS pour la stabilité. Démarrer en UEFI, sélectionner le profil minimal ou serveur selon les services requis, créer /boot/efi en FAT32, /boot, la swap et la racine. Définir un mot de passe root solide et créer un utilisateur standard. Après installation, ajouter seulement les paquets nécessaires avec DNF."
+        }
+      ],
+      "tip": "PXE n'est pas un média physique : c'est un démarrage réseau qui exige DHCP et TFTP. Une réponse qui le présente comme une clé USB est fausse."
+    },
+    {
+      "heading": "6. Partitionner le disque et démarrer pour la première fois",
+      "body": "Le partitionnement traduit un choix d'exploitation. La racine / contient le système et les applications ; elle doit donc avoir de la marge. /boot héberge le noyau et l'initramfs : une partition de 1 Go suffit généralement et facilite les retours arrière après mise à jour. En UEFI, /boot/efi est une petite partition FAT32, souvent 200 à 600 Mo, que le firmware lit pour trouver le chargeur d'amorçage. La swap sert de mémoire d'appoint : le noyau y déplace les pages peu utilisées quand la RAM manque, mais elle ne remplace jamais la RAM pour la performance.\n\nD'autres partitions sont souvent séparées en production : /var pour les journaux et les files d'attente, /home pour les données utilisateurs, /tmp pour les fichiers temporaires. Les séparer évite qu'un journal qui grossit sature la racine et bloque tout le système.\n\nAutrefois limité au MBR et à 2 To, le partitionnement utilise aujourd'hui GPT, indispensable pour les disques de grande capacité et pour l'UEFI. Après installation, lsblk affiche l'arborescence des disques et df -h l'espace utilisé par chaque système de fichiers monté.",
+      "bullets": [
+        "swap : mémoire d'appoint, pas un remplacement de la RAM",
+        "/boot : noyau et initramfs ; /boot/efi : FAT32 requis en UEFI",
+        "/ : système et applications ; /var : journaux et données variables",
+        "GPT est nécessaire au-delà de 2 To et pour l'UEFI",
+        "lsblk décrit les disques, df -h l'espace des systèmes de fichiers"
+      ],
+      "code": [
+        "lsblk -f          # disques, partitions, systèmes de fichiers",
+        "df -h             # espace utilisé par montage",
+        "findmnt /boot     # vérifier le montage d'une partition"
+      ],
+      "table": {
+        "headers": [
+          "Partition",
+          "Rôle",
+          "Remarque"
+        ],
+        "rows": [
+          [
+            "swap",
+            "Extension de la mémoire vive",
+            "Taille selon la RAM et l'usage"
+          ],
+          [
+            "/boot",
+            "Noyau, initramfs, fichiers d'amorçage",
+            "Environ 1 Go"
+          ],
+          [
+            "/boot/efi",
+            "Chargeur UEFI",
+            "FAT32, obligatoire en UEFI"
+          ],
+          [
+            "/",
+            "Système et applications",
+            "Prévoir de la marge"
+          ],
+          [
+            "/var",
+            "Journaux, files d'attente, conteneurs",
+            "Évite de saturer la racine"
+          ]
+        ]
+      },
+      "diagram": "Disque GPT (ex. /dev/sda)\n+-----------+--------+--------+-------------------------------+\n| /boot/efi | /boot  | swap   | /                             |\n|  FAT32    | ~1 Go  | RAM+   | systeme, applications, /var   |\n+-----------+--------+--------+-------------------------------+\n  firmware     noyau    memoire          reste du disque",
+      "exercises": [
+        {
+          "prompt": "Un serveur possède 8 Go de RAM et un disque de 500 Go. Propose un découpage simple en UEFI et justifie chaque partition.",
+          "correction": "Par exemple : /boot/efi 512 Mo en FAT32 pour le firmware UEFI ; /boot 1 Go pour le noyau et l'initramfs ; swap 8 Go pour absorber les pics mémoire et permettre l'hibernation si nécessaire ; / le reste du disque pour le système et les données. On peut ajouter /var 50 Go pour isoler les journaux. Les tailles restent des ordres de grandeur : l'essentiel est de justifier le rôle de chaque partition et de ne pas placer /boot/efi ailleurs qu'en FAT32."
+        }
+      ],
+      "tip": "MBR plafonne à 2 To et à quatre partitions primaires. GPT lève ces limites et s'impose en UEFI. Ne réponds jamais que le MBR gère les disques de plus de 2 To."
+    },
+    {
+      "heading": "7. Premiers pas dans le shell Bash",
+      "body": "Au premier démarrage, openEuler en installation serveur arrive en mode texte, sur une interface en ligne de commande. Le programme d'installation a créé un compte root et, si tu l'as demandé, un compte utilisateur. La commande whoami indique l'identité courante, id affiche les groupes, et le prompt se termine par # pour root ou $ pour un utilisateur ordinaire.\n\nBash est l'interpréteur de commandes par défaut. Il lit ce que tu tapes, l'interprète et lance le programme correspondant. Quelques raccourcis changent réellement le quotidien : Tab complète un nom de commande ou de fichier, les flèches haut et bas parcourent l'historique, Ctrl+R recherche dans cet historique, Ctrl+C interrompt le processus au premier plan, Ctrl+L efface l'écran sans perdre la ligne en cours, et Ctrl+D envoie une fin de fichier (EOF), ce qui ferme souvent la session.\n\nUne bonne habitude consiste à vérifier son identité et son répertoire avant toute commande destructive. Un rm lancé en root ne demande pas toujours confirmation et ne passe pas par une corbeille : les données sont supprimées immédiatement. Les commandes hostnamectl, ip addr et timedatectl donnent un premier état du système après installation.",
+      "bullets": [
+        "Prompt : # pour root, $ pour un utilisateur ordinaire",
+        "Tab complète commandes, chemins et paramètres",
+        "Ctrl+C interrompt, Ctrl+L efface l'écran, Ctrl+D envoie EOF",
+        "Ctrl+R recherche dans l'historique des commandes",
+        "Vérifier whoami et pwd avant toute suppression"
+      ],
+      "code": [
+        "whoami",
+        "id",
+        "hostnamectl",
+        "ip addr show",
+        "timedatectl"
+      ],
+      "diagram": "[root@oe-server ~]# whoami\nroot\n[root@oe-server ~]#\n\n[alice@oe-server ~]$ whoami\nalice\n[alice@oe-server ~]$",
+      "exercises": [
+        {
+          "prompt": "Associe chaque besoin au raccourci Bash correct : (a) compléter un chemin, (b) interrompre une commande bloquée, (c) retrouver une commande ancienne, (d) effacer l'écran.",
+          "correction": "(a) Tab ; (b) Ctrl+C ; (c) Ctrl+R pour une recherche interactive, ou les flèches haut/bas pour parcourir l'historique ; (d) Ctrl+L, qui efface l'affichage sans perdre la ligne en cours. À ne pas confondre avec Ctrl+D, qui envoie EOF et peut fermer la session."
+        }
+      ],
+      "tip": "Tab complète, mais ne devine pas à ta place : si plusieurs chemins commencent pareil, un premier Tab n'affiche rien ou complète partiellement. Un second Tab liste les possibilités."
+    }
+  ],
+  "key_points": [
+    "openEuler est un OS open source à noyau Linux pour le calcul diversifié, pas une base de données",
+    "Il prend en charge x86, ARM/Kunpeng, SW64, RISC-V, LoongArch et PowerPC",
+    "Innovation = fonctionnalités récentes ; LTS = stabilité et support long",
+    "GPL est un copyleft fort, LGPL un copyleft faible adapté aux bibliothèques, BSD et Mulan sont permissives",
+    "openEuler Intelligence s'utilise via le web ou un shell intelligent et s'appuie sur le RAG",
+    "Une installation se prépare selon l'architecture, le média et le profil ; root et /boot/efi sont obligatoires",
+    "swap étend la RAM, /boot contient le noyau, /var isole les journaux",
+    "Tab, Ctrl+C, Ctrl+L, Ctrl+R et Ctrl+D sont les raccourcis Bash à connaître"
+  ],
+  "traps": [
+    "Confondre openEuler (OS) et openGauss (base de données)",
+    "Croire que LTS désigne la version la plus récente",
+    "Affirmer que la LGPL contamine l'application qui utilise la bibliothèque",
+    "Présenter PXE comme un média physique ou oublier que /boot/efi est requis en UEFI",
+    "Croire qu'une installation serveur ouvre une interface graphique par défaut"
+  ],
+  "quiz": [
+    {
+      "id": "hcia-oe-01-q01",
+      "type": "single",
+      "prompt": "Which statement best describes openEuler?",
+      "options": [
+        "An open-source Linux-based operating system supporting multiple processor architectures",
+        "A database management system derived from PostgreSQL",
+        "A hypervisor that can only run virtual machines on Kunpeng",
+        "A proprietary Unix operating system available only on x86 servers"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "openEuler est un système d'exploitation libre à noyau Linux, soutenu par sa communauté. Il prend en charge x86, ARM/Kunpeng, SW64, RISC-V, LoongArch et PowerPC. Ce n'est ni un Unix propriétaire, ni une base de données (c'est openGauss), ni un simple hyperviseur.",
+      "topic": "openEuler overview"
+    },
+    {
+      "id": "hcia-oe-01-q02",
+      "type": "single",
+      "prompt": "Which release families does openEuler provide?",
+      "options": [
+        "Beta and Alpha",
+        "Innovation and LTS",
+        "Community and Enterprise only",
+        "Rolling and Stable only"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "openEuler distingue les versions Innovation, qui apportent rapidement les nouvelles fonctionnalités, et les versions LTS, orientées stabilité et support de longue durée. Les autres couples proposés ne correspondent pas à la terminologie officielle.",
+      "topic": "Releases"
+    },
+    {
+      "id": "hcia-oe-01-q03",
+      "type": "tf",
+      "prompt": "openEuler can only run on x86 processors.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux. openEuler supporte plusieurs architectures, notamment x86, ARM/Kunpeng, SW64, RISC-V, LoongArch et PowerPC. Le support de Kunpeng est même un argument central de l'écosystème Huawei.",
+      "topic": "Architecture support"
+    },
+    {
+      "id": "hcia-oe-01-q04",
+      "type": "multi",
+      "prompt": "Which of the following are valid ways to install openEuler? (Choose three.)",
+      "options": [
+        "Through a PXE network boot",
+        "By double-clicking a Windows .msi package",
+        "From a USB drive",
+        "From a CD/DVD"
+      ],
+      "answer": [
+        0,
+        2,
+        3
+      ],
+      "explanation_fr": "openEuler peut être installé depuis une clé USB, un CD/DVD, un serveur PXE ou une image ISO montée dans une machine virtuelle. Un paquet .msi est un format d'installation Windows et n'a aucun sens pour installer un OS Linux.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-oe-01-q05",
+      "type": "single",
+      "prompt": "Which partition is used as an extension of RAM when memory is insufficient?",
+      "options": [
+        "/var",
+        "/boot",
+        "swap",
+        "/boot/efi"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "La partition swap sert de mémoire d'appoint : le noyau y déplace des pages peu utilisées lorsque la RAM manque. /boot contient le noyau et les fichiers de démarrage, /boot/efi est nécessaire au démarrage UEFI, et /var accueille des données variables comme les journaux.",
+      "topic": "Partitioning"
+    },
+    {
+      "id": "hcia-oe-01-q06",
+      "type": "tf",
+      "prompt": "After a default server installation, openEuler starts with a graphical user interface.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux. openEuler démarre par défaut en CLI (Command Line Interface). Une interface graphique comme GNOME, UKUI, DDE, Kiran ou XFCE doit être installée séparément si elle est nécessaire.",
+      "topic": "Login"
+    },
+    {
+      "id": "hcia-oe-01-q07",
+      "type": "text",
+      "prompt": "Which key is used to automatically complete commands and parameters in the Bash shell? (Enter the key name.)",
+      "accept": [
+        "tab",
+        "tab key",
+        "the tab key"
+      ],
+      "sample_answer": "Tab",
+      "explanation_fr": "La touche Tab déclenche l'autocomplétion de Bash : elle complète les commandes, les chemins et les paramètres. Ctrl+L efface l'écran, les flèches haut et bas parcourent l'historique et Ctrl+C interrompt le processus courant.",
+      "topic": "Bash shortcuts"
+    },
+    {
+      "id": "hcia-oe-01-q08",
+      "type": "text",
+      "prompt": "Which character typically ends the shell prompt of the root user? (Enter the single character.)",
+      "accept": [
+        "#",
+        "hashtag",
+        "hash",
+        "sharp"
+      ],
+      "sample_answer": "#",
+      "explanation_fr": "Le prompt de root se termine par #, tandis que celui d'un utilisateur standard se termine par $. C'est un repère visuel important pour éviter d'exécuter des commandes destructrices en tant qu'administrateur.",
+      "topic": "Users"
+    },
+    {
+      "id": "hcia-oe-01-q09",
+      "type": "multi",
+      "prompt": "Which of the following are features or entry points of openEuler Intelligence? (Choose three.)",
+      "options": [
+        "A web entry",
+        "An intelligent shell entry",
+        "A local knowledge base used with RAG",
+        "A Windows Registry editor"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "openEuler Intelligence s'utilise via une interface web ou un shell intelligent, et s'appuie sur une base de connaissances locale combinée au RAG pour répondre. Il ne fournit pas d'éditeur de registre Windows, concept propre à Windows.",
+      "topic": "openEuler Intelligence"
+    },
+    {
+      "id": "hcia-oe-01-q10",
+      "type": "single",
+      "prompt": "Which statement about the LGPL license is correct?",
+      "options": [
+        "It forbids any commercial distribution",
+        "It is identical to the BSD license",
+        "It requires any application that links the library to be released under the GPL",
+        "It allows proprietary software to link the LGPL library without open-sourcing the application"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "La LGPL a été conçue pour les bibliothèques : une application propriétaire peut lier une bibliothèque LGPL sans devoir publier son propre code. En revanche, si tu modifies la bibliothèque LGPL, les modifications et le code dérivé doivent rester sous LGPL. La GPL impose le copyleft à l'ensemble du dérivé, et BSD est permissive.",
+      "topic": "Licenses"
+    },
+    {
+      "id": "hcia-oe-01-q11",
+      "type": "single",
+      "prompt": "What does the kernel version number 4.19.90 indicate?",
+      "options": [
+        "Major 4, minor 19, patch 90, with an even minor number indicating a stable branch",
+        "Major 4, patch 19, minor 90, with an odd patch number indicating a stable branch",
+        "A distribution release 4.19.90 with 90 packaged applications",
+        "An LTS release that will be supported for 90 months"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "La forme est majeur.mineur.correctif : 4 est le majeur, 19 le mineur et 90 le correctif. La convention Linux associe un mineur pair à une branche stable. Les autres propositions inventent une signification qui n'existe pas dans la numérotation du noyau.",
+      "topic": "Kernel versioning"
+    },
+    {
+      "id": "hcia-oe-01-q12",
+      "type": "single",
+      "prompt": "Which license requires a distributed derivative work to remain under the same license?",
+      "options": [
+        "BSD",
+        "GPL",
+        "LGPL for the calling application",
+        "Mulan"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "La GPL est un copyleft fort : un dérivé distribué doit rester sous GPL et son code source doit être disponible. BSD et Mulan sont permissives et autorisent la fermeture du produit. La LGPL n'impose le copyleft qu'à la bibliothèque modifiée, pas à l'application qui l'appelle.",
+      "topic": "Licenses"
+    },
+    {
+      "id": "hcia-oe-01-q13",
+      "type": "multi",
+      "prompt": "Which statements about openEuler LTS releases are correct? (Choose two.)",
+      "options": [
+        "They prioritize stability and security fixes for production",
+        "They always contain the newest experimental features",
+        "They are published every month",
+        "They are maintained for several years"
+      ],
+      "answer": [
+        0,
+        3
+      ],
+      "explanation_fr": "Une LTS est maintenue plusieurs années et privilégie la stabilité ainsi que les correctifs de sécurité, ce qui convient à la production. Les fonctionnalités expérimentales les plus récentes arrivent plutôt dans les versions Innovation, publiées à un rythme plus rapide mais pas mensuel.",
+      "topic": "Releases"
+    },
+    {
+      "id": "hcia-oe-01-q14",
+      "type": "tf",
+      "prompt": "Setting the root password is mandatory during an openEuler installation.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : l'installateur exige la définition d'un mot de passe root avant de poursuivre. La création d'un utilisateur standard est en revanche optionnelle, même si elle est recommandée pour éviter de travailler en permanence avec les privilèges maximaux.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-oe-01-q15",
+      "type": "text",
+      "prompt": "Which command displays the kernel version currently running? (Give the command and its option.)",
+      "accept": [
+        "uname -r",
+        "uname -r.",
+        "uname --kernel-release"
+      ],
+      "sample_answer": "uname -r",
+      "explanation_fr": "uname -r affiche la version du noyau, par exemple 4.19.90. uname -a montre toutes les informations, tandis que cat /etc/os-release donne la version de la distribution, qui ne doit pas être confondue avec celle du noyau.",
+      "topic": "Kernel versioning"
+    },
+    {
+      "id": "hcia-oe-01-q16",
+      "type": "single",
+      "prompt": "Which partition is required for booting openEuler in UEFI mode?",
+      "options": [
+        "/var",
+        "/home",
+        "/boot/efi",
+        "swap"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "En UEFI, le firmware lit une partition EFI au format FAT32, généralement montée sur /boot/efi, pour trouver le chargeur d'amorçage. swap est une extension mémoire, /var stocke des données variables et /home les fichiers des utilisateurs : aucune des trois n'est lue par le firmware au démarrage.",
+      "topic": "Partitioning"
+    },
+    {
+      "id": "hcia-oe-01-q17",
+      "type": "single",
+      "prompt": "What is the main role of RAG in openEuler Intelligence?",
+      "options": [
+        "To replace the Linux kernel with an AI model",
+        "To compile RPM packages automatically",
+        "To encrypt the container runtime socket",
+        "To retrieve relevant documents before generating an answer"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "RAG signifie Retrieval-Augmented Generation : le système recherche d'abord des documents pertinents dans une base de connaissances, puis génère une réponse à partir de ces extraits. Cela réduit les hallucinations et permet d'exploiter des données internes. RAG ne remplace pas le noyau, ne compile pas de RPM et ne chiffre pas le socket des conteneurs.",
+      "topic": "openEuler Intelligence"
+    },
+    {
+      "id": "hcia-oe-01-q18",
+      "type": "single",
+      "prompt": "Why is a minimal installation profile often preferred on production servers?",
+      "options": [
+        "It reduces disk usage and the attack surface",
+        "It is the only profile that supports UEFI",
+        "It automatically installs a graphical desktop",
+        "It disables the root account"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Un profil minimal installe moins de paquets : il consomme moins d'espace, demande moins de mises à jour et expose moins de services aux attaquants. UEFI dépend du firmware et du partitionnement, pas du profil. Un profil minimal n'installe justement pas de bureau graphique et ne supprime pas le compte root.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-oe-01-q19",
+      "type": "text",
+      "prompt": "Which command displays the openEuler release information stored in /etc/openEuler-release? (Give the full command.)",
+      "accept": [
+        "cat /etc/openEuler-release",
+        "cat /etc/openeuler-release",
+        "cat /etc/os-release"
+      ],
+      "sample_answer": "cat /etc/openEuler-release",
+      "explanation_fr": "cat /etc/openEuler-release affiche le contenu du fichier de version de la distribution. /etc/os-release fournit des informations équivalentes dans un format normalisé. uname -r ne donne que la version du noyau, pas le nom de la distribution.",
+      "topic": "Distribution version"
+    },
+    {
+      "id": "hcia-oe-01-q20",
+      "type": "single",
+      "prompt": "Which statement correctly distinguishes GNU from Linux?",
+      "options": [
+        "GNU is the kernel and Linux is a set of command-line tools",
+        "Linux is the kernel and GNU provides many system tools and libraries",
+        "GNU and Linux are two names for the same kernel",
+        "GNU is a package manager and Linux is a desktop environment"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Linux désigne le noyau, tandis que le projet GNU fournit de nombreux outils, bibliothèques et le compilateur GCC. Un système complet combine les deux, d'où l'expression GNU/Linux. Les autres propositions inversent les rôles ou inventent une équivalence qui n'existe pas.",
+      "topic": "Linux and GNU"
+    }
+  ]
+}

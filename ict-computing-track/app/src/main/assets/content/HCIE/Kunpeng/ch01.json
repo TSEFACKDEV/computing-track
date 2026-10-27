@@ -1,0 +1,611 @@
+{
+  "id": "hcie-kp-01",
+  "phase": "HCIE",
+  "subject": "Kunpeng",
+  "number": 1,
+  "title_fr": "BiSheng JDK et JVM avancée sur ARM64",
+  "title_en": "BiSheng JDK and Advanced JVM on ARM64",
+  "minutes": 75,
+  "source": "Pas de Training Material Kunpeng dédié dans les ressources (la gamme Computing Track ne couvre Kunpeng qu'en HCIA) — contenu aligné sur la documentation publique Huawei (BiSheng JDK, Kunpeng BoostKit) et sur la documentation OpenJDK relative à HotSpot, aux collecteurs de mémoire et à l'architecture ARM64.",
+  "objectives": [
+    "Expliquer ce que BiSheng JDK apporte réellement par rapport à un OpenJDK générique sur ARM64",
+    "Choisir un collecteur de mémoire à partir d'une SLA de latence et d'un profil de charge",
+    "Dimensionner heap, métaspace et mémoire directe sans exposer la JVM à l'OOMKilled",
+    "Observer une JVM en production avec JFR, async-profiler, les logs GC et NMT",
+    "Interpréter le warm-up JIT et les intrinsics ARM64 dans une campagne de benchmark",
+    "Diagnostiquer une fuite hors heap ou une pause anormale avec une démarche mesurée"
+  ],
+  "sections": [
+    {
+      "heading": "Pourquoi une JVM spécifique à ARM64",
+      "body": "BiSheng JDK est la distribution OpenJDK que Huawei maintient pour l'architecture ARM64 et les processeurs Kunpeng. Elle ne change ni le langage Java ni les API : elle adapte le moteur d'exécution HotSpot, les bibliothèques natives et les intrinsics aux caractéristiques du jeu d'instructions AArch64. Porter une application Java depuis x86 vers Kunpeng se résume donc souvent à changer de JDK et à reconstruire les dépendances natives : Netty avec son transport epoll, Snappy, zlib, les bibliothèques de chiffrement et les agents de supervision.\n\nTrois différences structurelles expliquent cet effort. Le modèle mémoire ARM64 est plus faible que celui de x86 : le compilateur et la JVM doivent insérer des barrières explicites, et les instructions atomiques LSE, quand le processeur les expose, évitent les anciennes boucles de chargement-réservation. Ensuite la vectorisation : NEON fournit 128 bits de SIMD, exploités par les intrinsics de compression, de chiffrement et de calcul. Enfin la topologie : un Kunpeng regroupe beaucoup de cœurs sur plusieurs nœuds NUMA, ce qui rend l'affinité des threads et le parallélisme du GC plus déterminants.\n\nLa conséquence pratique est méthodologique : un benchmark x86 ne se transpose pas tel quel. Toute conclusion doit venir d'une mesure sur la cible, avec le même JDK, les mêmes options et la même charge représentative.",
+      "bullets": [
+        "BiSheng = OpenJDK adapté à ARM64, pas un langage différent",
+        "Les bibliothèques natives doivent être reconstruites pour AArch64",
+        "Le modèle mémoire ARM64 impose des barrières explicites",
+        "Un Kunpeng expose souvent plusieurs nœuds NUMA : l'affinité compte"
+      ],
+      "code": [
+        "java -version   # vérifier la distribution et la version",
+        "uname -m        # doit renvoyer aarch64",
+        "ldd /opt/app/lib/*.so | grep -i x86   # détecter un binaire x86 résiduel"
+      ],
+      "diagram": "Application Java\n      |\n  API Java (identiques x86/ARM)\n      |\n  HotSpot JIT  ---> code AArch64 + intrinsics NEON\n      |\n  Bibliothèques natives (zlib, Netty, OpenSSL)  [à reconstruire]\n      |\n  Noyau Linux ARM64 (openEuler) + NUMA\n      |\n  Kunpeng 920 (cœurs ARMv8, plusieurs sockets)",
+      "tip": "En examen, « BiSheng » désigne une distribution JDK, pas un nouveau langage ni un hyperviseur. Le piège classique est de croire qu'il faut réécrire le code Java : seules les dépendances natives et les options de performance changent.",
+      "exercises": []
+    },
+    {
+      "heading": "Choisir un collecteur selon la SLA",
+      "body": "Le collecteur est le premier levier de latence, mais il ne se choisit pas par préférence : il se déduit de la SLA et du profil de charge. G1 découpe le heap en régions et évacue d'abord celles qui contiennent le plus de déchets. Il vise une pause cible via MaxGCPauseMillis et reste le choix par défaut équilibré des JDK modernes. ZGC, devenu générationnel dans les JDK récents, colore les références et déplace les objets en parallèle de l'application : ses pauses sont annoncées sous la milliseconde et dépendent très peu de la taille du heap, au prix de barrières de lecture et d'une empreinte mémoire supérieure. Parallel GC, lui, arrête le monde mais consacre tous les cœurs au recyclage : c'est le meilleur débit brut pour les traitements par lots. Serial reste pertinent pour les très petits heaps ou les environnements contraints.\n\nLa démarche est simple : mesurer d'abord, décider ensuite. Une API de paiement qui doit tenir un p99 de quelques dizaines de millisecondes avec un heap de 32 Go justifie ZGC. Une chaîne ETL nocturne, indifférente à une pause de deux secondes, préférera Parallel. Un microservice de 1 Go vivra très bien avec G1.\n\nAttention au coût caché : un collecteur à faibles pauses consomme des cycles CPU et de la mémoire pour ses structures. Sur une machine déjà saturée, il peut dégrader le débit global.",
+      "bullets": [
+        "G1 : compromis par défaut, pause cible configurable",
+        "ZGC : pauses quasi indépendantes de la taille du heap",
+        "Parallel GC : débit maximal pour les lots, pauses longues",
+        "Toujours arbitrer avec des mesures p99 et un budget CPU"
+      ],
+      "code": [
+        "java -Xms8g -Xmx8g -XX:+UseG1GC -XX:MaxGCPauseMillis=100 -jar app.jar",
+        "java -Xms32g -Xmx32g -XX:+UseZGC -XX:+ZGenerational -jar app.jar",
+        "java -Xms16g -Xmx16g -XX:+UseParallelGC -jar batch.jar"
+      ],
+      "table": {
+        "headers": [
+          "Collecteur",
+          "Cible principale",
+          "Pause visée",
+          "Compromis"
+        ],
+        "rows": [
+          [
+            "G1",
+            "Services généraux",
+            "Quelques dizaines de ms",
+            "Équilibré, overhead modéré"
+          ],
+          [
+            "ZGC",
+            "API interactive, gros heap",
+            "Inférieure à la ms",
+            "CPU et mémoire supplémentaires"
+          ],
+          [
+            "Parallel",
+            "Batch, calcul",
+            "Secondes acceptables",
+            "Débit maximal, pauses longues"
+          ],
+          [
+            "Serial",
+            "Petit heap, edge",
+            "Courte mais fréquente",
+            "Un seul cœur pour le GC"
+          ]
+        ]
+      },
+      "tip": "Ne répondez jamais « ZGC partout » : l'énoncé HCIE précise généralement la contrainte (débit, latence, taille de heap, CPU disponible). La bonne réponse est celle qui respecte cette contrainte au moindre coût.",
+      "exercises": [
+        {
+          "prompt": "Une plateforme de trading expose une API avec un heap de 48 Go et une SLA de p99 à 30 ms. La plateforme tourne sur un serveur Kunpeng à 64 cœurs encore chargé à 40 %. Quel collecteur choisir et quelles options vérifier avant la mise en production ?",
+          "correction": "Le besoin est une latence basse et prévisible avec un très gros heap : ZGC s'impose, car ses pauses dépendent peu de la taille du tas, contrairement à G1 dont les pauses augmentent avec le nombre de régions à évacuer. On démarre avec -Xms48g -Xmx48g -XX:+UseZGC -XX:+ZGenerational ; on fixe le heap pour éviter les redimensionnements. On vérifie ensuite trois points : la marge CPU (ZGC consomme des cycles pour ses barrières et ses threads de compaction), la mémoire hors heap (métaspace, buffers directs), et la stabilité du p99 sur une charge réelle de 30 à 60 minutes après warm-up. Si le CPU plafonne, G1 avec MaxGCPauseMillis=50 peut être un repli, mais il faudra accepter des pauses plus longues sur 48 Go."
+        }
+      ]
+    },
+    {
+      "heading": "Dimensionner le heap et les générations",
+      "body": "Un heap mal dimensionné produit deux maladies opposées. Trop petit, il provoque des collectes jeunes incessantes puis des full GC en cascade dès que le taux d'allocation dépasse la capacité de recyclage : la latence s'effondre et le CPU est monopolisé par le GC. Trop grand, il rallonge chaque cycle de collecte, retarde la libération des objets et peut masquer une fuite mémoire pendant des semaines. La bonne taille est celle qui laisse la JVM travailler avec une fréquence de GC maîtrisée, pas celle qui remplit la machine.\n\nEn production, on fixe généralement -Xms égal à -Xmx. Cela évite que la JVM redimensionne le tas à chaud, ce qui déclenche des full GC et brouille les mesures. Il faut aussi réserver de la place au métaspace, aux threads, aux buffers directs et aux structures natives : le tas n'est pas toute la mémoire du processus. Sur ARM64, la taille de page peut être de 64 Ko sur certaines configurations : les allocations natives très fragmentées en souffrent davantage, et les grands buffers alignés en bénéficient.\n\nLes générations méritent un regard particulier. La plupart des objets meurent jeunes ; un ratio jeune/vieux adapté évite de promouvoir trop tôt des objets temporaires. Surveillez le taux de promotion et le nombre de full GC plutôt que de régler à l'aveugle des ratios hérités d'articles anciens.",
+      "bullets": [
+        "-Xms = -Xmx pour supprimer le redimensionnement à chaud",
+        "Réserver 25 à 40 % de la mémoire du conteneur hors heap",
+        "Un heap trop grand retarde la détection des fuites",
+        "Surveiller le taux de promotion, pas seulement l'occupation"
+      ],
+      "code": [
+        "java -Xms8g -Xmx8g -XX:MetaspaceSize=256m -XX:MaxMetaspaceSize=512m -jar app.jar",
+        "java -Xlog:gc+heap=debug -Xlog:gc*:file=gc.log:time,uptime:filecount=5,filesize=50M -jar app.jar",
+        "jcmd PID GC.heap_info"
+      ],
+      "table": {
+        "headers": [
+          "Option",
+          "Rôle",
+          "Valeur de départ"
+        ],
+        "rows": [
+          [
+            "-Xms / -Xmx",
+            "Heap initial et maximal",
+            "50 à 70 % du conteneur"
+          ],
+          [
+            "-XX:MaxMetaspaceSize",
+            "Plafond du métaspace",
+            "256 à 512 Mo"
+          ],
+          [
+            "-XX:MaxDirectMemorySize",
+            "Buffers natifs hors heap",
+            "Selon usage Netty/Arrow"
+          ],
+          [
+            "-XX:+HeapDumpOnOutOfMemoryError",
+            "Preuve post-incident",
+            "Toujours activé"
+          ]
+        ]
+      },
+      "tip": "Un heap à 90 % de la RAM du pod est une erreur de débutant : le processus meurt en OOMKilled avant que le GC puisse réagir. Laissez toujours de la marge pour le métaspace, les threads, les buffers directs et le cache de pages.",
+      "exercises": []
+    },
+    {
+      "heading": "Observer sans arrêter : JFR et async-profiler",
+      "body": "Java Flight Recorder est un mécanisme d'événements intégré à la JVM, conçu pour un coût faible et une activation à chaud. On peut démarrer un enregistrement au lancement avec -XX:StartFlightRecording, ou sur une JVM déjà en production avec jcmd. JFR collecte les allocations, les pauses GC, les compilations JIT, les verrous, les I/O fichier et réseau, ainsi que les exceptions : c'est souvent la première source à consulter, car elle corrèle plusieurs symptômes dans une même chronologie.\n\nasync-profiler complète JFR pour l'analyse de CPU. Il échantillonne les piles d'appels, y compris en mode wall-clock, ce qui révèle les threads bloqués et pas seulement ceux qui brûlent du CPU. Un flamegraph bien lu se parcourt de haut en bas : la largeur représente le temps, la profondeur la pile d'appels. Un plateau large en bas indique une fonction chaude ; une tour étroite et profonde indique une chaîne d'appels spécifique.\n\nLa règle d'or est de profiler court et léger : quelques minutes, un échantillonnage raisonnable, jamais au pic absolu sans nécessité. Un profil prélevé pendant un incident n'est pas représentatif de la charge nominale ; il faut comparer une capture en régime stable et une capture en incident. Enfin, corrélez toujours le profil avec les métriques système : un flamegraph peut désigner le GC alors que la cause est un manque de mémoire ou un disque lent.",
+      "bullets": [
+        "JFR s'active à chaud avec jcmd, sans redémarrage",
+        "JFR corrèle allocation, GC, JIT, verrous et I/O",
+        "async-profiler produit des flamegraphs CPU ou wall-clock",
+        "Comparer un profil nominal et un profil d'incident"
+      ],
+      "code": [
+        "jcmd PID JFR.start name=diag duration=5m filename=/var/tmp/diag.jfr",
+        "jcmd PID JFR.dump name=diag filename=/var/tmp/diag.jfr",
+        "asprof -e cpu -d 30 -f /var/tmp/cpu.html PID",
+        "asprof -e alloc -d 30 -f /var/tmp/alloc.html PID"
+      ],
+      "tip": "JFR n'est pas réservé aux incidents : un enregistrement de quelques minutes en régime nominal constitue la référence qui permettra d'interpréter la prochaine crise. Sans référence, un profil d'incident est difficile à qualifier.",
+      "exercises": []
+    },
+    {
+      "heading": "JIT, intrinsics et warm-up sur ARM64",
+      "body": "HotSpot commence par interpréter le bytecode, puis compile les méthodes chaudes avec C1, puis C2. Ce passage progressif explique pourquoi les premières secondes d'un service Java sont lentes : le code n'est pas encore compilé, les profils de types ne sont pas stabilisés et les caches processeur sont froids. Sur ARM64, le JIT génère du code AArch64 et peut remplacer certains appels de bibliothèque par des instructions natives : AES pour le chiffrement, CRC32C pour les checksums, SHA pour les hachages, et des kernels NEON pour les opérations vectorielles. Ces intrinsics sont activés automatiquement lorsque le processeur et la JVM les supportent.\n\nBiSheng ajoute une couche d'optimisation pour Kunpeng et prend en charge la Vector API, qui permet d'exprimer du SIMD portable en Java. Le gain dépend toutefois de la taille des données et de l'alignement : vectoriser une boucle sur de petits tableaux peut être contre-productif à cause du surcoût de préparation.\n\nDeux options aident à stabiliser les mesures. AlwaysPreTouch pré-commite les pages du heap au démarrage, ce qui évite les défauts de page pendant les premières minutes. TieredStopAtLevel=1 limite la compilation à C1 : le démarrage est plus rapide et la latence plus régulière, mais le débit de pointe est inférieur. Pour les fonctions serverless, ce compromis peut être le bon ; pour un service longue durée, il faut laisser C2 travailler.",
+      "bullets": [
+        "Interpréteur, C1 puis C2 : le débit augmente avec le warm-up",
+        "Les intrinsics AES, SHA, CRC et NEON sont activés automatiquement",
+        "AlwaysPreTouch stabilise la latence de démarrage",
+        "TieredStopAtLevel=1 privilégie le démarrage, pas le débit de pointe"
+      ],
+      "code": [
+        "java -Xms8g -Xmx8g -XX:+AlwaysPreTouch -jar app.jar",
+        "java -XX:TieredStopAtLevel=1 -jar fonction.jar",
+        "java -XX:+PrintCompilation -jar app.jar | head -50"
+      ],
+      "tip": "Un benchmark qui compare x86 et ARM sans phase de warm-up mesure surtout la vitesse de démarrage. En examen comme en production, la performance JIT se juge en régime établi, après 30 à 60 secondes de charge représentative.",
+      "exercises": [
+        {
+          "prompt": "Un collègue conclut qu'un service Java est 35 % plus lent sur Kunpeng après avoir lancé un test de 20 secondes juste après le démarrage. Comment vérifier et corriger la méthodologie ?",
+          "correction": "Le test est trop court et démarre à froid : il mesure l'interprétation, la compilation C1/C2 et les défauts de page, pas les performances en régime établi. Il faut relancer avec une phase de warm-up de 30 à 60 secondes, puis mesurer sur plusieurs minutes en régime stable, avec la même charge, le même heap, les mêmes options JVM et la même version de JDK sur les deux architectures. On ajoute -XX:+AlwaysPreTouch pour éviter les défauts de page, on vérifie que le CPU n'est pas saturé et on compare le débit ainsi que le p99, pas seulement la moyenne. Enfin, on contrôle que les bibliothèques natives sont bien en ARM64 avec ldd : un .so x86 résiduel, souvent chargé via un wheel Python ou un agent, fausse toute la comparaison."
+        }
+      ]
+    },
+    {
+      "heading": "Mémoire off-heap et buffers directs",
+      "body": "Toute la mémoire d'un processus Java n'est pas dans le heap. Les ByteBuffer.allocateDirect, les pools de ByteBuf de Netty, les bibliothèques de sérialisation et les moteurs analytiques comme Arrow ou Chronicle allouent hors tas. Ces objets échappent au GC, ce qui réduit la pression sur les collecteurs et évite les copies entre Java et le noyau, mais ils doivent être libérés explicitement ou par des mécanismes de cleaner. Une fuite hors heap ne se voit donc pas dans les histogrammes de classes : elle se manifeste par une croissance de la mémoire résidente du processus, puis par un OOMKilled du conteneur.\n\nLa limite -XX:MaxDirectMemorySize plafonne les allocations directes ; lorsqu'elle n'est pas fixée, elle suit généralement la taille maximale du heap. C'est un garde-fou, pas un mécanisme de libération. Pour diagnostiquer, on active Native Memory Tracking au démarrage avec -XX:NativeMemoryTracking=summary, puis on interroge jcmd VM.native_memory. On distingue ainsi le heap, le métaspace, le code compilé, les threads, le GC et les allocations directes.\n\nLes bonnes pratiques sont les mêmes que pour tout pool : borner, réutiliser, mesurer. Un pool de buffers mal dimensionné peut sembler être une fuite alors qu'il ne fait que croître jusqu'à sa taille nominale. Il faut donc surveiller le nombre de buffers actifs, pas seulement les octets réservés.",
+      "bullets": [
+        "Les buffers directs échappent au GC mais pas à l'OOMKilled",
+        "MaxDirectMemorySize est un plafond, pas une libération",
+        "NMT distingue heap, métaspace, code, threads et direct",
+        "Surveiller les buffers actifs, pas seulement les octets réservés"
+      ],
+      "code": [
+        "java -XX:MaxDirectMemorySize=2g -XX:NativeMemoryTracking=summary -jar app.jar",
+        "jcmd PID VM.native_memory summary",
+        "jcmd PID VM.native_memory detail | grep -i direct",
+        "jcmd PID GC.class_histogram | head -30"
+      ],
+      "table": {
+        "headers": [
+          "Zone",
+          "Contenu",
+          "Symptôme de saturation"
+        ],
+        "rows": [
+          [
+            "Heap",
+            "Objets Java",
+            "GC fréquent, full GC, latence"
+          ],
+          [
+            "Metaspace",
+            "Classes et bytecode",
+            "OutOfMemoryError: Metaspace"
+          ],
+          [
+            "Direct",
+            "ByteBuffer, Netty, Arrow",
+            "RSS élevée puis OOMKilled"
+          ],
+          [
+            "Code cache",
+            "Code compilé par le JIT",
+            "Avertissement code cache plein"
+          ]
+        ]
+      },
+      "tip": "Une croissance de la mémoire résidente avec un heap stable ne prouve pas une fuite : elle peut venir du cache de pages, du métaspace ou d'un pool qui atteint sa taille nominale. Activez NMT avant l'incident, car il ne peut pas reconstituer le passé.",
+      "exercises": []
+    },
+    {
+      "heading": "La JVM dans Kubernetes",
+      "body": "Dans un conteneur, la JVM moderne lit les limites cgroup grâce à UseContainerSupport, activé par défaut. Si aucune option de heap n'est fournie, elle dimensionne le tas à environ un quart de la limite mémoire du conteneur. Ce comportement protège la machine hôte, mais il est souvent trop prudent pour une application serveur : un pod de 4 Go se retrouve avec un heap de 1 Go, tandis que le reste de la mémoire est peu utilisé.\n\nLe risque symétrique est plus grave : fixer -Xmx à 3 Go dans un pod limité à 4 Go en oubliant le métaspace, les threads, les buffers directs et les bibliothèques natives. La somme dépasse la limite, le noyau tue le processus et Kubernetes affiche OOMKilled. La JVM n'a alors produit aucun OutOfMemoryError : elle n'a pas eu le temps. D'où la règle : heap explicite à 50-70 % de la limite, marge documentée pour le reste, et ExitOnOutOfMemoryError pour forcer un redémarrage propre lorsqu'une vraie OOM Java survient.\n\nLes métriques doivent suivre : exporteur Prometheus pour le heap, le GC, le métaspace et les threads, logs GC avec rotation, et alertes sur la fréquence des collectes plutôt que sur un seuil d'occupation arbitraire. Enfin, ActiveProcessorCount permet d'aligner le nombre de threads JVM sur la limite CPU du pod, ce qui évite un parallélisme excessif et des contentions inutiles.",
+      "bullets": [
+        "UseContainerSupport lit les limites cgroup (heap par défaut ≈ 25 %)",
+        "Fixer -Xmx à 50-70 % de la limite du pod, jamais au-delà",
+        "ExitOnOutOfMemoryError transforme une OOM Java en redémarrage contrôlé",
+        "ActiveProcessorCount aligne la JVM sur la limite CPU"
+      ],
+      "code": [
+        "java -XX:MaxRAMPercentage=60 -XX:+ExitOnOutOfMemoryError -jar app.jar",
+        "java -XX:ActiveProcessorCount=4 -jar app.jar",
+        "kubectl describe pod app | grep -i -E 'oom|limit'",
+        "kubectl top pod app"
+      ],
+      "diagram": "Limite cgroup du pod : 4 Gi\n+--------------------------------------+\n| Heap Java        -Xmx 2 Gi   (50 %)  |\n| Metaspace               256 Mi       |\n| Threads + code JIT      300 Mi       |\n| Buffers directs         512 Mi       |\n| Bibliothèques natives   reste        |\n+--------------------------------------+\nSomme > 4 Gi  =>  OOMKilled avant toute OOM Java",
+      "tip": "En QCM, 25 % est la valeur par défaut du heap dans un conteneur, mais ce n'est jamais une bonne cible de production. La question distingue souvent « comportement par défaut » et « recommandation ».",
+      "exercises": [
+        {
+          "prompt": "Un pod limité à 4 Gi redémarre régulièrement avec le statut OOMKilled. La JVM tourne avec -Xmx3g, le heap observé reste autour de 2,4 Go et aucun OutOfMemoryError n'apparaît dans les logs. Expliquez le diagnostic et proposez un dimensionnement.",
+          "correction": "Le heap n'est pas la cause directe : la mémoire résidente totale dépasse la limite cgroup. Avec -Xmx3g, il faut ajouter le métaspace (parfois 300 à 500 Mo), le code compilé, les piles de threads, les buffers directs de Netty et les allocations natives des bibliothèques. Le noyau tue le processus avant que la JVM ne puisse lever une OutOfMemoryError, ce qui explique l'absence de trace Java. On corrige en réduisant -Xmx à 2g, en fixant -XX:MaxDirectMemorySize=512m, en plafonnant le métaspace et en vérifiant avec jcmd VM.native_memory. On ajoute -XX:+ExitOnOutOfMemoryError pour les vraies OOM Java et on surveille la mémoire résidente réelle du pod, pas seulement l'occupation du heap. Si l'application a réellement besoin de plus de 2 Go de tas, il faut augmenter la limite du pod plutôt que de rogner les marges."
+        }
+      ]
+    },
+    {
+      "heading": "Méthode de diagnostic et plan de tuning",
+      "body": "Un tuning JVM sérieux suit toujours le même ordre : constater, mesurer, corréler, corriger, vérifier. La plainte initiale (« c'est lent ») ne suffit pas. Il faut la traduire en indicateurs : débit, latence moyenne, p99, taux d'erreur, consommation CPU, mémoire résidente. Chaque indicateur oriente vers une famille de causes différentes. Une latence p99 qui se dégrade avec un débit stable évoque le GC ou les verrous ; une baisse de débit avec un CPU saturé évoque une fonction chaude ou un parallélisme excessif ; une croissance mémoire régulière évoque une fuite dans le heap ou hors heap.\n\nLa collecte doit être simultanée. Les logs GC donnent la chronologie des pauses, JFR fournit le contexte applicatif, les métriques système révèlent la pression CPU, disque et réseau, et les traces applicatives montrent les dépendances lentes. Isoler un seul indicateur conduit souvent à une conclusion fausse : une pause GC longue peut n'être que la conséquence d'un heap saturé par une fuite, elle-même causée par un cache non borné.\n\nEnfin, toute modification doit être unique et mesurée. Changer à la fois le collecteur, le heap et le nombre de threads rend le résultat ininterprétable. On documente l'hypothèse, la modification, la mesure avant/après et le retour arrière possible. C'est cette discipline, plus que la connaissance d'options exotiques, qui distingue un expert HCIE.",
+      "bullets": [
+        "Traduire la plainte en indicateurs : débit, p99, erreurs, CPU, RSS",
+        "Collecter logs GC, JFR, métriques système et traces en parallèle",
+        "Ne modifier qu'un paramètre à la fois et documenter le retour arrière",
+        "Distinguer la cause racine de sa conséquence visible"
+      ],
+      "code": [
+        "jcmd PID VM.flags",
+        "jcmd PID GC.heap_info",
+        "jstat -gcutil PID 1000 60",
+        "pidstat -p PID 1 60"
+      ],
+      "tip": "En production, un plan de tuning sans métrique de succès définie à l'avance n'est pas un plan : c'est une expérimentation. Fixez le critère (p99, débit, CPU) avant de toucher aux options.",
+      "exercises": []
+    }
+  ],
+  "key_points": [
+    "BiSheng JDK est un OpenJDK optimisé ARM64 : le code Java est portable, les dépendances natives doivent être reconstruites.",
+    "G1 reste le choix par défaut ; ZGC vise les pauses sub-millisecondes sur les gros heaps ; Parallel maximise le débit des lots.",
+    "En production, -Xms = -Xmx et le heap n'occupe que 50 à 70 % de la mémoire du conteneur.",
+    "JFR s'active à chaud avec jcmd et corrèle allocation, GC, JIT et I/O ; async-profiler fournit les flamegraphs.",
+    "Les intrinsics AES, SHA, CRC et NEON sont activés automatiquement, mais le gain se mesure après warm-up.",
+    "La mémoire directe échappe au GC : MaxDirectMemorySize et NMT sont les garde-fous indispensables.",
+    "Un pod OOMKilled sans OutOfMemoryError signale une somme heap + natif supérieure à la limite cgroup.",
+    "Un tuning se pilote par une hypothèse, une modification unique et une mesure avant/après."
+  ],
+  "traps": [
+    "Croire qu'un heap calculé à 25 % du cgroup est optimal : c'est un défaut protecteur, souvent trop petit pour un service serveur.",
+    "Comparer un démarrage à froid x86 avec un démarrage ARM sans warm-up : la différence mesurée est surtout celle du JIT.",
+    "Oublier la mémoire hors heap dans le dimensionnement d'un pod : le processus est tué avant que la JVM ne signale l'OOM.",
+    "Confondre une pause GC longue avec la cause racine : elle peut n'être que le symptôme d'une fuite ou d'un cache non borné.",
+    "Activer NMT après l'incident : sans activation préalable, l'historique des allocations natives n'est pas disponible."
+  ],
+  "quiz": [
+    {
+      "id": "hcie-kp-01-q01",
+      "type": "single",
+      "prompt": "Which garbage collector is the default choice in modern HotSpot JDKs for a general-purpose server?",
+      "options": [
+        "G1 GC",
+        "Parallel GC",
+        "ZGC",
+        "Serial GC"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "G1 est le collecteur par défaut des JDK HotSpot modernes : il équilibre débit et latence avec une pause cible configurable. Serial ne convient qu'aux petits heaps, Parallel privilégie le débit au prix de pauses longues, et ZGC doit être activé explicitement car il consomme davantage de CPU et de mémoire.",
+      "topic": "Collecteurs de mémoire"
+    },
+    {
+      "id": "hcie-kp-01-q02",
+      "type": "single",
+      "prompt": "A service requires p99 latency below 5 ms with a 64 GB heap. Which collector is the most appropriate?",
+      "options": [
+        "Serial GC",
+        "ZGC",
+        "CMS",
+        "Parallel GC"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "ZGC est conçu pour maintenir des pauses inférieures à la milliseconde indépendamment de la taille du heap, ce qui correspond à l'exigence de p99. Parallel et Serial provoquent des pauses stop-the-world proportionnelles au tas, et CMS, déprécié, ne tient pas une telle contrainte sur 64 Go.",
+      "topic": "Collecteurs de mémoire"
+    },
+    {
+      "id": "hcie-kp-01-q03",
+      "type": "single",
+      "prompt": "Why is it recommended to set -Xms equal to -Xmx in production?",
+      "options": [
+        "It forces the use of ZGC",
+        "It enables compressed oops automatically",
+        "It avoids heap resizing that can trigger unnecessary full GC cycles",
+        "It disables the metaspace"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Fixer la taille initiale et maximale évite que la JVM agrandisse le tas à chaud, opération coûteuse qui peut provoquer des full GC et fausser les mesures. Cela n'active pas les compressed oops, ne désactive pas le métaspace et n'impose aucun collecteur particulier.",
+      "topic": "Dimensionnement du heap"
+    },
+    {
+      "id": "hcie-kp-01-q04",
+      "type": "single",
+      "prompt": "With UseContainerSupport and no explicit heap flags, what fraction of the cgroup memory limit does HotSpot use for the heap by default?",
+      "options": [
+        "About 50 %",
+        "About 90 %",
+        "About 10 %",
+        "About 25 %"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Par défaut, HotSpot dimensionne le heap maximal à environ un quart de la mémoire disponible ou de la limite cgroup. 10 % serait excessivement prudent, 50 % correspond à une cible de production recommandée mais pas au défaut, et 90 % exposerait le processus à l'OOMKilled.",
+      "topic": "JVM en conteneur"
+    },
+    {
+      "id": "hcie-kp-01-q05",
+      "type": "single",
+      "prompt": "Which JVM flag pre-commits and touches all heap pages at startup?",
+      "options": [
+        "-XX:+AlwaysPreTouch",
+        "-XX:+UseCompressedOops",
+        "-XX:+HeapDumpOnOutOfMemoryError",
+        "-XX:+ExitOnOutOfMemoryError"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "AlwaysPreTouch parcourt le heap au démarrage pour que les pages soient réellement allouées par le noyau, ce qui évite les défauts de page pendant les premières minutes. UseCompressedOops concerne la représentation des références, HeapDumpOnOutOfMemoryError produit un dump en cas d'OOM, et ExitOnOutOfMemoryError arrête la JVM après une OOM.",
+      "topic": "Démarrage et warm-up"
+    },
+    {
+      "id": "hcie-kp-01-q06",
+      "type": "single",
+      "prompt": "Which command starts a five-minute JFR recording on an already running JVM?",
+      "options": [
+        "jmap -histo:live PID",
+        "jcmd PID JFR.start duration=5m filename=rec.jfr",
+        "java -XX:StartFlightRecording=duration=5m -jar app.jar",
+        "jstack PID > rec.jfr"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "jcmd transmet la commande JFR.start à une JVM en cours d'exécution, sans redémarrage ni interruption du service. jmap produit un histogramme, la forme -XX:StartFlightRecording ne s'applique qu'au lancement d'une nouvelle JVM, et jstack capture des piles de threads dans un fichier texte, pas un enregistrement JFR.",
+      "topic": "JFR et profilage"
+    },
+    {
+      "id": "hcie-kp-01-q07",
+      "type": "single",
+      "prompt": "If -XX:MaxDirectMemorySize is not specified, what is the default limit for direct buffer allocations?",
+      "options": [
+        "64 MB",
+        "256 MB",
+        "It generally equals the maximum heap size",
+        "It is unlimited"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Sans valeur explicite, la limite des allocations directes suit généralement la taille maximale du heap. Ce n'est ni 64 Mo ni 256 Mo, valeurs arbitraires, et ce n'est pas illimité : la mémoire native reste bornée par la RAM et par le cgroup, ce qui expose au risque d'OOMKilled.",
+      "topic": "Mémoire off-heap"
+    },
+    {
+      "id": "hcie-kp-01-q08",
+      "type": "single",
+      "prompt": "Which flag must be set at JVM startup to collect Native Memory Tracking data?",
+      "options": [
+        "-Xlog:gc*",
+        "-XX:+AlwaysPreTouch",
+        "-XX:+UseZGC",
+        "-XX:NativeMemoryTracking=summary"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Native Memory Tracking doit être activé au démarrage avec -XX:NativeMemoryTracking=summary ou detail, puis interrogé via jcmd VM.native_memory. UseZGC change de collecteur, Xlog:gc* produit des logs GC et AlwaysPreTouch pré-alloue le heap : aucun ne fournit le détail des allocations natives.",
+      "topic": "Mémoire off-heap"
+    },
+    {
+      "id": "hcie-kp-01-q09",
+      "type": "single",
+      "prompt": "What is the main effect of -XX:TieredStopAtLevel=1?",
+      "options": [
+        "It limits JIT compilation to C1, improving startup at the expense of peak throughput",
+        "It forces ZGC generational mode",
+        "It doubles the default heap size",
+        "It disables the interpreter"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Avec TieredStopAtLevel=1, la JVM s'arrête à la compilation C1 : le code est compilé plus vite et le démarrage s'améliore, mais le débit de pointe reste inférieur à celui obtenu avec C2. L'interpréteur n'est pas désactivé, le collecteur n'est pas modifié et le heap n'est pas doublé.",
+      "topic": "JIT et warm-up"
+    },
+    {
+      "id": "hcie-kp-01-q10",
+      "type": "single",
+      "prompt": "Which GC log configuration limits disk usage while keeping recent history?",
+      "options": [
+        "-XX:+UseG1GC -XX:MaxGCPauseMillis=200",
+        "-Xlog:gc*:file=gc.log:filecount=5,filesize=50M",
+        "-XX:+PrintGCDetails -Xlog:gc",
+        "-Xlog:gc:file=gc.log:uptime"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "L'option filecount associée à filesize provoque la rotation des logs et borne l'espace disque consommé tout en conservant les fichiers récents. Les autres propositions soit mélangent des syntaxes incompatibles, soit ne définissent aucune rotation, soit règlent le collecteur sans configurer les logs.",
+      "topic": "Logs GC"
+    },
+    {
+      "id": "hcie-kp-01-q11",
+      "type": "multi",
+      "prompt": "Which practices improve JVM observability in production? (Choose three.)",
+      "options": [
+        "Removing native memory tracking to save CPU",
+        "Enabling GC logs with rotation",
+        "Starting JFR recordings on demand with jcmd",
+        "Exposing JVM metrics through a Prometheus exporter",
+        "Disabling garbage collection to reduce noise"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "Les logs GC avec rotation, JFR à la demande et un exporteur Prometheus forment les trois piliers de l'observabilité JVM. Désactiver le GC est impossible en pratique et provoquerait une saturation du heap ; supprimer NMT prive l'équipe du diagnostic des fuites natives.",
+      "topic": "Observabilité"
+    },
+    {
+      "id": "hcie-kp-01-q12",
+      "type": "multi",
+      "prompt": "Which signals suggest a leak in direct (off-heap) memory? (Choose three.)",
+      "options": [
+        "Metaspace usage grows with every request",
+        "Resident memory keeps growing while heap usage stays stable",
+        "The container is OOMKilled without a Java OutOfMemoryError",
+        "NMT shows unbounded growth in the direct memory category",
+        "Young GC frequency decreases over time"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "Une fuite directe se traduit par une croissance de la mémoire résidente alors que le heap reste stable, un OOMKilled sans trace Java et une progression de la catégorie direct dans NMT. Une baisse des young GC n'est pas un symptôme de fuite, et la croissance du métaspace indique plutôt un chargement de classes, pas des buffers directs.",
+      "topic": "Mémoire off-heap"
+    },
+    {
+      "id": "hcie-kp-01-q13",
+      "type": "multi",
+      "prompt": "Which statements about the JVM on ARM64 are correct? (Choose three.)",
+      "options": [
+        "NEON provides SIMD instructions used by JVM intrinsics",
+        "LSE atomics can replace load-reserved/store-conditional loops when available",
+        "Java bytecode must be rewritten before running on Kunpeng",
+        "BiSheng JDK only supports interpreted execution",
+        "The ARM64 memory model is weaker than x86 and requires explicit barriers"
+      ],
+      "answer": [
+        0,
+        1,
+        4
+      ],
+      "explanation_fr": "ARM64 impose un ordonnancement mémoire plus faible, exploite NEON pour le SIMD et bénéficie des instructions atomiques LSE sur les processeurs récents. Le bytecode Java est portable et n'a pas à être réécrit, et BiSheng fournit bien un JIT C1/C2 complet, pas seulement un interpréteur.",
+      "topic": "Architecture ARM64"
+    },
+    {
+      "id": "hcie-kp-01-q14",
+      "type": "multi",
+      "prompt": "Which rules help size a JVM inside a Kubernetes pod? (Choose three.)",
+      "options": [
+        "Reserve memory for metaspace, threads and direct buffers",
+        "Use ActiveProcessorCount to match the CPU limit",
+        "Set -Xmx slightly above the container limit to avoid GC",
+        "Rely on the default 25 percent heap for latency-critical services",
+        "Set an explicit -Xmx between 50 and 70 percent of the container limit"
+      ],
+      "answer": [
+        0,
+        1,
+        4
+      ],
+      "explanation_fr": "Un heap explicite à 50-70 % de la limite, une marge pour les zones natives et un parallélisme aligné sur la limite CPU constituent un dimensionnement sain. Dépasser la limite du conteneur provoque l'OOMKilled, et le défaut de 25 % est protecteur mais généralement trop petit pour un service serveur.",
+      "topic": "JVM en conteneur"
+    },
+    {
+      "id": "hcie-kp-01-q15",
+      "type": "tf",
+      "prompt": "Benchmarking only the cold-start latency of a Java service is sufficient to evaluate JIT performance on ARM64.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le JIT a besoin d'une phase de warm-up pour compiler les méthodes chaudes et stabiliser les profils de types. Mesurer uniquement le démarrage à froid évalue surtout l'interpréteur et C1, pas la performance en régime établi, qui est celle qui compte pour un service de production.",
+      "topic": "JIT et warm-up"
+    },
+    {
+      "id": "hcie-kp-01-q16",
+      "type": "tf",
+      "prompt": "BiSheng JDK provides NEON-optimized intrinsics for operations such as compression and cryptography on ARM64.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "BiSheng exploite les instructions ARM64, notamment NEON et les extensions cryptographiques, pour accélérer compression, chiffrement et calcul vectoriel. Ces optimisations sont intégrées au JDK et aux bibliothèques associées, sans modification du code applicatif dans la majorité des cas.",
+      "topic": "Architecture ARM64"
+    },
+    {
+      "id": "hcie-kp-01-q17",
+      "type": "tf",
+      "prompt": "Setting -Xmx above the container memory limit is safe because HotSpot reads the cgroup limit and caps the heap automatically.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Une valeur explicite de -Xmx est prioritaire sur le calcul automatique : la JVM ne plafonne pas silencieusement le heap à la limite cgroup. Si le heap et les zones natives dépassent la limite, le noyau tue le processus et Kubernetes affiche OOMKilled.",
+      "topic": "JVM en conteneur"
+    },
+    {
+      "id": "hcie-kp-01-q18",
+      "type": "text",
+      "prompt": "Which jcmd command starts a 5-minute JFR recording named diag on a running JVM? (Enter the full command with PID as placeholder.)",
+      "options": [],
+      "answer": [],
+      "accept": [
+        "jcmd PID JFR.start name=diag duration=5m filename=rec.jfr",
+        "jcmd PID JFR.start duration=5m name=diag filename=rec.jfr",
+        "jcmd <pid> JFR.start name=diag duration=5m filename=rec.jfr"
+      ],
+      "sample_answer": "jcmd PID JFR.start name=diag duration=5m filename=rec.jfr",
+      "explanation_fr": "JFR.start est une commande de diagnostic attachée à une JVM en cours : elle démarre l'enregistrement sans redémarrage. Le nom permet de le retrouver avec JFR.dump ou JFR.stop, et duration limite la collecte dans le temps.",
+      "topic": "JFR et profilage"
+    },
+    {
+      "id": "hcie-kp-01-q19",
+      "type": "text",
+      "prompt": "Which two flags set both the initial and maximum heap to 4 GB? (Enter the two flags separated by a space.)",
+      "options": [],
+      "answer": [],
+      "accept": [
+        "-Xms4g -Xmx4g",
+        "-Xms4G -Xmx4G",
+        "-Xms4096m -Xmx4096m"
+      ],
+      "sample_answer": "-Xms4g -Xmx4g",
+      "explanation_fr": "-Xms fixe le heap initial et -Xmx le heap maximal. Les rendre égaux supprime le redimensionnement à chaud, stabilise la latence et évite les full GC déclenchés par l'agrandissement du tas.",
+      "topic": "Dimensionnement du heap"
+    },
+    {
+      "id": "hcie-kp-01-q20",
+      "type": "text",
+      "prompt": "Which unified logging flag replaces the deprecated PrintGCDetails option in modern JDKs? (Enter only the flag.)",
+      "options": [],
+      "answer": [],
+      "accept": [
+        "-Xlog:gc*",
+        "-Xlog:gc",
+        "-Xlog:gc*:stdout"
+      ],
+      "sample_answer": "-Xlog:gc*",
+      "explanation_fr": "Le système de logs unifié remplace PrintGCDetails et PrintGCTimeStamps par -Xlog. La forme -Xlog:gc* active tous les tags liés au GC ; on peut ensuite ajouter le fichier, l'horodatage, la rotation et le niveau de détail.",
+      "topic": "Logs GC"
+    }
+  ]
+}

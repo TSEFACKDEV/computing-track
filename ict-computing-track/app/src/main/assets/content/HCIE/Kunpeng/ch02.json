@@ -1,0 +1,616 @@
+{
+  "id": "hcie-kp-02",
+  "phase": "HCIE",
+  "subject": "Kunpeng",
+  "number": 2,
+  "title_fr": "Calcul haute performance (HPC) sur Kunpeng",
+  "title_en": "High Performance Computing on Kunpeng",
+  "minutes": 75,
+  "source": "Pas de Training Material Kunpeng dédié dans les ressources (la gamme Computing Track ne couvre Kunpeng qu'en HCIA) — contenu aligné sur la documentation publique Huawei (Kunpeng BoostKit HPC, Kunpeng 920), la documentation OpenMPI, OpenBLAS et Slurm.",
+  "objectives": [
+    "Décrire l'architecture d'un cluster HPC Kunpeng et le rôle de chaque type de nœud",
+    "Justifier le choix de RoCE v2 et d'une topologie réseau sans perte pour les collectives MPI",
+    "Écrire et lancer un programme MPI, puis expliquer le coût des opérations collectives",
+    "Dimensionner un modèle hybride MPI + OpenMP en respectant la topologie NUMA",
+    "Choisir les bibliothèques mathématiques disponibles sur ARM64 et éviter les dépendances x86",
+    "Soumettre des jobs Slurm et interpréter un benchmark HPL, STREAM ou IMB"
+  ],
+  "sections": [
+    {
+      "heading": "Anatomie d'un cluster HPC Kunpeng",
+      "body": "Un cluster HPC n'est pas une collection de serveurs puissants : c'est un système où chaque étage doit alimenter les autres sans devenir le goulot d'étranglement. Les nœuds de calcul hébergent les processus qui font le travail ; les nœuds de login servent à compiler, soumettre les jobs et consulter les résultats ; les nœuds de gestion portent le scheduler, l'annuaire, la supervision et le provisionnement. Le stockage parallèle est exposé à tous les nœuds de calcul, et un réseau dédié relie les nœuds entre eux.\n\nLe Kunpeng 920 associe jusqu'à 64 cœurs ARMv8 par socket, plusieurs contrôleurs mémoire et une hiérarchie de caches profonde. Cette densité est un atout pour le calcul, mais elle accentue l'effet NUMA : un cœur accède plus vite à la mémoire de son socket qu'à celle du socket voisin. Un job mal placé peut perdre une part importante de sa bande passante mémoire sans qu'aucun compteur CPU ne signale de saturation.\n\nLa conception part donc des besoins de l'application. Un code dominé par le calcul et les échanges de messages privilégiera la latence réseau et la fréquence ; un code dominé par la mémoire privilégiera la bande passante et l'affinité NUMA ; un code dominé par les entrées-sorties exigera un stockage parallèle correctement dimensionné. Le dimensionnement se fait par profil, pas par symétrie.",
+      "bullets": [
+        "Nœuds de login, de calcul, de gestion et stockage parallèle ont des rôles distincts",
+        "Le Kunpeng 920 offre une forte densité de cœurs et une topologie NUMA marquée",
+        "Un job mal placé perd de la bande passante sans saturer le CPU",
+        "Le dimensionnement découle du profil : calcul, mémoire ou I/O"
+      ],
+      "code": [
+        "lscpu | grep -E 'Socket|Core|NUMA|Model name'",
+        "numactl --hardware",
+        "sinfo -N -l"
+      ],
+      "diagram": "                 +-------------------+\n                 |  Nœuds de login   |\n                 +---------+---------+\n                           |\n        +------------------+------------------+\n        |        Réseau HPC (RoCE v2)         |\n        +----+-------------+-------------+----+\n             |             |             |\n        +----+----+   +----+----+   +----+----+\n        | Compute |   | Compute |   | Compute |  ... x N\n        | 64 cœurs|   | 64 cœurs|   | 64 cœurs|\n        +----+----+   +----+----+   +----+----+\n             |             |             |\n        +----+-------------+-------------+----+\n        |     Stockage parallèle (Lustre)     |\n        +-------------------------------------+",
+      "tip": "Le nœud de login ne doit jamais exécuter les calculs : il est partagé par tous les utilisateurs et n'a ni l'affinité ni la bande passante d'un nœud de calcul. En examen, un job lancé sur le login est un anti-pattern classique.",
+      "exercises": []
+    },
+    {
+      "heading": "Réseau d'interconnexion : RoCE v2 et topologies",
+      "body": "Dans un cluster, le réseau n'est pas un simple tuyau : c'est un composant de calcul. Une collective MPI comme Allreduce sur des milliers de rangs se traduit par des échanges nombreux et synchronisés ; si chaque message coûte quelques dizaines de microsecondes de latence CPU, le temps de calcul est masqué par la communication. RoCE v2 transporte RDMA sur Ethernet en encapsulant les paquets dans UDP/IP, ce qui permet d'utiliser une infrastructure Ethernet standard tout en supprimant les copies mémoire et une partie du coût CPU.\n\nLe prix de cette performance est l'exigence de réseau sans perte. RoCE v2 s'appuie sur le Priority Flow Control pour éviter les drops sur les files critiques, sur l'ECN pour signaler la congestion et sur une classification DSCP cohérente de bout en bout. Un seul lien mal configuré, un MTU différent ou une file non priorisée peut provoquer des retransmissions et faire chuter le débit de toutes les collectives.\n\nLa topologie doit suivre le trafic. Un fat-tree offre un chemin uniforme entre nœuds et simplifie le dimensionnement ; un leaf-spine réduit la latence et s'étend par paliers ; un dragonfly réduit le nombre de sauts pour les très grands systèmes. Le choix dépend du nombre de nœuds, du budget et du profil des collectives, notamment Allreduce et Alltoall.",
+      "bullets": [
+        "RoCE v2 encapsule RDMA dans UDP/IP sur Ethernet",
+        "PFC, ECN et DSCP forment le triptyque d'un réseau sans perte",
+        "Un MTU hétérogène suffit à dégrader toutes les collectives",
+        "La topologie doit être choisie selon le profil de trafic MPI"
+      ],
+      "code": [
+        "ip link set dev eth0 mtu 9000",
+        "cma_roce_mode -d mlx5_0 -p 1 -m 2   # RoCE v2",
+        "rping -c -a 10.0.0.5 -v",
+        "ib_write_bw -d mlx5_0 --report_gbits"
+      ],
+      "table": {
+        "headers": [
+          "Technologie",
+          "Latence",
+          "Points forts",
+          "Points de vigilance"
+        ],
+        "rows": [
+          [
+            "RoCE v2",
+            "Quelques µs",
+            "Ethernet standard, coût CPU faible",
+            "Configuration sans perte obligatoire"
+          ],
+          [
+            "InfiniBand",
+            "Quelques µs",
+            "Écosystème HPC mature",
+            "Coût et compétences spécifiques"
+          ],
+          [
+            "TCP classique",
+            "Dizaines de µs",
+            "Universel",
+            "Copies mémoire et charge CPU"
+          ]
+        ]
+      },
+      "tip": "Le jumbo frame ne se résume pas à « MTU 9000 partout » : il faut la même valeur sur tous les liens, y compris les trunks et les interfaces de stockage. Un MTU incohérent provoque des fragmentations silencieuses et des retransmissions.",
+      "exercises": [
+        {
+          "prompt": "Après l'ajout de nouveaux nœuds, les jobs MPI perdent 30 % de débit sur Allreduce alors que le CPU et le stockage sont normaux. Quels contrôles réseau menez-vous et dans quel ordre ?",
+          "correction": "On commence par vérifier la cohérence de la configuration : MTU identique sur tous les liens (ip link), mode RoCE v2 (cma_roce_mode), VLAN et sous-réseau corrects. On mesure ensuite la latence et le débit point à point avec rping et ib_write_bw entre un nœud ancien et un nœud neuf, puis entre deux nœuds neufs, pour isoler le lien fautif. On contrôle la configuration PFC et ECN sur les switchs ainsi que le marquage DSCP : une file non priorisée suffit à provoquer des drops. Enfin, on compare la topologie logique du nouveau nœud (nombre de sauts, uplink) à celle des anciens. La démarche isole d'abord le lien, puis la configuration sans perte, puis le placement topologique, avant de soupçonner l'application."
+        }
+      ]
+    },
+    {
+      "heading": "Stockage parallèle et gestion des I/O",
+      "body": "Les applications HPC lisent et écrivent des volumes qui dépassent largement les capacités d'un serveur isolé : maillages de simulation, checkpoints de dynamique moléculaire, résultats de rendu. Un stockage parallèle répartit les fichiers sur plusieurs serveurs de stockage et plusieurs disques, de sorte que la bande passante agrégée augmente avec le nombre de nœuds. Lustre organise ce modèle autour de serveurs de métadonnées et de serveurs d'objets ; GPFS, désormais Spectrum Scale, propose une approche comparable avec réplication et quotas.\n\nLe point critique est le motif d'accès. Un grand fichier lu séquentiellement par un seul processus ne profite pas du parallélisme : il faut répartir les lectures entre les rangs MPI. À l'inverse, des milliers de petits fichiers ouverts simultanément saturent les serveurs de métadonnées, même si la capacité de stockage est largement suffisante. D'où l'importance de regrouper les petits fichiers, d'utiliser des formats adaptés comme HDF5 ou NetCDF avec des accès collectifs, et de soigner le striping.\n\nLes checkpoints illustrent le compromis. Écrire toutes les cinq minutes un état complet garantit une reprise rapide mais coûte cher ; écrire trop rarement expose à recalculer des heures de travail. La bonne pratique combine une fréquence adaptée au coût de reprise, une écriture parallèle et une vérification de l'intégrité, car un checkpoint corrompu ne se découvre qu'au moment où on en a besoin.",
+      "bullets": [
+        "Le stockage parallèle agrège la bande passante de plusieurs serveurs",
+        "Les petits fichiers saturent les métadonnées, pas la capacité",
+        "Répartir les lectures entre rangs MPI et utiliser les accès collectifs HDF5",
+        "Un checkpoint doit être fréquent, parallèle et vérifié"
+      ],
+      "code": [
+        "lfs setstripe -c 8 /scratch/job_dir   # Lustre : 8 OST",
+        "lfs getstripe /scratch/job_dir",
+        "mpirun -np 64 ./io_bench --collective",
+        "df -h /scratch && lfs df -h"
+      ],
+      "tip": "Ne confondez pas capacité et débit : un stockage peut être rempli à 40 % et incapable d'absorber le checkpoint de 64 rangs. En examen, la question porte souvent sur le motif d'accès, pas sur le nombre de téraoctets.",
+      "exercises": []
+    },
+    {
+      "heading": "Programmation MPI : rangs et collectives",
+      "body": "MPI est une bibliothèque de communication, pas un langage : chaque processus du job s'exécute indépendamment et ne partage pas sa mémoire avec les autres. Le rang identifie le processus dans un communicateur, et c'est ce numéro qui permet de distribuer les données. Un programme typique initialise MPI, lit son rang, calcule une portion du domaine, échange les frontières avec ses voisins, puis finalise. Le modèle suppose que chaque rang exécute le même binaire avec des données différentes, ce qui simplifie l'écriture mais impose une réflexion explicite sur la répartition.\n\nLes opérations point à point, Send et Recv, transmettent un message d'un rang à un autre. Les collectives impliquent l'ensemble du communicateur. Bcast diffuse une valeur depuis un rang racine ; Scatter distribue des blocs ; Gather les rassemble ; Reduce combine les valeurs vers un rang ; Allreduce combine et renvoie le résultat à tous. Alltoall échange un bloc avec chaque rang et devient vite coûteuse lorsque le nombre de rangs augmente.\n\nLa performance dépend du nombre et de la taille des messages. Beaucoup de petits messages coûtent surtout de la latence ; quelques gros messages coûtent surtout de la bande passante. Les versions non bloquantes Isend et Irecv permettent de recouvrir communication et calcul, à condition de ne pas saturer les files d'envoi. Un Allreduce global après chaque itération est souvent le signe d'un algorithme à repenser.",
+      "bullets": [
+        "MPI = mémoire distribuée : chaque rang a son propre espace d'adressage",
+        "Bcast, Scatter, Gather, Reduce et Allreduce couvrent la majorité des besoins",
+        "Petits messages = latence ; gros messages = bande passante",
+        "Isend/Irecv permettent de recouvrir communication et calcul"
+      ],
+      "code": [
+        "mpicc -O3 -march=armv8-a mpi_app.c -o mpi_app",
+        "mpirun -np 64 --bind-to core ./mpi_app",
+        "mpirun -np 8 --map-by ppr:2:socket --bind-to core ./mpi_app",
+        "mpiexec -n 64 ./imb-MPI1 Allreduce"
+      ],
+      "diagram": "Rang 0 ---- Bcast ----> Rangs 1..N\nRang 0 -- Scatter ----> blocs vers 1..N\nRangs 1..N -- Gather --> Rang 0\nRangs 1..N -- Reduce --> Rang 0 (somme)\nRangs 1..N -- Allreduce -> résultat sur TOUS les rangs",
+      "tip": "Un Allreduce est une opération globale : sa latence croît avec le nombre de rangs et la taille du message. En QCM, ne le confondez pas avec Reduce, qui ne renvoie le résultat qu'au rang racine.",
+      "exercises": []
+    },
+    {
+      "heading": "Modèle hybride MPI + OpenMP et affinité NUMA",
+      "body": "Le modèle hybride combine deux niveaux de parallélisme : MPI entre les nœuds, OpenMP entre les cœurs d'un même nœud. Cette organisation réduit le nombre de rangs MPI, donc le nombre de messages échangés, tout en conservant le parallélisme mémoire partagée à l'intérieur de chaque nœud. Sur un Kunpeng à deux sockets de 64 cœurs, on peut lancer par exemple quatre rangs MPI par nœud, chacun avec 32 threads OpenMP, ou deux rangs avec 64 threads, selon la taille des messages et la bande passante mémoire.\n\nLe piège est la sursouscription. Si chaque rang lance autant de threads OpenMP que de cœurs alors que plusieurs rangs partagent le nœud, les threads se disputent les mêmes cœurs : les changements de contexte explosent et la performance s'effondre. Il faut donc que le produit du nombre de rangs par le nombre de threads par rang reste inférieur ou égal au nombre de cœurs alloués, et que le placement soit cohérent avec la topologie NUMA.\n\nLes variables d'environnement complètent le placement : OMP_NUM_THREADS fixe le nombre de threads, OMP_PROC_BIND indique comment les lier aux cœurs, et OMP_PLACES décrit les emplacements disponibles. Côté MPI, --map-by ppr:4:node:PE=32 demande quatre rangs par nœud avec 32 éléments de traitement chacun, et --bind-to core assure l'épinglage. On vérifie ensuite avec numastat que les accès mémoire restent locaux au socket.",
+      "bullets": [
+        "MPI entre nœuds, OpenMP entre cœurs : moins de messages, plus de parallélisme local",
+        "Le produit rangs × threads ne doit pas dépasser les cœurs alloués",
+        "OMP_NUM_THREADS, OMP_PROC_BIND et OMP_PLACES contrôlent le placement",
+        "numastat révèle les accès mémoire distants"
+      ],
+      "code": [
+        "export OMP_NUM_THREADS=32 OMP_PROC_BIND=close OMP_PLACES=cores",
+        "mpirun -np 8 --map-by ppr:4:node:PE=32 --bind-to core ./hybrid_app",
+        "numactl --cpunodebind=0 --membind=0 ./local_test",
+        "numastat -p $(pgrep -f hybrid_app | head -1)"
+      ],
+      "tip": "Deux rangs MPI de 64 threads sur un nœud de 128 cœurs ne sont pas équivalents à quatre rangs de 32 threads : la bande passante mémoire et la taille des messages décident. En examen, retenez surtout que la sursouscription est toujours une faute.",
+      "exercises": [
+        {
+          "prompt": "Un nœud possède 2 sockets de 64 cœurs. L'application hybride est lancée avec 8 rangs MPI et OMP_NUM_THREADS=32, soit 256 threads pour 128 cœurs. La performance chute et le temps système augmente. Expliquez et proposez un lancement corrigé.",
+          "correction": "Le job est en sursouscription : 8 × 32 = 256 threads se disputent 128 cœurs, ce qui provoque des changements de contexte, des migrations entre sockets et une chute de la bande passante mémoire utile. On corrige d'abord le produit rangs × threads : par exemple 4 rangs par nœud avec 32 threads, ou 2 rangs avec 64 threads, selon le profil de communication. On lance avec mpirun --map-by ppr:4:node:PE=32 --bind-to core et OMP_PROC_BIND=close, OMP_PLACES=cores, pour que chaque rang reste sur son socket. On vérifie ensuite numastat : si les accès mémoire distants restent élevés, on ajuste le mapping ou on utilise numactl pour forcer la localité. Enfin, on mesure le temps de calcul et le temps de communication séparément pour confirmer que le gain vient bien du placement."
+        }
+      ]
+    },
+    {
+      "heading": "Bibliothèques mathématiques ARM64",
+      "body": "Les applications scientifiques passent l'essentiel de leur temps dans des noyaux de calcul : multiplication de matrices, transformées de Fourier, décomposition LU, solveurs creux. Ces noyaux sont regroupés derrière des interfaces standard, BLAS pour l'algèbre linéaire dense et LAPACK pour les solveurs, ce qui rend les implémentations interchangeables. Sur ARM64, OpenBLAS fournit des kernels optimisés pour NEON et les processeurs ARMv8 ; BLIS propose une approche modulaire ; FFTW couvre les transformées de Fourier ; ScaLAPACK ajoute le parallélisme distribué au-dessus de BLAS.\n\nLe piège vient des dépendances précompilées. Une wheel Python, un binaire scientifique ou une bibliothèque .so compilée pour x86 peut embarquer MKL ou des instructions AVX, inexistantes sur ARM64. Le portage se fait alors par recompilation depuis les sources ou par installation d'un paquet ARM64 officiel. Un simple ldd sur les bibliothèques chargées révèle parfois une dépendance inattendue, et un test de cohérence numérique reste indispensable après changement de bibliothèque.\n\nLa performance ne se déduit pas du nom : elle dépend de la taille des matrices, du type de données et du nombre de threads. Un GEMM sur une matrice qui tient dans le cache L2 n'a pas le même profil qu'un GEMM sur une matrice de plusieurs gigaoctets. Il faut mesurer avec le même jeu de données que l'application et vérifier que le nombre de threads OpenBLAS ne provoque pas de sursouscription avec MPI.",
+      "bullets": [
+        "BLAS et LAPACK sont des interfaces : OpenBLAS et BLIS en sont les implémentations ARM64",
+        "FFTW couvre les transformées de Fourier, ScaLAPACK le distribué",
+        "MKL est une implémentation x86 : elle ne fonctionne pas sur ARM64",
+        "Contrôler les dépendances avec ldd et mesurer sur les tailles réelles"
+      ],
+      "code": [
+        "gcc -O3 -march=armv8-a app.c -lopenblas -o app",
+        "export OPENBLAS_NUM_THREADS=32",
+        "ldd ./app | grep -E 'blas|mkl|fftw'",
+        "cmake -DBLA_VENDOR=OpenBLAS .."
+      ],
+      "table": {
+        "headers": [
+          "Bibliothèque",
+          "Rôle",
+          "Disponibilité ARM64"
+        ],
+        "rows": [
+          [
+            "OpenBLAS",
+            "BLAS dense, kernels NEON",
+            "Oui, paquets natifs"
+          ],
+          [
+            "BLIS",
+            "BLAS modulaire",
+            "Oui"
+          ],
+          [
+            "FFTW",
+            "Transformées de Fourier",
+            "Oui"
+          ],
+          [
+            "ScaLAPACK",
+            "LAPACK distribué MPI",
+            "Oui"
+          ],
+          [
+            "MKL",
+            "BLAS/LAPACK Intel",
+            "Non, x86 uniquement"
+          ]
+        ]
+      },
+      "tip": "Une bibliothèque qui « compile » n'est pas forcément performante : un build générique sans kernels ARMv8 peut être plusieurs fois plus lent qu'OpenBLAS natif. Vérifiez la présence des optimisations dans le paquet, pas seulement l'absence d'erreur de compilation.",
+      "exercises": []
+    },
+    {
+      "heading": "Slurm : soumettre, réserver, ordonnancer",
+      "body": "Slurm est le chef d'orchestre du cluster. Il connaît les nœuds, leurs ressources et leur état, reçoit les demandes des utilisateurs, place les jobs dès que les ressources sont disponibles et rend compte de leur consommation. Cette séparation entre soumission et exécution explique pourquoi un job peut attendre longtemps : il ne demande pas seulement des cœurs, il demande une combinaison de nœuds, de mémoire, de temps et éventuellement d'accélérateurs.\n\nLes commandes forment un vocabulaire cohérent. sbatch soumet un script et rend un identifiant ; squeue affiche la file d'attente ; sinfo décrit les partitions et l'état des nœuds ; srun exécute une commande ou un pas de job sur les nœuds alloués ; salloc ouvre une allocation interactive ; scancel annule ; sacct restitue l'historique et la comptabilité. Les directives #SBATCH, placées en tête du script, décrivent les ressources : partition, nombre de nœuds, tâches par nœud, cœurs par tâche, mémoire, temps maximal et accélérateurs via --gres.\n\nLe temps maximal n'est pas un détail administratif : il conditionne la planification. Un job qui demande 72 heures alors qu'il en utilise 3 bloque les ressources et attend plus longtemps. De même, réserver plus de cœurs que nécessaire réduit le débit global du cluster. La discipline de déclaration est donc aussi importante que la performance du code.",
+      "bullets": [
+        "sbatch soumet, srun exécute, salloc réserve, scancel annule",
+        "squeue et sinfo observent la file et l'état des nœuds",
+        "--gres réserve les accélérateurs GPU ou NPU",
+        "Déclarer un temps et des ressources réalistes améliore la planification"
+      ],
+      "code": [
+        "sbatch -p compute -N 2 --ntasks-per-node=64 --time=02:00:00 job.sh",
+        "srun --jobid=12345 --overlap ./step2",
+        "squeue -u $USER -o '%.10i %.9P %.20j %.8T %.10M'",
+        "scancel 12345"
+      ],
+      "diagram": "sbatch job.sh\n      |\n      v\n+-------------+     ressources libres ?     +-------------+\n|  File Slurm | --------------------------> |  Nœuds      |\n|  (pending)  | <-------------------------- |  (running)  |\n+-------------+        allocation           +-------------+\n      |                                           |\n      +--> squeue (état)                          +--> srun (pas de job)\n      +--> sacct (historique)                     +--> logs du job",
+      "tip": "Un script sbatch sans #SBATCH --time peut se voir appliquer la limite par défaut de la partition, parfois très courte. Déclarez toujours le temps, la mémoire et le nombre de tâches : c'est ce que le scheduler utilise pour placer le job.",
+      "exercises": [
+        {
+          "prompt": "Écrivez l'en-tête d'un script Slurm demandant 2 nœuds, 64 tâches par nœud, 1 cœur par tâche, 2 heures, 128 Go de mémoire par nœud et 1 NPU, puis la commande de lancement MPI correspondante.",
+          "correction": "L'en-tête doit contenir : #!/bin/bash, #SBATCH --job-name=hybride, #SBATCH --partition=compute, #SBATCH --nodes=2, #SBATCH --ntasks-per-node=64, #SBATCH --cpus-per-task=1, #SBATCH --mem=128G, #SBATCH --time=02:00:00, #SBATCH --gres=npu:1, puis les modules et la commande. Le lancement utilise srun pour créer le pas de job : srun --mpi=pmix ./app, ou mpirun -np 128 --bind-to core ./app si l'application est lancée directement. Il faut vérifier que le nombre total de tâches (2 × 64 = 128) correspond à -np, et que --cpus-per-task reste cohérent avec OMP_NUM_THREADS=1. Enfin, on contrôle l'allocation avec squeue puis sacct pour vérifier la mémoire et le temps réellement consommés."
+        }
+      ]
+    },
+    {
+      "heading": "Benchmarker et diagnostiquer la performance",
+      "body": "Un benchmark HPC répond à une question précise. HPL mesure la résolution d'un système linéaire dense et sert de référence pour le classement TOP500 ; il surestime la performance des applications réelles dominées par les accès mémoire. HPCG comble en partie ce vide avec un solveur creux et des motifs d'accès irréguliers. STREAM mesure la bande passante mémoire. Les suites IMB ou OSU mesurent la latence et la bande passante des collectives et point à point. Enfin, les applications réelles restent le juge final.\n\nL'interprétation exige de distinguer plusieurs échelles. Le strong scaling fixe la taille du problème et augmente le nombre de rangs : le speedup plafonne lorsque la communication et les parties séquentielles dominent, ce que la loi d'Amdahl décrit. Le weak scaling augmente la taille du problème avec le nombre de rangs : l'efficacité se maintient si le travail par rang reste constant. Confondre les deux conduit à des conclusions opposées sur la qualité d'un code.\n\nLe diagnostic suit la chaîne des ressources. On vérifie d'abord le placement avec lscpu et numastat, puis la mémoire avec STREAM et les compteurs, ensuite le réseau avec ib_write_bw et les statistiques RDMA, enfin les I/O avec le temps passé en lecture de checkpoints. Un profil CPU élevé en mode système pointe souvent vers les changements de contexte ou les copies mémoire, pas vers un manque de puissance de calcul.",
+      "bullets": [
+        "HPL mesure le dense, HPCG le creux, STREAM la bande passante mémoire",
+        "IMB/OSU caractérisent la latence et le débit des collectives",
+        "Strong scaling = problème fixe ; weak scaling = charge par rang constante",
+        "Diagnostiquer dans l'ordre : placement, mémoire, réseau, I/O"
+      ],
+      "code": [
+        "mpirun -np 64 ./xhpl",
+        "mpirun -np 64 ./stream_mpi",
+        "mpirun -np 64 ./imb-MPI1 Allreduce",
+        "perf stat -e cache-misses,context-switches -p PID sleep 10"
+      ],
+      "table": {
+        "headers": [
+          "Outil",
+          "Ce qu'il mesure",
+          "Limite d'interprétation"
+        ],
+        "rows": [
+          [
+            "HPL",
+            "GFlops sur système dense",
+            "Peu représentatif des accès irréguliers"
+          ],
+          [
+            "HPCG",
+            "Solveur creux",
+            "Plus proche des codes réels, moins spectaculaire"
+          ],
+          [
+            "STREAM",
+            "Bande passante mémoire",
+            "Ne dit rien du calcul"
+          ],
+          [
+            "IMB / OSU",
+            "Latence et débit réseau",
+            "À corréler avec la topologie"
+          ],
+          [
+            "Application réelle",
+            "Performance métier",
+            "Référence ultime"
+          ]
+        ]
+      },
+      "tip": "Une efficacité de 100 % n'existe pas : les benchmarks publiés utilisent des configurations optimisées et des tailles de problème choisies. Comparez toujours à configuration égale, et méfiez-vous des chiffres annoncés sans taille de matrice ni nombre de rangs.",
+      "exercises": []
+    }
+  ],
+  "key_points": [
+    "Un cluster HPC sépare login, calcul, gestion et stockage, reliés par un réseau dédié.",
+    "RoCE v2 offre RDMA sur Ethernet mais exige PFC, ECN et un MTU homogène.",
+    "MPI repose sur la mémoire distribuée : rang, communicateur, point à point et collectives.",
+    "Allreduce renvoie le résultat à tous les rangs, Reduce seulement au rang racine.",
+    "Le modèle hybride MPI + OpenMP réduit les messages mais interdit la sursouscription des cœurs.",
+    "OpenBLAS, BLIS, FFTW et ScaLAPACK couvrent le calcul scientifique ARM64 ; MKL est x86.",
+    "Slurm place les jobs selon les ressources déclarées : nœuds, tâches, mémoire, temps, GRES.",
+    "HPL, HPCG, STREAM et IMB mesurent des choses différentes ; l'application réelle tranche."
+  ],
+  "traps": [
+    "Surnumérer les threads OpenMP au-delà des cœurs alloués : la performance chute au lieu de progresser.",
+    "Laisser une wheel ou une bibliothèque x86 (MKL, AVX) dans le build ARM : le portage échoue ou tourne en émulation.",
+    "Configurer RoCE v2 sans réseau sans perte : les retransmissions invisibles détruisent le débit des collectives.",
+    "Confondre Reduce et Allreduce : seul Allreduce diffuse le résultat à tous les rangs.",
+    "Comparer un strong scaling et un weak scaling comme s'ils mesuraient la même chose."
+  ],
+  "quiz": [
+    {
+      "id": "hcie-kp-02-q01",
+      "type": "single",
+      "prompt": "What does RoCE v2 provide on a Kunpeng HPC cluster?",
+      "options": [
+        "RDMA over Ethernet encapsulated in UDP/IP",
+        "A layer-2 VLAN trunking protocol",
+        "A distributed file system",
+        "A job scheduling algorithm"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "RoCE v2 transporte des opérations RDMA dans des paquets UDP/IP sur Ethernet, ce qui réduit les copies mémoire et la charge CPU. Ce n'est ni un protocole de trunking VLAN, ni un système de fichiers, ni un algorithme d'ordonnancement : ces rôles appartiennent respectivement à Ethernet, à Lustre ou GPFS et à Slurm.",
+      "topic": "Réseau HPC"
+    },
+    {
+      "id": "hcie-kp-02-q02",
+      "type": "single",
+      "prompt": "Which MPI collective combines values from all ranks and delivers the result to every rank?",
+      "options": [
+        "MPI_Reduce",
+        "MPI_Allreduce",
+        "MPI_Scatter",
+        "MPI_Barrier"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "MPI_Allreduce applique une opération de réduction, comme la somme ou le maximum, puis diffuse le résultat à tous les rangs. MPI_Reduce ne renvoie le résultat qu'au rang racine, MPI_Scatter distribue des blocs de données et MPI_Barrier ne fait que synchroniser les rangs sans combiner de valeurs.",
+      "topic": "MPI"
+    },
+    {
+      "id": "hcie-kp-02-q03",
+      "type": "single",
+      "prompt": "Which Slurm command executes a job step on the nodes already allocated to a job?",
+      "options": [
+        "scancel",
+        "sbatch",
+        "srun",
+        "sinfo"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "srun lance une commande ou un pas de job sur les nœuds alloués, que l'allocation vienne de sbatch, salloc ou d'une soumission interactive. sbatch soumet un script, sinfo affiche l'état des partitions et scancel annule un job.",
+      "topic": "Slurm"
+    },
+    {
+      "id": "hcie-kp-02-q04",
+      "type": "single",
+      "prompt": "Which command submits the batch script job.sh to the Slurm queue?",
+      "options": [
+        "salloc job.sh",
+        "squeue job.sh",
+        "srun job.sh",
+        "sbatch job.sh"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "sbatch dépose le script dans la file et retourne un identifiant de job ; le script s'exécute lorsque les ressources demandées sont disponibles. srun exécute immédiatement sur une allocation, salloc ouvre une allocation interactive et squeue ne fait qu'afficher la file.",
+      "topic": "Slurm"
+    },
+    {
+      "id": "hcie-kp-02-q05",
+      "type": "single",
+      "prompt": "Which environment variable limits the number of threads used by OpenBLAS?",
+      "options": [
+        "OPENBLAS_NUM_THREADS",
+        "MPI_THREADS",
+        "BLAS_CORES",
+        "OMP_NUM_THREADS only"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "OpenBLAS lit OPENBLAS_NUM_THREADS pour fixer son propre parallélisme, ce qui permet de le limiter indépendamment d'OpenMP. OMP_NUM_THREADS agit sur les boucles OpenMP mais n'est pas la variable dédiée à OpenBLAS, tandis que MPI_THREADS et BLAS_CORES n'existent pas dans ce contexte.",
+      "topic": "Bibliothèques mathématiques"
+    },
+    {
+      "id": "hcie-kp-02-q06",
+      "type": "single",
+      "prompt": "Which mathematical library is NOT available for native ARM64 execution?",
+      "options": [
+        "BLIS",
+        "Intel MKL",
+        "FFTW",
+        "OpenBLAS"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Intel MKL est optimisé pour les processeurs x86 et n'existe pas en version ARM64 native. OpenBLAS, BLIS et FFTW disposent de builds ARM64 et exploitent NEON ; une dépendance MKL dans un projet porté sur Kunpeng doit être remplacée.",
+      "topic": "Bibliothèques mathématiques"
+    },
+    {
+      "id": "hcie-kp-02-q07",
+      "type": "single",
+      "prompt": "Which benchmark specifically measures sustainable memory bandwidth?",
+      "options": [
+        "HPCG",
+        "HPL",
+        "STREAM",
+        "IMB"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "STREAM exécute des noyaux simples de copie et de calcul sur de grands tableaux pour mesurer la bande passante mémoire. HPL mesure le calcul dense, IMB la communication MPI et HPCG la résolution d'un système creux : aucun ne cible directement la bande passante mémoire.",
+      "topic": "Benchmarks"
+    },
+    {
+      "id": "hcie-kp-02-q08",
+      "type": "single",
+      "prompt": "What does the HPL benchmark primarily measure?",
+      "options": [
+        "Parallel file system throughput",
+        "Job scheduling efficiency",
+        "Memory latency of the interconnect",
+        "Floating-point throughput on a dense linear system"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "HPL résout un système linéaire dense et rapporte des GFlops, ce qui en fait une mesure du débit de calcul flottant. Il ne mesure ni la latence réseau, ni le débit du stockage, ni l'efficacité du scheduler, même s'il dépend indirectement de tous ces éléments.",
+      "topic": "Benchmarks"
+    },
+    {
+      "id": "hcie-kp-02-q09",
+      "type": "single",
+      "prompt": "What does the Slurm directive --gres=npu:1 request?",
+      "options": [
+        "One generic resource of type NPU",
+        "One extra node per task",
+        "One gigabyte of memory",
+        "One MPI rank"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "GRES signifie Generic RESource : --gres=npu:1 demande un accélérateur NPU pour le job. Ce n'est pas un nœud supplémentaire, ni une quantité de mémoire, ni un rang MPI, qui se demandent respectivement avec --nodes, --mem et --ntasks.",
+      "topic": "Slurm"
+    },
+    {
+      "id": "hcie-kp-02-q10",
+      "type": "single",
+      "prompt": "Why is an MTU of 9000 commonly configured on HPC data networks?",
+      "options": [
+        "It encrypts RDMA traffic",
+        "It reduces packet count and per-packet overhead for large messages",
+        "It increases the number of available VLANs",
+        "It replaces the need for PFC"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Des trames plus grandes réduisent le nombre de paquets et le coût par paquet pour les transferts massifs, ce qui améliore le débit utile. Le MTU n'apporte aucune encryption, n'augmente pas le nombre de VLAN et ne remplace pas Priority Flow Control, indispensable à RoCE v2.",
+      "topic": "Réseau HPC"
+    },
+    {
+      "id": "hcie-kp-02-q11",
+      "type": "multi",
+      "prompt": "Which components are essential in a production HPC cluster? (Choose three.)",
+      "options": [
+        "A parallel file system such as Lustre",
+        "A job scheduler such as Slurm",
+        "A single monolithic server with no network",
+        "A web dashboard replacing the scheduler",
+        "A low-latency interconnect such as RoCE v2"
+      ],
+      "answer": [
+        0,
+        1,
+        4
+      ],
+      "explanation_fr": "Un cluster HPC repose sur un réseau basse latence, un stockage parallèle et un ordonnanceur qui place les jobs. Un serveur unique ne constitue pas un cluster, et un tableau de bord web est une interface de visualisation, pas un remplacement du scheduler.",
+      "topic": "Architecture HPC"
+    },
+    {
+      "id": "hcie-kp-02-q12",
+      "type": "multi",
+      "prompt": "Which libraries are valid choices for numerical computing on ARM64? (Choose three.)",
+      "options": [
+        "FFTW",
+        "Intel MKL",
+        "OpenBLAS",
+        "BLIS"
+      ],
+      "answer": [
+        0,
+        2,
+        3
+      ],
+      "explanation_fr": "OpenBLAS, BLIS et FFTW proposent des builds ARM64 exploitant NEON. Intel MKL est une bibliothèque x86 : elle ne peut pas s'exécuter nativement sur Kunpeng et doit être remplacée lors d'un portage.",
+      "topic": "Bibliothèques mathématiques"
+    },
+    {
+      "id": "hcie-kp-02-q13",
+      "type": "multi",
+      "prompt": "Which practices improve NUMA locality for an MPI job? (Choose three.)",
+      "options": [
+        "Bind each rank to cores with --bind-to core",
+        "Check remote memory accesses with numastat",
+        "Use numactl with --cpunodebind and --membind when appropriate",
+        "Launch more ranks than available cores",
+        "Disable all CPU affinity to let the scheduler decide"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "L'épinglage des rangs, la vérification des accès distants avec numastat et l'usage de numactl pour lier CPU et mémoire améliorent la localité. Lancer plus de rangs que de cœurs provoque de la sursouscription, et désactiver l'affinité laisse le système migrer les tâches entre sockets, ce qui dégrade la bande passante.",
+      "topic": "Affinité NUMA"
+    },
+    {
+      "id": "hcie-kp-02-q14",
+      "type": "multi",
+      "prompt": "Which commands report the state or history of Slurm jobs? (Choose three.)",
+      "options": [
+        "sbatch",
+        "squeue",
+        "sinfo",
+        "sacct"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "squeue liste les jobs en attente ou en cours, sinfo décrit l'état des partitions et des nœuds, et sacct restitue l'historique et la comptabilité. sbatch ne consulte rien : il soumet un nouveau script à la file.",
+      "topic": "Slurm"
+    },
+    {
+      "id": "hcie-kp-02-q15",
+      "type": "tf",
+      "prompt": "Running more OpenMP threads than physical cores usually increases application performance.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Au-delà du nombre de cœurs disponibles, les threads se disputent les unités d'exécution : les changements de contexte et les migrations augmentent, et la performance diminue. Un thread par cœur est la référence, avec un ajustement éventuel selon la bande passante mémoire.",
+      "topic": "Modèle hybride"
+    },
+    {
+      "id": "hcie-kp-02-q16",
+      "type": "tf",
+      "prompt": "RoCE v2 requires a lossless network configuration, typically using PFC and ECN.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "RoCE v2 suppose que les paquets critiques ne sont pas jetés en cas de congestion : Priority Flow Control suspend les émetteurs et ECN signale la congestion plus tôt. Sans cette configuration, les retransmissions invisibles dégradent fortement le débit des collectives MPI.",
+      "topic": "Réseau HPC"
+    },
+    {
+      "id": "hcie-kp-02-q17",
+      "type": "tf",
+      "prompt": "After MPI_Allreduce, every rank holds the combined result.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Allreduce combine les valeurs de tous les rangs, puis diffuse le résultat à l'ensemble du communicateur. C'est précisément la différence avec Reduce, qui laisse le résultat uniquement sur le rang racine et laisse les autres rangs sans valeur combinée.",
+      "topic": "MPI"
+    },
+    {
+      "id": "hcie-kp-02-q18",
+      "type": "text",
+      "prompt": "Which mpirun command starts 64 processes bound to cores? (Enter the full command.)",
+      "options": [],
+      "answer": [],
+      "accept": [
+        "mpirun -np 64 --bind-to core ./hpc_app",
+        "mpirun -np 64 --bind-to core ./app",
+        "mpirun -np 64 --bind-to core ./mpi_app"
+      ],
+      "sample_answer": "mpirun -np 64 --bind-to core ./hpc_app",
+      "explanation_fr": "-np fixe le nombre de processus et --bind-to core épingle chaque rang à un cœur, ce qui évite les migrations et améliore la localité mémoire. La commande doit viser le binaire réellement compilé pour ARM64.",
+      "topic": "MPI"
+    },
+    {
+      "id": "hcie-kp-02-q19",
+      "type": "text",
+      "prompt": "Which environment variable sets the number of OpenMP threads? (Enter only the variable name.)",
+      "options": [],
+      "answer": [],
+      "accept": [
+        "OMP_NUM_THREADS",
+        "omp_num_threads"
+      ],
+      "sample_answer": "OMP_NUM_THREADS",
+      "explanation_fr": "OMP_NUM_THREADS contrôle le nombre de threads créés par les régions parallèles OpenMP. Dans un job hybride, il doit être cohérent avec le nombre de cœurs alloués par rang pour éviter la sursouscription.",
+      "topic": "Modèle hybride"
+    },
+    {
+      "id": "hcie-kp-02-q20",
+      "type": "text",
+      "prompt": "Which Lustre command sets a stripe count of 8 on a directory? (Enter the full command.)",
+      "options": [],
+      "answer": [],
+      "accept": [
+        "lfs setstripe -c 8 /scratch/job_dir",
+        "lfs setstripe -c 8 .",
+        "lfs setstripe -c 8 <dir>"
+      ],
+      "sample_answer": "lfs setstripe -c 8 /scratch/job_dir",
+      "explanation_fr": "lfs setstripe -c définit le nombre d'objets de stockage sur lesquels les nouveaux fichiers du répertoire seront répartis. Un striping plus large augmente la bande passante agrégée pour les gros fichiers, mais peut nuire aux petits fichiers et aux accès séquentiels par un seul processus.",
+      "topic": "Stockage parallèle"
+    }
+  ]
+}

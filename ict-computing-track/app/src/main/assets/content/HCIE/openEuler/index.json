@@ -1,0 +1,27 @@
+{
+  "phase": "HCIE",
+  "subject": "openEuler",
+  "name": "openEuler — expert : Ceph, Kubernetes et observabilité",
+  "tagline": "Stockage distribué, clusters K8s, ops expert",
+  "weight": 50,
+  "chapters": [
+    {
+      "id": "hcie-oe-01",
+      "file": "ch01.json",
+      "title": "Ceph : stockage distribué de niveau datacenter",
+      "minutes": 90
+    },
+    {
+      "id": "hcie-oe-02",
+      "file": "ch02.json",
+      "title": "Kubernetes avancé : clusters de production",
+      "minutes": 90
+    },
+    {
+      "id": "hcie-oe-03",
+      "file": "ch03.json",
+      "title": "Ops expert : observabilité et débogage système",
+      "minutes": 90
+    }
+  ]
+}

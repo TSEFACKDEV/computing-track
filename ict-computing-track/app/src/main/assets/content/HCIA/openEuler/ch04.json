@@ -1,0 +1,580 @@
+{
+  "id": "hcia-oe-04",
+  "phase": "HCIA",
+  "subject": "openEuler",
+  "number": 4,
+  "title_fr": "Stockage, LVM et réseau",
+  "title_en": "Storage, LVM, and Networking",
+  "minutes": 55,
+  "source": "HCIA-openEuler V2.0 Training Material — Sessions «Persistent Storage · Disk Partitioning · LVM · Network Management» · Lab Guide (stockage, réseau)",
+  "objectives": [
+    "Identifier disques, partitions et systèmes de fichiers avec les bons outils",
+    "Créer un système de fichiers et le monter de façon persistante via /etc/fstab",
+    "Construire et étendre une chaîne LVM PV, VG et LV",
+    "Configurer une adresse réseau avec nmcli et diagnostiquer une connectivité",
+    "Ouvrir un service dans firewalld en distinguant runtime et permanent",
+    "Diagnostiquer un refus SELinux et connaître ses trois modes"
+  ],
+  "sections": [
+    {
+      "heading": "1. Disques, partitions et tables MBR/GPT",
+      "body": "Un disque brut ne contient pas directement de fichiers : il est découpé en partitions, chacune recevant un système de fichiers. lsblk affiche cette arborescence, fdisk -l liste les tables de partitions et parted permet de créer ou redimensionner des partitions. Les noms suivent le type de disque : /dev/sda1 pour une partition d'un disque SCSI/SATA, /dev/nvme0n1p1 pour un disque NVMe, où p sépare le nom du disque du numéro.\n\nDeux formats de table se rencontrent. MBR, historique, plafonne à 2 To et à quatre partitions primaires ; il est associé au démarrage BIOS. GPT, moderne, gère des disques bien plus grands, jusqu'à 128 partitions par défaut, et s'impose en UEFI. Sur un serveur récent, GPT est le choix par défaut.\n\nAvant de partitionner, il faut identifier le disque, vérifier qu'il ne contient pas de données utiles et s'assurer qu'il n'est pas monté. Les commandes lsblk -f et findmnt donnent les montages en cours. Écrire une table de partitions détruit les métadonnées précédentes : une sauvegarde ou une confirmation explicite est indispensable.",
+      "bullets": [
+        "lsblk affiche l'arborescence disques/partitions, fdisk -l la table",
+        "/dev/sda1 pour SATA, /dev/nvme0n1p1 pour NVMe",
+        "MBR plafonne à 2 To et à quatre partitions primaires",
+        "GPT gère les grands disques et s'impose en UEFI",
+        "Vérifier lsblk -f et findmnt avant toute écriture"
+      ],
+      "code": [
+        "lsblk -f",
+        "fdisk -l",
+        "parted /dev/sdb print",
+        "findmnt"
+      ],
+      "table": {
+        "headers": [
+          "Critère",
+          "MBR",
+          "GPT"
+        ],
+        "rows": [
+          [
+            "Taille maximale du disque",
+            "2 To",
+            "Bien au-delà de 2 To"
+          ],
+          [
+            "Partitions",
+            "4 primaires (extensions possibles)",
+            "128 par défaut"
+          ],
+          [
+            "Firmware associé",
+            "BIOS",
+            "UEFI (et BIOS possible)"
+          ],
+          [
+            "Redondance de la table",
+            "Faible",
+            "En-tête et sauvegarde GPT"
+          ]
+        ]
+      },
+      "diagram": "/dev/sda  (disque)\n|-- sda1   /boot/efi   vfat\n|-- sda2   /boot       xfs\n|-- sda3   [SWAP]\n`-- sda4   /           xfs\n\nNVMe : /dev/nvme0n1 -> nvme0n1p1, nvme0n1p2 ...",
+      "tip": "Ne confonds pas le disque et sa partition : mkfs s'applique à une partition (/dev/sdb1) ou à un LV, pas au disque entier (/dev/sdb), sauf choix volontaire et destructeur."
+    },
+    {
+      "heading": "2. Systèmes de fichiers, montage et /etc/fstab",
+      "body": "Un système de fichiers organise les données sur une partition : il gère les blocs, les noms, les permissions et les métadonnées. openEuler prend en charge XFS et ext4 : XFS est fréquent pour les volumes de données, tandis qu'ext4 reste très utilisé et abondamment documenté. mkfs.xfs /dev/sdb1 ou mkfs.ext4 /dev/sdb1 crée le système de fichiers ; cette opération efface le contenu de la partition.\n\nMonter consiste à attacher ce système de fichiers à un répertoire de l'arborescence, appelé point de montage. mount /dev/sdb1 /data le fait pour la session courante, umount /data le détache. Le montage doit être déclaré dans /etc/fstab pour survivre au redémarrage. Une entrée fstab comporte le périphérique, le point de montage, le type, les options, le champ dump et le champ fsck.\n\nMieux vaut référencer le périphérique par son UUID que par /dev/sdb1 : l'ordre d'attribution des noms peut changer après ajout d'un disque. blkid affiche l'UUID, et mount -a teste la configuration fstab. Une erreur dans fstab peut bloquer le démarrage : vérifie toujours avec findmnt --verify ou un montage à blanc.",
+      "bullets": [
+        "mkfs.xfs ou mkfs.ext4 formate une partition et efface son contenu",
+        "mount attache un système de fichiers à un point de montage",
+        "fstab rend le montage persistant au redémarrage",
+        "Préférer l'UUID au nom /dev/sdX, qui peut changer",
+        "mount -a et findmnt --verify contrôlent la configuration"
+      ],
+      "code": [
+        "mkfs.xfs /dev/sdb1",
+        "mkdir -p /data",
+        "mount /dev/sdb1 /data",
+        "blkid /dev/sdb1",
+        "mount -a",
+        "df -h /data"
+      ],
+      "diagram": "/etc/fstab : 6 champs\nUUID=xxxx  /data  xfs  defaults  0 0\n   |         |      |      |      | |\n   |         |      |      |      | `-- fsck : 0 = pas de verification\n   |         |      |      |      `---- dump : 0 = ignore\n   |         |      |      `----------- options de montage\n   |         |      `------------------ type de systeme de fichiers\n   |         `------------------------- point de montage\n   `----------------------------------- peripherique (UUID recommande)",
+      "exercises": [
+        {
+          "prompt": "Tu viens de formater /dev/sdb1 en XFS. Écris l'entrée fstab permettant de le monter sur /data au démarrage, en utilisant son UUID.",
+          "correction": "On récupère l'UUID avec blkid /dev/sdb1, puis on ajoute dans /etc/fstab une ligne du type UUID=xxxx-xxxx /data xfs defaults 0 0. Le premier champ est le périphérique, le deuxième le point de montage, le troisième le type, le quatrième les options, puis dump=0 et fsck=0. On crée /data, on teste avec mount -a et on vérifie avec df -h. En cas d'erreur, une entrée invalide peut bloquer le démarrage."
+        }
+      ],
+      "tip": "XFS ne se réduit pas. Si tu prévois de diminuer un volume un jour, choisis ext4 dès le départ, ou prévois la capacité autrement."
+    },
+    {
+      "heading": "3. LVM : PV, VG et LV",
+      "body": "LVM ajoute une couche d'abstraction entre les disques physiques et les systèmes de fichiers. Un volume physique (PV) est un disque ou une partition initialisé par pvcreate. Un groupe de volumes (VG) agrège plusieurs PV en un réservoir unique, créé avec vgcreate. Un volume logique (LV) est découpé dans ce réservoir avec lvcreate, puis formaté et monté comme une partition classique.\n\nL'intérêt est la souplesse. On peut ajouter un disque au VG avec vgextend, agrandir un LV avec lvextend, créer des instantanés pour une sauvegarde cohérente, ou répartir les données sur plusieurs disques. Les commandes pvs, vgs et lvs donnent une vue synthétique, et lvdisplay détaille un volume.\n\nAnalogie utile : le VG est un réservoir d'eau, les PV sont les arrivées qui l'alimentent et les LV sont les robinets qui distribuent une capacité choisie. Le réservoir peut être agrandi sans recréer les robinets. Cette abstraction a un coût : une couche supplémentaire à administrer et à diagnostiquer.",
+      "bullets": [
+        "PV = disque ou partition initialisé par pvcreate",
+        "VG = réservoir formé de plusieurs PV, créé par vgcreate",
+        "LV = volume découpé dans le VG, formaté puis monté",
+        "vgextend agrandit le réservoir, lvextend agrandit un volume",
+        "pvs, vgs et lvs donnent une vue synthétique"
+      ],
+      "code": [
+        "pvcreate /dev/sdb1 /dev/sdc1",
+        "vgcreate vgdata /dev/sdb1 /dev/sdc1",
+        "lvcreate -L 20G -n lvapp vgdata",
+        "mkfs.xfs /dev/vgdata/lvapp",
+        "vgs",
+        "lvs"
+      ],
+      "diagram": "Disques physiques        Groupe de volumes        Volumes logiques\n/dev/sdb1  --+\n             +--> PV --> VG vgdata --+--> LV lvapp   20 Go -> /data\n/dev/sdc1  --+                        `--> LV lvlog   10 Go -> /var/log\n\nLe VG peut etre agrandi avec vgextend sans recreer les LV.",
+      "exercises": [
+        {
+          "prompt": "Deux disques /dev/sdb et /dev/sdc doivent fournir un volume de 100 Go monté sur /data. Décris la chaîne LVM complète.",
+          "correction": "pvcreate /dev/sdb /dev/sdc, puis vgcreate vgdata /dev/sdb /dev/sdc pour créer le réservoir. On crée le volume avec lvcreate -L 100G -n lvdata vgdata, on formate avec mkfs.xfs /dev/vgdata/lvdata, on crée /data, on monte et on ajoute l'entrée fstab. La vérification se fait avec pvs, vgs, lvs, puis df -h /data. Le nom du périphérique est /dev/vgdata/lvdata ou /dev/mapper/vgdata-lvdata."
+        }
+      ],
+      "tip": "L'ordre est toujours PV puis VG puis LV. Une question qui propose de créer le VG avant les PV, ou de formater avant de créer le LV, décrit une séquence impossible."
+    },
+    {
+      "heading": "4. Étendre un volume et son système de fichiers",
+      "body": "Agrandir un volume logique se fait en deux temps : étendre le volume, puis étendre le système de fichiers qui s'y trouve. Les deux opérations sont distinctes, et oublier la seconde laisse un espace alloué mais inutilisable par les fichiers.\n\nlvextend -L +5G /dev/vgdata/lvapp ajoute 5 Go au LV. On peut aussi utiliser -l +100%FREE pour consommer tout l'espace libre du VG. Pour XFS, la croissance se fait en ligne avec xfs_growfs /mountpoint, en indiquant le point de montage et non le périphérique. XFS ne peut pas être réduit. Pour ext4, resize2fs /dev/vgdata/lvapp étend le système, et une réduction reste possible après démontage et vérification.\n\nAvant toute opération, vérifie l'espace libre avec vgs et df -h. Après extension, df -h doit refléter la nouvelle taille. Si le LV a été agrandi mais que df ne change pas, c'est que le système de fichiers n'a pas été étendu : c'est le piège le plus fréquent de ce module.",
+      "bullets": [
+        "Étendre le LV puis étendre le système de fichiers : deux étapes",
+        "lvextend -L +5G agrandit le volume, -l +100%FREE consomme le reste du VG",
+        "XFS : xfs_growfs sur le point de montage, en ligne",
+        "ext4 : resize2fs sur le périphérique ; réduction possible hors ligne",
+        "XFS ne peut pas être réduit"
+      ],
+      "code": [
+        "vgs",
+        "lvextend -L +5G /dev/vgdata/lvapp",
+        "xfs_growfs /data",
+        "df -h /data",
+        "resize2fs /dev/vgdata/lvext4    # pour ext4"
+      ],
+      "table": {
+        "headers": [
+          "Système",
+          "Étendre",
+          "Réduire"
+        ],
+        "rows": [
+          [
+            "XFS",
+            "xfs_growfs /point/de/montage",
+            "Impossible"
+          ],
+          [
+            "ext4",
+            "resize2fs /dev/vg/lv",
+            "Possible après démontage et e2fsck"
+          ]
+        ]
+      },
+      "tip": "xfs_growfs prend le point de montage en argument, pas /dev/vgdata/lvapp. C'est une erreur classique en examen et en production."
+    },
+    {
+      "heading": "5. Réseau avec nmcli et les commandes ip",
+      "body": "NetworkManager gère les interfaces réseau d'openEuler, et nmcli est son interface en ligne de commande. nmcli device status liste les interfaces et leur état ; nmcli connection show liste les profils de connexion. Un profil peut être actif ou non, et plusieurs profils peuvent viser la même interface.\n\nPour une adresse fournie par DHCP, on crée ou modifie un profil avec ipv4.method auto. Pour une adresse fixe, on utilise ipv4.method manual puis ipv4.addresses 192.168.1.50/24, ipv4.gateway 192.168.1.1 et ipv4.dns 192.168.1.1. nmcli connection up nom active le profil, nmcli connection modify le modifie à chaud. Les changements sont enregistrés dans un fichier de connexion géré par NetworkManager.\n\nLes commandes ip complètent l'outil : ip addr show affiche les adresses, ip route show la table de routage, ip link montre l'état des liens. Pour tester, ping vérifie l'accessibilité, ss -tulpn liste les ports en écoute et dig interroge le DNS. NetworkManager et les fichiers de configuration ne doivent pas être modifiés en parallèle, sous peine de conflits.",
+      "bullets": [
+        "nmcli device status liste les interfaces et leur état",
+        "ipv4.method auto = DHCP ; manual = adresse fixe",
+        "ipv4.addresses, ipv4.gateway et ipv4.dns complètent le mode manual",
+        "nmcli connection up active un profil",
+        "ip addr, ip route, ss et dig complètent le diagnostic"
+      ],
+      "code": [
+        "nmcli device status",
+        "nmcli connection show",
+        "nmcli connection modify eth0 ipv4.method manual ipv4.addresses 192.168.1.50/24 ipv4.gateway 192.168.1.1 ipv4.dns 192.168.1.1",
+        "nmcli connection up eth0",
+        "ip addr show eth0",
+        "ip route show"
+      ],
+      "table": {
+        "headers": [
+          "Besoin",
+          "Commande nmcli"
+        ],
+        "rows": [
+          [
+            "Voir les interfaces",
+            "nmcli device status"
+          ],
+          [
+            "Lister les profils",
+            "nmcli connection show"
+          ],
+          [
+            "Activer un profil",
+            "nmcli connection up eth0"
+          ],
+          [
+            "Passer en DHCP",
+            "nmcli connection modify eth0 ipv4.method auto"
+          ],
+          [
+            "Fixer une adresse",
+            "nmcli connection modify eth0 ipv4.method manual ipv4.addresses ..."
+          ]
+        ]
+      },
+      "tip": "ipv4.method manual sans ipv4.addresses laisse l'interface sans adresse. Les trois informations adresse, passerelle et DNS doivent être fournies de façon cohérente avec le réseau."
+    },
+    {
+      "heading": "6. firewalld : zones, runtime et permanent",
+      "body": "firewalld filtre le trafic réseau selon des zones. Une zone est un niveau de confiance associé à une interface ou à un réseau source : public, internal, trusted, drop. Chaque zone possède des services autorisés, des ports ouverts et des règles riches. L'interface affectée à une zone hérite de sa politique.\n\nfirewall-cmd interroge et modifie la configuration. --state vérifie que le démon tourne, --get-active-zones affiche les zones actives, --list-all détaille la zone par défaut. Pour autoriser un service, on utilise --add-service=http ; pour un port précis, --add-port=8080/tcp. Sans --permanent, la règle ne vit que dans la configuration d'exécution et disparaît au redémarrage. Avec --permanent, elle est écrite sur disque mais n'est pas active tant que --reload n'a pas été exécuté.\n\nLe réflexe professionnel est donc : firewall-cmd --permanent --add-port=8080/tcp, puis firewall-cmd --reload, puis vérification avec --list-ports. Ouvrir un port sans service derrière est inutile, et ouvrir un service sans comprendre la zone peut exposer une interface non désirée.",
+      "bullets": [
+        "Une zone définit un niveau de confiance et une politique",
+        "Sans --permanent, la règle est temporaire (runtime)",
+        "Avec --permanent, il faut --reload pour l'activer",
+        "--list-all, --list-ports et --get-active-zones servent au diagnostic",
+        "Ouvrir un port ne suffit pas : le service doit écouter derrière"
+      ],
+      "code": [
+        "firewall-cmd --state",
+        "firewall-cmd --get-active-zones",
+        "firewall-cmd --permanent --add-service=http",
+        "firewall-cmd --permanent --add-port=8080/tcp",
+        "firewall-cmd --reload",
+        "firewall-cmd --list-ports"
+      ],
+      "diagram": "Regle runtime  ---> active immediatement, perdue au reboot\nRegle --permanent ---> ecrite dans /etc/firewalld, inactive\n                        jusqu'a : firewall-cmd --reload\n\nSequence sure :\n--permanent --add-port=8080/tcp  ->  --reload  ->  --list-ports",
+      "exercises": [
+        {
+          "prompt": "Tu dois exposer le port TCP 8443 de façon permanente, puis vérifier qu'il est bien actif. Donne les trois commandes dans l'ordre.",
+          "correction": "firewall-cmd --permanent --add-port=8443/tcp écrit la règle dans la configuration persistante. firewall-cmd --reload recharge la configuration runtime depuis les fichiers permanents. firewall-cmd --list-ports permet de vérifier que 8443/tcp apparaît. Si l'on omet --reload, le port reste fermé jusqu'au redémarrage ou au prochain rechargement."
+        }
+      ],
+      "tip": "--permanent seul ne rend pas la règle effective immédiatement. Inversement, une règle sans --permanent disparaît au redémarrage. Les deux mécanismes sont indépendants."
+    },
+    {
+      "heading": "7. SELinux : contexte, modes et dépannage",
+      "body": "SELinux est un mécanisme de contrôle d'accès obligatoire. Même si un processus tourne en root, SELinux peut lui refuser l'accès à un fichier si son contexte de sécurité ne l'autorise pas. Chaque processus et chaque fichier porte un contexte de la forme utilisateur:rôle:type:niveau ; le type est la partie la plus utilisée dans le diagnostic.\n\nTrois modes existent. Enforcing, SELinux applique la politique et refuse les accès non autorisés. Permissive, il journalise les refus sans les bloquer, ce qui aide à comprendre une politique. Disabled, il est totalement inactif. getenforce affiche le mode courant ; setenforce 0 ou 1 bascule entre Permissive et Enforcing, mais ne permet pas d'atteindre Disabled, qui exige une modification de /etc/selinux/config et un redémarrage.\n\nls -Z affiche les contextes, restorecon -Rv rétablit les contextes par défaut d'une arborescence et chcon les modifie temporairement. Les booléens, listés par getsebool -a et modifiés par setsebool -P, activent ou désactivent des règles sans changer de politique. Un serveur web qui ne lit pas /var/www à cause d'un contexte copié depuis /root est un cas classique.",
+      "bullets": [
+        "SELinux applique une politique obligatoire même à root",
+        "Enforcing bloque, Permissive journalise, Disabled désactive",
+        "setenforce bascule 0/1 mais ne désactive pas SELinux",
+        "Disabled exige /etc/selinux/config et un redémarrage",
+        "ls -Z, restorecon et setsebool -P servent au dépannage"
+      ],
+      "code": [
+        "getenforce",
+        "setenforce 0",
+        "ls -Z /var/www/html",
+        "restorecon -Rv /var/www/html",
+        "getsebool -a | grep httpd",
+        "setsebool -P httpd_can_network_connect on"
+      ],
+      "diagram": "Acces demande\n     |\n     v\nMode Enforcing ? --non--> Disabled : aucun controle SELinux\n     | oui\n     v\nPolitique + contexte autorisent ? --oui--> acces accorde\n     | non\n     v\nRefus bloque + evenement journalise\n\nMode Permissive : le refus est journalise mais l'acces est accorde.",
+      "tip": "setenforce 0 ne désactive pas SELinux : il passe en Permissive jusqu'au redémarrage. Pour un état Disabled, il faut éditer /etc/selinux/config puis redémarrer."
+    }
+  ],
+  "key_points": [
+    "MBR plafonne à 2 To, GPT gère les grands disques et l'UEFI",
+    "mkfs crée le système de fichiers, mount l'attache, fstab rend le montage persistant",
+    "LVM s'ordonne PV puis VG puis LV, et permet d'étendre le stockage à chaud",
+    "Agrandir un LV exige aussi d'étendre le système de fichiers",
+    "XFS grandit avec xfs_growfs et ne peut pas être réduit",
+    "nmcli ipv4.method auto correspond à DHCP, manual à une adresse fixe",
+    "firewalld distingue runtime et permanent ; --reload applique les règles permanentes",
+    "SELinux Enforcing bloque, Permissive journalise, Disabled nécessite un redémarrage"
+  ],
+  "traps": [
+    "Formater le disque entier au lieu d'une partition",
+    "Utiliser /dev/sdb1 dans fstab alors que l'ordre des disques peut changer",
+    "Agrandir le LV sans étendre le système de fichiers",
+    "Croire que firewall-cmd --permanent est actif immédiatement",
+    "Penser que setenforce 0 désactive SELinux définitivement"
+  ],
+  "quiz": [
+    {
+      "id": "hcia-oe-04-q01",
+      "type": "single",
+      "prompt": "In the LVM hierarchy, which object groups several physical volumes into a single storage pool?",
+      "options": [
+        "VG (Volume Group)",
+        "PV (Physical Volume)",
+        "RAID device",
+        "LV (Logical Volume)"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le VG (Volume Group) agrège plusieurs PV en un réservoir unique, dans lequel les LV sont découpés. Le PV est un disque ou une partition initialisé pour LVM, le LV est le volume utilisable par le système de fichiers, et un périphérique RAID est une autre technologie de stockage.",
+      "topic": "LVM"
+    },
+    {
+      "id": "hcia-oe-04-q02",
+      "type": "single",
+      "prompt": "After lvextend on an XFS logical volume, which command grows the file system online?",
+      "options": [
+        "resize2fs",
+        "xfs_growfs",
+        "mkfs.xfs",
+        "lvresize"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "xfs_growfs étend un système de fichiers XFS monté, en prenant le point de montage en argument. resize2fs concerne ext4, mkfs.xfs reformate et détruit les données, et lvresize modifie le volume logique mais pas le système de fichiers qu'il contient.",
+      "topic": "LVM"
+    },
+    {
+      "id": "hcia-oe-04-q03",
+      "type": "single",
+      "prompt": "In nmcli, which value of ipv4.method makes the interface use DHCP?",
+      "options": [
+        "link-local",
+        "manual",
+        "auto",
+        "static"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "ipv4.method auto active DHCP : l'interface demande une adresse, une passerelle et un DNS au serveur. manual exige une configuration statique complète, static n'est pas une valeur de cette propriété et link-local désigne une adresse auto-attribuée dans un cas particulier.",
+      "topic": "Networking"
+    },
+    {
+      "id": "hcia-oe-04-q04",
+      "type": "multi",
+      "prompt": "Which tools display block devices, mounted filesystems or filesystem identifiers? (Choose three.)",
+      "options": [
+        "journalctl",
+        "lsblk",
+        "df -h",
+        "blkid"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "lsblk affiche l'arborescence des périphériques, df -h l'espace des systèmes de fichiers montés et blkid les UUID ainsi que les types de systèmes de fichiers. journalctl affiche des journaux et n'inspecte pas directement le stockage.",
+      "topic": "Storage tools"
+    },
+    {
+      "id": "hcia-oe-04-q05",
+      "type": "multi",
+      "prompt": "Which SELinux modes can be selected at runtime with setenforce? (Choose two.)",
+      "options": [
+        "Permissive",
+        "Disabled",
+        "Relaxed",
+        "Enforcing"
+      ],
+      "answer": [
+        0,
+        3
+      ],
+      "explanation_fr": "setenforce 1 active Enforcing et setenforce 0 active Permissive. Le mode Disabled ne peut pas être atteint par setenforce : il faut modifier /etc/selinux/config puis redémarrer. Relaxed n'est pas un mode SELinux.",
+      "topic": "SELinux"
+    },
+    {
+      "id": "hcia-oe-04-q06",
+      "type": "tf",
+      "prompt": "The firewall-cmd option --permanent alone makes a new rule effective immediately.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : --permanent écrit la règle dans la configuration persistante, mais la configuration runtime n'est pas modifiée. Il faut exécuter firewall-cmd --reload pour que la règle devienne active immédiatement. Sans --reload, elle ne s'appliquera qu'au prochain démarrage du service.",
+      "topic": "firewalld"
+    },
+    {
+      "id": "hcia-oe-04-q07",
+      "type": "tf",
+      "prompt": "An MBR partition table supports disks larger than 2 TB.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : le MBR est limité à 2 To et à quatre partitions primaires. Pour les disques de plus grande capacité, il faut utiliser GPT, qui est également le format attendu pour un démarrage UEFI moderne.",
+      "topic": "Partitioning"
+    },
+    {
+      "id": "hcia-oe-04-q08",
+      "type": "text",
+      "prompt": "Which command creates a Physical Volume in LVM from the device /dev/sdb1?",
+      "accept": [
+        "pvcreate /dev/sdb1",
+        "pvcreate /dev/sdb1."
+      ],
+      "sample_answer": "pvcreate /dev/sdb1",
+      "explanation_fr": "pvcreate initialise une partition ou un disque comme volume physique LVM. On crée ensuite le groupe avec vgcreate et le volume logique avec lvcreate. vgcreate et lvcreate interviennent après pvcreate, jamais avant.",
+      "topic": "LVM"
+    },
+    {
+      "id": "hcia-oe-04-q09",
+      "type": "text",
+      "prompt": "Give the firewall-cmd command (with --permanent) to allow TCP port 8080.",
+      "accept": [
+        "firewall-cmd --permanent --add-port=8080/tcp",
+        "firewall-cmd --permanent --add-port 8080/tcp",
+        "firewall-cmd --add-port=8080/tcp --permanent"
+      ],
+      "sample_answer": "firewall-cmd --permanent --add-port=8080/tcp",
+      "explanation_fr": "Le format attendu est port/protocole, ici 8080/tcp, avec --add-port. --permanent enregistre la règle durablement ; il faut ensuite firewall-cmd --reload pour l'activer dans la configuration runtime.",
+      "topic": "firewalld"
+    },
+    {
+      "id": "hcia-oe-04-q10",
+      "type": "single",
+      "prompt": "Which file must be edited for a mount to survive a reboot without manual intervention?",
+      "options": [
+        "/boot/grub2/grub.cfg",
+        "/etc/services",
+        "/etc/motd",
+        "/etc/fstab"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "/etc/fstab déclare les systèmes de fichiers montés au démarrage. /etc/motd affiche un message de connexion, grub.cfg configure le chargeur d'amorçage et /etc/services associe des noms de services à des ports ; aucun de ces fichiers ne gère les montages.",
+      "topic": "Mounting"
+    },
+    {
+      "id": "hcia-oe-04-q11",
+      "type": "single",
+      "prompt": "Which advantage is specific to GPT compared with MBR?",
+      "options": [
+        "It supports disks larger than 2 TB",
+        "It removes the need for a filesystem",
+        "It works only with ext4",
+        "It disables UEFI boot"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "GPT lève la limite de 2 To du MBR et permet un plus grand nombre de partitions, ce qui le rend indispensable sur les gros disques et en UEFI. Une table de partitions ne remplace jamais un système de fichiers, n'est pas liée à ext4 et ne désactive pas UEFI.",
+      "topic": "Partitioning"
+    },
+    {
+      "id": "hcia-oe-04-q12",
+      "type": "single",
+      "prompt": "Which command creates an XFS filesystem on /dev/vgdata/lvapp?",
+      "options": [
+        "df -T /dev/vgdata/lvapp",
+        "mkfs.xfs /dev/vgdata/lvapp",
+        "xfs_growfs /dev/vgdata/lvapp",
+        "mount -t xfs /dev/vgdata/lvapp"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "mkfs.xfs formate le volume et crée un nouveau système de fichiers XFS. xfs_growfs agrandit un système existant, mount l'attache à un répertoire et df affiche des statistiques : aucune de ces trois commandes ne crée le système de fichiers.",
+      "topic": "Filesystems"
+    },
+    {
+      "id": "hcia-oe-04-q13",
+      "type": "multi",
+      "prompt": "Which capabilities are provided by LVM? (Choose three.)",
+      "options": [
+        "Replacing the need for backups",
+        "Combining several physical disks into one volume group",
+        "Extending a logical volume while it is in use",
+        "Creating snapshots for backup consistency"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "LVM agrège des disques en un VG, permet d'étendre un LV en ligne et de créer des instantanés pour des sauvegardes cohérentes. En revanche, un instantané n'est pas une sauvegarde : il reste sur le même stockage et ne protège ni d'une panne matérielle ni d'une suppression accidentelle.",
+      "topic": "LVM"
+    },
+    {
+      "id": "hcia-oe-04-q14",
+      "type": "tf",
+      "prompt": "An XFS filesystem can be shrunk online with xfs_growfs.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : xfs_growfs ne fait qu'agrandir un XFS monté. XFS ne prend pas en charge la réduction. Pour diminuer un volume, il faut sauvegarder les données, recréer un système de fichiers plus petit et restaurer, ou choisir ext4 dès la conception.",
+      "topic": "Filesystems"
+    },
+    {
+      "id": "hcia-oe-04-q15",
+      "type": "text",
+      "prompt": "Which command displays the UUID and filesystem type of /dev/sdb1? (Give the full command.)",
+      "accept": [
+        "blkid /dev/sdb1",
+        "blkid /dev/sdb1."
+      ],
+      "sample_answer": "blkid /dev/sdb1",
+      "explanation_fr": "blkid affiche l'UUID, le type de système de fichiers et éventuellement le label d'une partition. Ces informations servent à écrire une entrée fstab stable. lsblk -f donne des informations comparables sous forme d'arborescence.",
+      "topic": "Storage tools"
+    },
+    {
+      "id": "hcia-oe-04-q16",
+      "type": "text",
+      "prompt": "Which nmcli command activates the existing connection profile named eth0? (Give the full command.)",
+      "accept": [
+        "nmcli connection up eth0",
+        "nmcli con up eth0",
+        "nmcli connection up eth0."
+      ],
+      "sample_answer": "nmcli connection up eth0",
+      "explanation_fr": "nmcli connection up eth0 active le profil de connexion eth0 et applique sa configuration à l'interface. nmcli device status se contente d'afficher l'état et nmcli connection show liste les profils sans les activer.",
+      "topic": "Networking"
+    },
+    {
+      "id": "hcia-oe-04-q17",
+      "type": "single",
+      "prompt": "What is the purpose of firewall-cmd --reload?",
+      "options": [
+        "Restart the network interface",
+        "Disable SELinux",
+        "Reload the permanent configuration into the runtime configuration",
+        "Delete all firewall rules permanently"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "--reload recharge la configuration runtime à partir des règles permanentes, ce qui rend immédiatement actives les règles ajoutées avec --permanent. Cette commande ne supprime pas les règles, ne redémarre pas l'interface réseau et n'a aucun effet sur SELinux.",
+      "topic": "firewalld"
+    },
+    {
+      "id": "hcia-oe-04-q18",
+      "type": "single",
+      "prompt": "In which SELinux mode are denied accesses logged but not blocked?",
+      "options": [
+        "Disabled",
+        "Strict",
+        "Enforcing",
+        "Permissive"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "En mode Permissive, SELinux journalise les refus qu'il aurait appliqués en Enforcing, mais laisse l'accès se produire : c'est le mode de diagnostic. Enforcing bloque réellement, Disabled n'applique aucune politique et Strict n'est pas un mode SELinux.",
+      "topic": "SELinux"
+    },
+    {
+      "id": "hcia-oe-04-q19",
+      "type": "single",
+      "prompt": "Which command displays the SELinux context of files in a directory?",
+      "options": [
+        "ls -Z",
+        "ls -l",
+        "getenforce",
+        "sestatus -v"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "ls -Z ajoute le contexte SELinux de chaque fichier, par exemple un type comme httpd_sys_content_t. ls -l montre les permissions Unix sans contexte, getenforce affiche seulement le mode courant et sestatus -v donne un état général sans lister les contextes des fichiers.",
+      "topic": "SELinux"
+    },
+    {
+      "id": "hcia-oe-04-q20",
+      "type": "single",
+      "prompt": "Which nmcli subcommand lists network devices and their current state?",
+      "options": [
+        "nmcli networking off",
+        "nmcli device status",
+        "nmcli connection add",
+        "nmcli general reload"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "nmcli device status affiche les interfaces, leur type et leur état (connected, disconnected, unavailable). connection add crée un profil, general reload recharge la configuration et networking off désactive la gestion réseau : aucune de ces commandes ne produit la liste demandée.",
+      "topic": "Networking"
+    }
+  ]
+}

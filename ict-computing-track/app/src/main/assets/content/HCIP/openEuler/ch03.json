@@ -1,0 +1,683 @@
+{
+  "id": "hcip-oe-03",
+  "phase": "HCIP",
+  "subject": "openEuler",
+  "number": 3,
+  "title_fr": "Sécurité avancée et automatisation openEuler",
+  "title_en": "Advanced Security and Automation",
+  "minutes": 50,
+  "source": "HCIP-openEuler V1.0 Training Material — Sessions 4 «Automated O&M» · 5 «Shell avancé» · 6 «OS Security Hardening/SELinux» · 7 «Monit. Zabbix»",
+  "objectives": [
+    "Expliquer le contrôle d'accès obligatoire SELinux et ses trois modes",
+    "Corriger durablement les contextes de fichiers et de ports",
+    "Analyser un refus AVC et choisir entre booléen, étiquette et politique",
+    "Durcir un hôte avec SSH, firewalld, GRUB2 et auditd",
+    "Automatiser un parc avec Ansible et superviser avec Zabbix",
+    "Préparer une mise à jour et un retour arrière maîtrisés"
+  ],
+  "sections": [
+    {
+      "heading": "SELinux : du DAC au contrôle d'accès obligatoire",
+      "body": "Linux applique historiquement un contrôle d'accès discrétionnaire, le DAC : les permissions rwx et la propriété des fichiers décident qui peut agir. Ce modèle laisse l'administrateur sans moyen de confiner finement un processus compromis. SELinux ajoute un contrôle d'accès obligatoire, le MAC : chaque processus, fichier, port et utilisateur porte une étiquette, et la politique décide des transitions autorisées, indépendamment du compte Unix.\n\nTrois modes existent. Enforcing applique la politique et bloque les opérations interdites. Permissive les autorise mais journalise un refus AVC, ce qui sert au diagnostic. Disabled ne charge aucune politique : à éviter, car réactiver SELinux plus tard exige un réétiquetage complet du système.\n\nLe changement temporaire se fait avec setenforce 0 ou 1, et le changement permanent dans /etc/selinux/config, avec redémarrage. En production openEuler, on reste en Enforcing et on corrige les étiquettes plutôt que de désactiver la protection.",
+      "bullets": [
+        "Le DAC repose sur les permissions Unix, le MAC sur des étiquettes et une politique",
+        "Enforcing bloque, Permissive journalise, Disabled ne charge rien",
+        "setenforce agit immédiatement mais pas durablement",
+        "/etc/selinux/config fixe le mode persistant après redémarrage"
+      ],
+      "code": [
+        "getenforce",
+        "sudo setenforce 0",
+        "sudo setenforce 1",
+        "sudo vi /etc/selinux/config",
+        "sestatus"
+      ],
+      "table": {
+        "headers": [
+          "Mode",
+          "Blocage",
+          "Journalisation",
+          "Usage"
+        ],
+        "rows": [
+          [
+            "Enforcing",
+            "Oui",
+            "Oui",
+            "Production"
+          ],
+          [
+            "Permissive",
+            "Non",
+            "Oui",
+            "Diagnostic et recette"
+          ],
+          [
+            "Disabled",
+            "Non",
+            "Non",
+            "À éviter"
+          ]
+        ]
+      },
+      "diagram": "Processus httpd  --- demande --->  Fichier\ncontexte httpd_t                    contexte default_t\n        |                                  |\n        +-------- politique SELinux --------+\n                          |\n             autorise ?  /          \\  refuse ?\n                        v            v\n                   acces OK      AVC + blocage\n                                 (si Enforcing)",
+      "tip": "setenforce 0 est un outil de diagnostic temporaire. Le passer dans un script de déploiement revient à désactiver silencieusement une protection de production."
+    },
+    {
+      "heading": "Contextes, ports et booléens : agir sur la politique",
+      "body": "Un contexte SELinux s'écrit user:role:type:sensitivity:category, par exemple system_u:object_r:httpd_sys_content_t:s0. En politique ciblée, le type est l'élément déterminant : il indique à la politique quelle catégorie d'objet est manipulée. On observe les contextes réels avec ls -Z, ps axZ ou ss -lnpZ. Les contextes par défaut, eux, sont stockés dans la base de politique et visibles avec semanage fcontext -l.\n\nchcon modifie l'étiquette réelle d'un fichier, mais cette modification peut être perdue lors d'un relabeling. Pour une règle durable, on utilise semanage fcontext -a -t type 'chemin(/.*)?' puis restorecon -Rv, qui applique le contexte par défaut. Cette distinction entre chcon temporaire et semanage persistant est un classique de l'examen.\n\nLes ports ont aussi un contexte. Si NGINX écoute sur 8080 au lieu de 80, SELinux bloque la liaison tant que le port n'est pas étiqueté avec semanage port -a -t http_port_t -p tcp 8080.",
+      "bullets": [
+        "Le type est le champ décisif d'un contexte en politique ciblée",
+        "chcon change l'étiquette réelle, semanage fcontext la règle par défaut",
+        "restorecon applique la règle par défaut, éventuellement en récursif",
+        "semanage port autorise un service à écouter sur un port non standard"
+      ],
+      "code": [
+        "ls -Z /var/www/html",
+        "sudo semanage fcontext -a -t httpd_sys_content_t '/srv/web(/.*)?'",
+        "sudo restorecon -Rv /srv/web",
+        "sudo semanage port -a -t http_port_t -p tcp 8080",
+        "getsebool -a | grep httpd_can_network_connect",
+        "sudo setsebool -P httpd_can_network_connect on"
+      ],
+      "table": {
+        "headers": [
+          "Champ du contexte",
+          "Rôle",
+          "Exemple"
+        ],
+        "rows": [
+          [
+            "user",
+            "Type d'utilisateur SELinux",
+            "system_u"
+          ],
+          [
+            "role",
+            "Rôle autorisé",
+            "object_r"
+          ],
+          [
+            "type",
+            "Catégorie de l'objet, champ clé",
+            "httpd_sys_content_t"
+          ],
+          [
+            "sensitivity",
+            "Niveau de sensibilité",
+            "s0"
+          ],
+          [
+            "category",
+            "Catégorie organisationnelle",
+            "c0.c1023"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "NGINX doit servir les fichiers de /srv/web, mais SELinux refuse l'accès. Le répertoire contient des sous-répertoires et des fichiers existants. Donnez les commandes qui rendent l'autorisation durable, puis expliquez pourquoi chcon seul serait insuffisant.",
+          "correction": "On déclare d'abord une règle persistante avec semanage fcontext -a -t httpd_sys_content_t '/srv/web(/.*)?'. L'expression (/.*)? couvre le répertoire et tout son contenu. On applique ensuite restorecon -Rv /srv/web, qui réétiquette les fichiers existants selon la règle. chcon aurait modifié les étiquettes actuelles sans créer de règle : un restorecon ultérieur ou un relabeling complet du système aurait rétabli l'ancien contexte et cassé de nouveau le service."
+        }
+      ],
+      "tip": "semanage fcontext n'applique rien aux fichiers existants : il faut toujours restorecon derrière. Inversement, restorecon seul ne connaît pas votre nouveau chemin."
+    },
+    {
+      "heading": "Booléens et diagnostic d'un refus AVC",
+      "body": "Les booléens permettent d'activer ou de désactiver une règle de politique sans écrire de module. getsebool -a liste les booléens et leur état, semanage boolean -l donne une description plus lisible, et setsebool -P nom on rend le changement persistant. Sans -P, le réglage disparaît au redémarrage.\n\nUn refus SELinux apparaît dans /var/log/audit/audit.log sous forme d'enregistrement AVC. On y lit la permission refusée, le processus source avec scontext, l'objet cible avec tcontext et le mode avec permissive. ausearch -m avc -ts recent filtre les refus récents, et sealert, fourni par setroubleshoot, propose une explication en langage courant.\n\nLa démarche est méthodique : identifier le type source et le type cible, vérifier le chemin réel, corriger l'étiquette avec restorecon, puis activer un booléen si le besoin est légitime. Désactiver SELinux n'est pas un diagnostic, c'est une perte de protection.",
+      "bullets": [
+        "setsebool -P rend un booléen persistant, sans -P il est temporaire",
+        "Un AVC contient scontext, tcontext, tclass et la permission refusée",
+        "ausearch -m avc et sealert accélèrent l'identification de la cause",
+        "Corriger l'étiquette ou le booléen avant d'envisager une politique sur mesure"
+      ],
+      "code": [
+        "sudo getsebool -a | grep samba",
+        "sudo semanage boolean -l | grep samba",
+        "sudo setsebool -P samba_export_all_rw on",
+        "sudo ausearch -m avc -ts recent",
+        "sudo journalctl -t setroubleshoot --since '1 hour ago'"
+      ],
+      "tip": "Un booléen activé avec setsebool sans -P fonctionne jusqu'au prochain redémarrage. C'est une cause fréquente de panne après une maintenance."
+    },
+    {
+      "heading": "Durcissement de l'hôte : SSH, GRUB2 et auditd",
+      "body": "Le durcissement d'un hôte openEuler commence par réduire la surface exposée. SSH doit refuser root, imposer les clés et limiter les essais ; firewalld ne doit ouvrir que les services nécessaires ; les paquets inutiles doivent être retirés. GRUB2 mérite une protection par mot de passe, sinon un utilisateur disposant d'un accès console peut modifier les paramètres du noyau, démarrer en mode mono-utilisateur ou désactiver SELinux.\n\nauditd complète cette protection en enregistrant les événements sensibles. Une règle -w /etc/passwd -p wa -k identity surveille les écritures et changements d'attributs sur le fichier des comptes. ausearch -k identity retrouve les événements, aureport en produit une synthèse. Les règles persistantes vivent dans /etc/audit/rules.d et se chargent avec augenrules --load.\n\nLe journal d'audit doit être protégé et dimensionné : un disque plein peut faire perdre des preuves ou arrêter le service. On surveille donc l'espace et on exporte les journaux vers un collecteur central.",
+      "bullets": [
+        "SSH : clés uniquement, root interdit, essais limités",
+        "GRUB2 : mot de passe pour empêcher la modification des paramètres de démarrage",
+        "auditctl -w chemin -p permissions -k tag définit une surveillance",
+        "ausearch et aureport exploitent les journaux d'audit"
+      ],
+      "code": [
+        "sudo sshd -T | grep -E 'permitrootlogin|passwordauthentication|maxauthtries'",
+        "sudo grub2-mkpasswd-pbkdf2",
+        "sudo auditctl -w /etc/passwd -p wa -k identity",
+        "sudo ausearch -k identity -ts today",
+        "sudo aureport --summary",
+        "sudo augenrules --load"
+      ],
+      "table": {
+        "headers": [
+          "Contrôle",
+          "Menace couverte",
+          "Vérification"
+        ],
+        "rows": [
+          [
+            "Clés SSH seulement",
+            "Vol de mot de passe, brute force",
+            "sshd -T"
+          ],
+          [
+            "PermitRootLogin no",
+            "Compromission directe de root",
+            "sshd -T"
+          ],
+          [
+            "Mot de passe GRUB2",
+            "Modification du noyau en console",
+            "grub.cfg"
+          ],
+          [
+            "Règles auditd",
+            "Traçabilité des actions sensibles",
+            "auditctl -l"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Écrivez une règle auditd qui surveille les écritures et les changements d'attributs sur /etc/passwd, avec le tag identity. Donnez ensuite la commande de recherche des événements du jour et expliquez la différence entre la règle temporaire et sa persistance.",
+          "correction": "La règle est auditctl -w /etc/passwd -p wa -k identity : -w désigne le fichier surveillé, -p wa active la détection des écritures et des changements d'attributs, et -k pose le tag de recherche. On interroge les événements avec ausearch -k identity -ts today. Cette commande auditctl est immédiate mais perdue au redémarrage. Pour la rendre persistante, on écrit la même ligne dans un fichier de /etc/audit/rules.d, par exemple 10-identity.rules, puis on recharge avec augenrules --load."
+        }
+      ],
+      "tip": "Sur /etc/passwd, -p wa est plus pertinent que -p r : la lecture est fréquente et générerait un bruit énorme, alors que l'écriture et les attributs révèlent une modification de compte."
+    },
+    {
+      "heading": "Ansible : inventaire, modules et exécution ad hoc",
+      "body": "Ansible automatise la configuration sans agent : il se connecte en SSH, copie un module temporaire, l'exécute et supprime le tout. L'inventaire liste les hôtes et les regroupe, par exemple web, db ou zabbix. Une commande ad hoc suffit pour une action ponctuelle, comme installer un paquet ou redémarrer un service.\n\nLes modules décrivent un état désiré. dnf garantit la présence d'un paquet, service garantit qu'un démon est démarré et activé, copy dépose un fichier, template génère un fichier à partir de variables, user crée un compte. Cette approche est idempotente : rejouer la tâche ne change rien si l'état est déjà conforme.\n\nLe fichier ansible.cfg fixe l'inventaire par défaut, l'utilisateur distant et les options de connexion. On vérifie la connectivité avec ansible all -m ping. Les modules se documentent avec ansible-doc, ce qui évite de deviner les paramètres. Pour les opérations privilégiées, l'élévation se fait avec -b et become.",
+      "bullets": [
+        "Ansible est sans agent et utilise SSH et Python sur la cible",
+        "L'inventaire peut être en INI ou en YAML, avec des groupes et des enfants",
+        "Un module décrit un état, pas une suite de commandes shell",
+        "ansible-doc documente les paramètres d'un module",
+        "-b active l'élévation de privilèges pour les tâches administratives"
+      ],
+      "code": [
+        "sudo dnf install -y ansible",
+        "ansible all -i hosts -m ping",
+        "ansible web -i hosts -m dnf -a 'name=nginx state=present' -b",
+        "ansible db -i hosts -m service -a 'name=postgresql state=started enabled=true' -b",
+        "ansible-doc dnf"
+      ],
+      "table": {
+        "headers": [
+          "Module",
+          "Usage",
+          "Exemple de paramètre"
+        ],
+        "rows": [
+          [
+            "dnf",
+            "Paquets",
+            "name=nginx state=present"
+          ],
+          [
+            "service",
+            "Démons",
+            "name=nginx state=started enabled=true"
+          ],
+          [
+            "copy",
+            "Fichiers statiques",
+            "src=... dest=... mode=0644"
+          ],
+          [
+            "template",
+            "Fichiers dynamiques",
+            "src=...j2 dest=..."
+          ],
+          [
+            "user",
+            "Comptes",
+            "name=deploy shell=/bin/bash"
+          ],
+          [
+            "lineinfile",
+            "Ligne de configuration",
+            "path=... line=..."
+          ]
+        ]
+      },
+      "tip": "ansible all -m ping ne teste pas ICMP : le module ping vérifie la connexion SSH et la présence de Python. Un échec indique un problème d'accès ou d'interpréteur, pas de réseau IP."
+    },
+    {
+      "heading": "Playbooks : idempotence, handlers et rôles",
+      "body": "Un playbook est un fichier YAML qui décrit des tâches ordonnées pour un groupe d'hôtes. Chaque tâche nomme un module et ses paramètres ; les variables adaptent le déploiement à l'environnement. Les handlers sont des tâches déclenchées uniquement lorsqu'une autre tâche signale un changement, typiquement pour redémarrer un service après modification de sa configuration.\n\nL'idempotence est la propriété centrale : un second passage doit afficher ok plutôt que changed. Elle permet d'exécuter le playbook sans craindre de casser l'existant. ansible-playbook --check simule l'exécution et --diff montre les modifications de fichiers ; ces deux options sont indispensables avant une production.\n\nPour un parc important, on organise les tâches en rôles avec defaults, vars, tasks, handlers et templates. ansible-vault chiffre les secrets comme les mots de passe de base de données. ansible-lint signale les mauvaises pratiques. La cible n'a besoin que de SSH et de Python, ce qui explique la popularité d'Ansible en environnement hétérogène.",
+      "bullets": [
+        "Un playbook décrit des tâches YAML ordonnées et idempotentes",
+        "Un handler ne s'exécute que si la tâche qui le notifie a changé",
+        "--check simule, --diff montre les écarts avant application",
+        "Les rôles structurent un déploiement réutilisable",
+        "ansible-vault protège les secrets du playbook"
+      ],
+      "code": [
+        "ansible-playbook -i hosts site.yml --check --diff",
+        "ansible-playbook -i hosts site.yml",
+        "ansible-vault create secrets.yml",
+        "ansible-lint site.yml"
+      ],
+      "diagram": "+----------------+     SSH      +----------------+\n| Control node   |------------->| Managed host   |\n| ansible.cfg    |              | Python         |\n| inventory      |   module     | sshd           |\n| site.yml       |<------------>|                |\n+----------------+   temporaire +----------------+\n       |\n       +-- roles/web/tasks/main.yml\n       +-- roles/web/handlers/main.yml\n       +-- roles/web/templates/nginx.conf.j2\n\nAucun agent permanent n'est installe\nsur les hotes geres.",
+      "exercises": [
+        {
+          "prompt": "Écrivez un playbook minimal qui installe NGINX sur le groupe web, dépose une configuration depuis un template, active le service et ne le redémarre que si le fichier a changé.",
+          "correction": "Le playbook cible hosts: web, avec become: true. La première tâche utilise le module dnf avec name: nginx et state: present. La deuxième utilise template avec src: nginx.conf.j2, dest: /etc/nginx/nginx.conf et notify: restart nginx. La troisième utilise service avec name: nginx, state: started et enabled: true. Le bloc handlers contient une tâche nommée restart nginx qui appelle service avec state: restarted. Le handler ne se déclenche que si le template modifie réellement le fichier, ce qui évite un redémarrage inutile à chaque exécution."
+        }
+      ],
+      "tip": "Un handler mal nommé ne se déclenche jamais : la valeur de notify doit correspondre exactement au name du handler. C'est une erreur silencieuse fréquente."
+    },
+    {
+      "heading": "Zabbix : superviser sans bruit",
+      "body": "Zabbix supervise serveurs, machines virtuelles, équipements réseau et applications. Le serveur centralise la configuration et stocke les données dans une base MySQL ou PostgreSQL. L'interface web sert à consulter et administrer, et le proxy, optionnel, collecte pour le compte du serveur dans une architecture distribuée ou lors de connexions intermittentes.\n\nL'agent installé sur la cible collecte les métriques. En mode passif, le serveur interroge l'agent ; en mode actif, l'agent pousse lui-même les valeurs, ce qui traverse plus facilement un pare-feu. Un template regroupe items, triggers et graphes réutilisables. Un trigger est une expression qui passe en état Problem lorsque le seuil est franchi, et une action définit la notification ou le remède automatique.\n\nLes hôtes sont organisés en groupes, et les droits se gèrent par rôle. Une supervision utile mesure moins mais alerte juste : un trigger trop sensible génère du bruit et masque les incidents réels. On teste toujours un template sur un hôte de recette avant de le déployer.",
+      "bullets": [
+        "Serveur, base de données, interface web, proxy et agent composent Zabbix",
+        "Mode passif : le serveur interroge, mode actif : l'agent pousse",
+        "Un template regroupe items, triggers et graphes",
+        "Un trigger passe en Problem quand son expression devient vraie",
+        "Une action réagit à un événement : notification ou remédiation"
+      ],
+      "code": [
+        "sudo dnf install -y zabbix-agent2",
+        "sudo vi /etc/zabbix/zabbix_agent2.conf",
+        "sudo systemctl enable --now zabbix-agent2",
+        "sudo firewall-cmd --permanent --add-port=10050/tcp",
+        "sudo firewall-cmd --reload",
+        "zabbix_agent2 -t system.uptime"
+      ],
+      "diagram": "        +----------------+\n        |  Zabbix server |\n        |  + database    |\n        |  + web UI      |\n        +--------+-------+\n                 |\n        +--------+--------+\n        |                 |\n   +---------+       +---------+\n   | Proxy   |       | Agent   |\n   | site B  |       | site A  |\n   +----+----+       +---------+\n        |\n   +---------+\n   | Agents  |\n   +---------+\n\nPassif : le serveur interroge.\nActif : l'agent pousse ses valeurs.",
+      "tip": "Le port agent par défaut est 10050 et le port de trafic serveur-proxy est 10051. Les confondre est l'une des causes les plus fréquentes d'agent injoignable."
+    },
+    {
+      "heading": "Mises à jour, snapshots et retour arrière",
+      "body": "Les mises à jour openEuler passent par dnf. Avant toute opération, on vérifie l'espace, on sauvegarde /etc et on identifie le noyau courant. dnf update met à jour l'ensemble, tandis que dnf update nom-paquet cible un composant. dnf history liste les transactions et dnf history undo last tente d'inverser la dernière, mais cette opération n'est pas une garantie absolue, notamment pour le noyau.\n\nLes snapshots offrent un retour arrière plus fiable. snapper, associé à Btrfs ou à LVM thin, crée un point de restauration avant la maintenance. Si le système ne démarre plus, on sélectionne un ancien noyau dans GRUB ou on passe en rescue mode pour réparer depuis un chroot.\n\nPour une migration majeure, x2openEuler analyse la compatibilité des paquets et des configurations. La bonne pratique reste de tester en recette, de documenter la fenêtre de maintenance et de préparer un plan de retour arrière avant de toucher à la production.",
+      "bullets": [
+        "dnf history liste les transactions, undo tente de les inverser",
+        "L'undo n'est pas fiable pour tous les paquets, surtout le noyau",
+        "snapper crée un point de retour arrière sur Btrfs ou LVM thin",
+        "GRUB et le rescue mode permettent de démarrer un noyau de secours",
+        "x2openEuler évalue la compatibilité avant une migration majeure"
+      ],
+      "code": [
+        "sudo dnf check-update",
+        "sudo dnf update -y",
+        "sudo dnf history",
+        "sudo dnf history undo last",
+        "sudo snapper create --description 'avant upgrade'",
+        "sudo grub2-mkconfig -o /boot/grub2/grub.cfg"
+      ],
+      "table": {
+        "headers": [
+          "Moyen",
+          "Portée",
+          "Limite"
+        ],
+        "rows": [
+          [
+            "dnf history undo",
+            "Transaction de paquets",
+            "Ne restaure pas les configurations"
+          ],
+          [
+            "snapper",
+            "Système de fichiers",
+            "Dépend de Btrfs ou LVM thin"
+          ],
+          [
+            "Ancien noyau GRUB",
+            "Démarrage",
+            "Ne corrige pas les paquets applicatifs"
+          ],
+          [
+            "Rescue mode",
+            "Réparation complète",
+            "Intervention manuelle et lente"
+          ]
+        ]
+      },
+      "tip": "dnf history undo last ne restaure pas les fichiers de configuration modifiés à la main. Seul un snapshot ou une sauvegarde de /etc couvre ce cas."
+    }
+  ],
+  "key_points": [
+    "SELinux ajoute un MAC fondé sur des étiquettes à côté du DAC Unix",
+    "Enforcing bloque et journalise, Permissive journalise seulement, Disabled ne charge rien",
+    "Le type est le champ décisif du contexte en politique ciblée",
+    "semanage fcontext crée une règle durable, restorecon l'applique aux fichiers",
+    "setsebool -P persiste un booléen, sans -P il est perdu au redémarrage",
+    "Un AVC se lit avec ausearch -m avc et se corrige par étiquette ou booléen",
+    "auditd trace les accès sensibles, GRUB2 et SSH réduisent la surface d'attaque",
+    "Ansible est sans agent et idempotent, Zabbix supervise par agent actif ou passif"
+  ],
+  "traps": [
+    "Utiliser chcon puis croire l'étiquette durable : un restorecon ou un relabeling l'écrase",
+    "Activer un booléen sans -P et perdre le réglage au redémarrage",
+    "Croire que dnf history undo restaure aussi les fichiers de configuration",
+    "Confondre mode actif et passif dans Zabbix : dans le passif, c'est le serveur qui interroge",
+    "Désactiver SELinux pour faire taire un refus au lieu de corriger l'étiquette ou la politique"
+  ],
+  "quiz": [
+    {
+      "id": "hcip-oe-03-q01",
+      "type": "single",
+      "prompt": "Which SELinux mode logs AVC denials but still allows the operations to proceed?",
+      "options": [
+        "Permissive",
+        "Disabled",
+        "Targeted",
+        "Enforcing"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Permissive autorise les opérations tout en journalisant les refus, ce qui permet d'identifier les règles manquantes sans interrompre le service. Enforcing bloque réellement les accès refusés. Disabled ne charge aucune politique et ne produit donc pas d'AVC, tandis que Targeted désigne un type de politique, pas un mode.",
+      "topic": "SELinux modes"
+    },
+    {
+      "id": "hcip-oe-03-q02",
+      "type": "single",
+      "prompt": "Which command temporarily switches SELinux to permissive mode without changing the configuration file?",
+      "options": [
+        "systemctl stop selinux",
+        "setenforce 0",
+        "setsebool -P selinux off",
+        "semanage mode permissive"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "setenforce 0 bascule immédiatement en Permissive jusqu'au redémarrage ou au retour à Enforcing avec setenforce 1. setsebool agit sur un booléen de politique, pas sur le mode global. semanage mode n'existe pas et SELinux n'est pas un service systemd que l'on arrête ainsi.",
+      "topic": "SELinux mode commands"
+    },
+    {
+      "id": "hcip-oe-03-q03",
+      "type": "single",
+      "prompt": "In a targeted SELinux policy, which field of the security context is the most important for access decisions?",
+      "options": [
+        "user",
+        "role",
+        "type",
+        "sensitivity"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Le type décrit la catégorie de l'objet ou du processus et constitue le critère principal des règles en politique ciblée. Le champ user identifie le type d'utilisateur SELinux et le rôle encadre les transitions. La sensibilité et les catégories relèvent de MLS/MCS et ne sont pas le critère central du modèle ciblé.",
+      "topic": "SELinux contexts"
+    },
+    {
+      "id": "hcip-oe-03-q04",
+      "type": "single",
+      "prompt": "Which command makes a file context change persistent across a full filesystem relabel?",
+      "options": [
+        "restorecon -v /srv/web",
+        "ls -Z /srv/web",
+        "chcon -t httpd_sys_content_t /srv/web",
+        "semanage fcontext -a -t httpd_sys_content_t '/srv/web(/.*)?'"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "semanage fcontext enregistre une règle dans la base de politique, règle qui survit à un relabeling. chcon ne modifie que l'étiquette actuelle et peut être écrasé. restorecon applique une règle existante mais n'en crée pas, et ls -Z se contente d'afficher le contexte.",
+      "topic": "SELinux file contexts"
+    },
+    {
+      "id": "hcip-oe-03-q05",
+      "type": "single",
+      "prompt": "What is the effect of the -P option in setsebool -P httpd_can_network_connect on?",
+      "options": [
+        "It makes the boolean change persistent across reboots",
+        "It prints the current boolean value",
+        "It applies the change only to the httpd process",
+        "It disables the boolean temporarily"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "-P enregistre la valeur dans la politique persistante, de sorte que le booléen reste actif après redémarrage. Sans -P, la modification est immédiate mais temporaire. L'option ne sert ni à afficher la valeur, ni à cibler un processus, ni à désactiver le booléen.",
+      "topic": "SELinux booleans"
+    },
+    {
+      "id": "hcip-oe-03-q06",
+      "type": "single",
+      "prompt": "Which command searches recent SELinux AVC denials in the audit log?",
+      "options": [
+        "journalctl -u auditd",
+        "ausearch -m avc -ts recent",
+        "aureport --login",
+        "auditctl -l"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "ausearch -m avc sélectionne les enregistrements AVC et -ts recent limite la recherche aux événements récents. aureport --login résume les connexions, auditctl -l liste les règles et journalctl -u auditd affiche le journal du service sans filtrer spécifiquement les AVC.",
+      "topic": "SELinux troubleshooting"
+    },
+    {
+      "id": "hcip-oe-03-q07",
+      "type": "single",
+      "prompt": "Which auditctl rule watches /etc/passwd for writes and attribute changes with the tag identity?",
+      "options": [
+        "auditctl -a /etc/passwd -k identity",
+        "auditctl -p wa -w identity",
+        "auditctl -w /etc/passwd -p wa -k identity",
+        "auditctl -w identity -p /etc/passwd -k wa"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "-w désigne le chemin surveillé, -p wa active la surveillance des écritures et des changements d'attributs, et -k associe le tag identity. Les autres formes inversent les rôles des options ou utilisent -a sans les paramètres requis. Cette règle est immédiate mais doit être écrite dans rules.d pour être persistante.",
+      "topic": "auditd rules"
+    },
+    {
+      "id": "hcip-oe-03-q08",
+      "type": "single",
+      "prompt": "How does Ansible connect to managed Linux hosts?",
+      "options": [
+        "Through an SNMP community string",
+        "Through a shared NFS directory",
+        "Through a permanent agent installed on each host",
+        "Over SSH, using Python on the target"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Ansible est sans agent : il se connecte en SSH et exécute des modules Python temporaires sur la cible. Il n'installe pas de démon permanent, ce qui le distingue des outils à agent. SNMP et NFS ne sont pas ses mécanismes de transport.",
+      "topic": "Ansible architecture"
+    },
+    {
+      "id": "hcip-oe-03-q09",
+      "type": "single",
+      "prompt": "Which ansible-playbook option performs a dry run without changing the managed hosts?",
+      "options": [
+        "--check",
+        "--diff",
+        "--limit",
+        "--syntax-check"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "--check simule l'exécution et indique ce qui serait modifié, sans appliquer les changements. --diff montre le contenu des différences mais ne désactive pas l'application. --limit restreint les hôtes ciblés et --syntax-check valide seulement la syntaxe YAML.",
+      "topic": "Ansible execution"
+    },
+    {
+      "id": "hcip-oe-03-q10",
+      "type": "single",
+      "prompt": "Which Zabbix component collects monitoring data on behalf of the server in a distributed deployment?",
+      "options": [
+        "Agent",
+        "Proxy",
+        "Frontend",
+        "Template"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le proxy collecte les données localement et les transmet au serveur, ce qui réduit la charge et gère les sites à connexion intermittente. L'agent collecte sur une seule machine mais ne joue pas ce rôle de relais. Le frontend est l'interface web et le template un ensemble de définitions réutilisables.",
+      "topic": "Zabbix architecture"
+    },
+    {
+      "id": "hcip-oe-03-q11",
+      "type": "multi",
+      "prompt": "Which practices make an Ansible deployment reproducible? (Choose 3)",
+      "options": [
+        "Using handlers to restart services only when needed",
+        "Embedding random shell commands in every task",
+        "Maintaining a versioned inventory",
+        "Writing idempotent tasks"
+      ],
+      "answer": [
+        0,
+        2,
+        3
+      ],
+      "explanation_fr": "Un inventaire versionné décrit l'état du parc, des tâches idempotentes peuvent être rejouées sans effet de bord, et les handlers évitent les redémarrages inutiles. Des commandes shell aléatoires rendent au contraire le résultat imprévisible et difficile à auditer. Elles contournent la logique de modules et nuisent à la reproductibilité.",
+      "topic": "Ansible best practices"
+    },
+    {
+      "id": "hcip-oe-03-q12",
+      "type": "multi",
+      "prompt": "Which commands can modify SELinux file contexts? (Choose 3)",
+      "options": [
+        "chcon",
+        "semanage fcontext",
+        "restorecon",
+        "getenforce"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "chcon modifie l'étiquette réelle, semanage fcontext définit la règle par défaut et restorecon applique cette règle aux fichiers. getenforce ne fait qu'afficher le mode courant et ne touche à aucun contexte. Pour une correction durable, semanage suivi de restorecon est la combinaison attendue.",
+      "topic": "SELinux context management"
+    },
+    {
+      "id": "hcip-oe-03-q13",
+      "type": "multi",
+      "prompt": "Which are valid SELinux modes? (Choose 3)",
+      "options": [
+        "Enforcing",
+        "Permissive",
+        "Disabled",
+        "Auditing"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "SELinux connaît exactement trois modes : Enforcing, Permissive et Disabled. Auditing n'est pas un mode SELinux ; la journalisation des refus existe aussi en Enforcing et en Permissive via auditd. Le mode se règle temporairement avec setenforce ou durablement dans /etc/selinux/config.",
+      "topic": "SELinux modes"
+    },
+    {
+      "id": "hcip-oe-03-q14",
+      "type": "multi",
+      "prompt": "Which components are part of a Zabbix monitoring deployment? (Choose 3)",
+      "options": [
+        "SELinux policy module",
+        "Zabbix server",
+        "Zabbix agent",
+        "Database storage"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "Le serveur centralise la supervision, l'agent collecte les métriques et la base de données stocke configuration et historique. Un module de politique SELinux peut protéger Zabbix mais n'est pas un composant de son architecture. Le proxy est également optionnel selon la topologie.",
+      "topic": "Zabbix components"
+    },
+    {
+      "id": "hcip-oe-03-q15",
+      "type": "tf",
+      "prompt": "In Permissive mode, SELinux records AVC denials in the audit log while allowing the denied operation.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : Permissive journalise le refus mais ne bloque pas l'opération, ce qui en fait un mode de diagnostic utile. Enforcing bloque l'opération en plus de la journaliser. Disabled ne produit ni blocage ni AVC, faute de politique chargée.",
+      "topic": "SELinux modes"
+    },
+    {
+      "id": "hcip-oe-03-q16",
+      "type": "tf",
+      "prompt": "dnf history undo last always restores configuration files modified manually since the transaction.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : dnf history undo agit sur les paquets de la transaction, pas sur les fichiers de configuration édités à la main. Il ne garantit pas non plus un retour arrière propre du noyau. Pour restaurer l'ensemble du système, il faut un snapshot ou une sauvegarde dédiée.",
+      "topic": "Package rollback"
+    },
+    {
+      "id": "hcip-oe-03-q17",
+      "type": "tf",
+      "prompt": "Ansible handlers run only when a task that notifies them reports a change.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : un handler est déclenché par une notification émise lorsqu'une tâche passe en état changed. Si la tâche est déjà conforme et renvoie ok, le handler ne s'exécute pas. Cela évite notamment de redémarrer un service à chaque exécution du playbook.",
+      "topic": "Ansible handlers"
+    },
+    {
+      "id": "hcip-oe-03-q18",
+      "type": "text",
+      "prompt": "Give the command that persistently enables the SELinux boolean httpd_can_network_connect.",
+      "accept": [
+        "setsebool -P httpd_can_network_connect on",
+        "setsebool -P httpd_can_network_connect=on",
+        "setsebool -P httpd_can_network_connect 1",
+        "setsebool -P httpd_can_network_connect=1"
+      ],
+      "sample_answer": "setsebool -P httpd_can_network_connect on",
+      "explanation_fr": "setsebool modifie la valeur d'un booléen et -P l'enregistre dans la politique persistante. La valeur on active l'autorisation de connexion réseau sortante pour httpd. Sans -P, le réglage serait perdu au redémarrage, ce qui provoquerait une panne difficile à relier à SELinux.",
+      "topic": "SELinux boolean command"
+    },
+    {
+      "id": "hcip-oe-03-q19",
+      "type": "text",
+      "prompt": "Which command runs the playbook site.yml with the inventory file hosts?",
+      "accept": [
+        "ansible-playbook -i hosts site.yml",
+        "ansible-playbook site.yml -i hosts"
+      ],
+      "sample_answer": "ansible-playbook -i hosts site.yml",
+      "explanation_fr": "ansible-playbook charge l'inventaire indiqué par -i puis exécute les plays du fichier site.yml. L'ordre des options est souple, mais l'inventaire doit précéder ou suivre immédiatement le nom du playbook. Ajouter --check permettrait une simulation avant l'application réelle.",
+      "topic": "Ansible playbook command"
+    },
+    {
+      "id": "hcip-oe-03-q20",
+      "type": "text",
+      "prompt": "Which command lists all SELinux booleans and their current values?",
+      "accept": [
+        "getsebool -a",
+        "getsebool --all",
+        "semanage boolean -l"
+      ],
+      "sample_answer": "getsebool -a",
+      "explanation_fr": "getsebool -a affiche tous les booléens avec leur état on ou off. semanage boolean -l donne une vue plus détaillée avec la description et la valeur persistante. getenforce, lui, n'affiche que le mode global et ne liste aucun booléen.",
+      "topic": "SELinux boolean commands"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "phase": "HCIE",
+  "subject": "Kunpeng",
+  "name": "Kunpeng — expert : JVM, HPC et migration datacenter",
+  "tagline": "BiSheng avancé, cluster HPC, migration industrielle",
+  "weight": 20,
+  "chapters": [
+    {
+      "id": "hcie-kp-01",
+      "file": "ch01.json",
+      "title": "BiSheng JDK et JVM avancée sur ARM64",
+      "minutes": 75
+    },
+    {
+      "id": "hcie-kp-02",
+      "file": "ch02.json",
+      "title": "Calcul haute performance (HPC) sur Kunpeng",
+      "minutes": 75
+    },
+    {
+      "id": "hcie-kp-03",
+      "file": "ch03.json",
+      "title": "Migration d'un datacenter vers Kunpeng",
+      "minutes": 75
+    }
+  ]
+}

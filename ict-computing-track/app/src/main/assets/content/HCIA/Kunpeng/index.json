@@ -1,0 +1,39 @@
+{
+  "phase": "HCIA",
+  "subject": "Kunpeng",
+  "name": "Kunpeng — cours plateforme complet",
+  "tagline": "Écosystème ARM, portage, optimisation, virtualisation, serveurs TaiShan",
+  "weight": 20,
+  "chapters": [
+    {
+      "id": "hcia-kp-01",
+      "file": "ch01.json",
+      "title": "Écosystème Kunpeng et processeurs ARM",
+      "minutes": 35
+    },
+    {
+      "id": "hcia-kp-02",
+      "file": "ch02.json",
+      "title": "Portage d'applications vers ARM64",
+      "minutes": 40
+    },
+    {
+      "id": "hcia-kp-03",
+      "file": "ch03.json",
+      "title": "Optimisation des performances sur Kunpeng",
+      "minutes": 40
+    },
+    {
+      "id": "hcia-kp-04",
+      "file": "ch04.json",
+      "title": "Noyau, virtualisation et conteneurs sur Kunpeng",
+      "minutes": 40
+    },
+    {
+      "id": "hcia-kp-05",
+      "file": "ch05.json",
+      "title": "Serveurs TaiShan et ateliers pratiques",
+      "minutes": 40
+    }
+  ]
+}

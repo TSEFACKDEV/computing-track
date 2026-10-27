@@ -1,0 +1,669 @@
+{
+  "id": "hcip-kp-03",
+  "phase": "HCIP",
+  "subject": "Kunpeng",
+  "number": 3,
+  "title_fr": "Migration industrielle et déploiement sur Kunpeng",
+  "title_en": "Industrial Migration and Deployment",
+  "minutes": 75,
+  "source": "Pas de Training Material Kunpeng dans les ressources (la gamme Computing Track ne couvre Kunpeng qu'en HCIA) — contenu aligné sur la documentation publique Huawei : x2openEuler, migration ARM64, openGauss et runbooks de bascule.",
+  "objectives": [
+    "Cadrer une migration x86 vers ARM64 avec un inventaire et des critères mesurables",
+    "Exploiter x2openEuler pour évaluer la compatibilité d'un système",
+    "Planifier le portage du code, des dépendances et des données",
+    "Conduire une bascule avec runbook, critères de go/no-go et retour arrière",
+    "Valider en production par tests de fumée, rejeu et canary",
+    "Stabiliser puis clôturer la migration avec un retour d'expérience"
+  ],
+  "sections": [
+    {
+      "heading": "Cadrer la migration avant de toucher aux serveurs",
+      "body": "Une migration d'infrastructure n'est pas un projet de compilation : c'est un projet de continuité de service. Avant de modifier le premier serveur, il faut un inventaire exhaustif : applications, versions, dépendances, bibliothèques natives, bases de données, échanges avec les partenaires, tâches planifiées et scripts oubliés. Les dépendances invisibles, celles qui ne figurent dans aucun schéma, sont la première cause de retard.\n\nLe cadrage définit ensuite les objectifs en langage métier : fenêtre d'indisponibilité acceptable, perte de données tolérable, critères de succès mesurables. Ces éléments se traduisent en RTO et RPO, qui orientent le choix technique : un RPO proche de zéro impose de la réplication, une fenêtre courte impose une bascule préparée plutôt qu'un export nocturne.\n\nEnfin, la gouvernance : un responsable par lot applicatif, un comité de go/no-go, un plan de communication et un plan de retour arrière signé avant le départ. Sans ces documents, la meilleure équipe technique improvisera sous pression.",
+      "bullets": [
+        "Inventaire exhaustif : applications, dépendances natives, données, scripts",
+        "RTO et RPO traduisent les contraintes métier en choix techniques",
+        "Un responsable identifié par lot applicatif",
+        "Plan de retour arrière signé avant le lancement, pas après un incident"
+      ],
+      "code": [
+        "uname -m",
+        "rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\\n' | sort > paquets.txt",
+        "systemctl list-unit-files --state=enabled"
+      ],
+      "table": {
+        "headers": [
+          "Livrable",
+          "Contenu",
+          "Validé par"
+        ],
+        "rows": [
+          [
+            "Inventaire",
+            "Applications, dépendances, flux",
+            "Responsable applicatif"
+          ],
+          [
+            "Fiche de lot",
+            "RTO, RPO, fenêtre, risques",
+            "Métier et DSI"
+          ],
+          [
+            "Runbook",
+            "Étapes, responsables, contrôles",
+            "Équipe d'exploitation"
+          ],
+          [
+            "Plan de rollback",
+            "Déclencheurs, procédure, données",
+            "Comité de go/no-go"
+          ]
+        ]
+      },
+      "exercises": [],
+      "tip": "Un inventaire basé uniquement sur la documentation est incomplet : les paquets installés hors dépôt et les scripts copiés à la main n'y figurent presque jamais."
+    },
+    {
+      "heading": "Évaluer avec x2openEuler",
+      "body": "x2openEuler est l'outil Huawei d'évaluation et de migration vers openEuler. Il analyse un système existant — paquets installés, services, configuration, bibliothèques — et produit un rapport qui distingue ce qui est compatible, ce qui nécessite une adaptation et ce qui doit être remplacé. Il peut aussi préparer la migration des dépôts et des paquets vers la cible.\n\nLa valeur de l'outil vient de l'inventaire automatique. Une analyse manuelle oublie systématiquement les paquets installés hors dépôt, les binaires copiés à la main et les services désactivés mais toujours présents. Le rapport donne une base de discussion chiffrée avec les éditeurs et permet de dimensionner l'effort.\n\nAttention à ne pas confondre migration du système et migration de l'application. x2openEuler traite la couche OS : paquets, dépôts, services. Le code métier, les bibliothèques tierces et les données relèvent d'un plan distinct. Un rapport favorable ne garantit donc jamais que l'application fonctionnera : il faut un test réel sur ARM64.",
+      "bullets": [
+        "x2openEuler évalue la compatibilité des paquets et services vers openEuler",
+        "Le rapport distingue compatible, à adapter et à remplacer",
+        "La migration de l'OS ne couvre pas le code métier ni les données",
+        "Un rapport favorable doit être confirmé par un test applicatif réel"
+      ],
+      "code": [
+        "cat /etc/os-release",
+        "rpm -qa | wc -l",
+        "ldd /opt/app/bin/app | grep 'not found'",
+        "x2openEuler --help"
+      ],
+      "table": {
+        "headers": [
+          "Constat du rapport",
+          "Signification",
+          "Suite à donner"
+        ],
+        "rows": [
+          [
+            "Compatible",
+            "Paquet disponible pour la cible",
+            "Réinstaller et tester"
+          ],
+          [
+            "À adapter",
+            "Version ou configuration différente",
+            "Modifier la configuration"
+          ],
+          [
+            "À remplacer",
+            "Paquet absent ou obsolète",
+            "Choisir une alternative"
+          ],
+          [
+            "Inconnu",
+            "Paquet hors dépôt",
+            "Traiter manuellement"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Le rapport x2openEuler d'un serveur indique 180 paquets compatibles, 12 à adapter et 3 inconnus. L'équipe veut planifier la bascule en une semaine. Quelles questions poser avant d'accepter ce délai ?",
+          "correction": "Il faut d'abord identifier les 3 paquets inconnus : s'ils portent des fonctions critiques, ils peuvent bloquer toute la migration et représentent le vrai risque. Ensuite, examiner les 12 paquets à adapter pour savoir si l'adaptation est une simple configuration ou un changement de version majeur. Il faut aussi vérifier ce que le rapport ne voit pas : binaires copiés à la main, bibliothèques chargées dynamiquement, scripts de démarrage, tâches cron et intégrations avec des systèmes externes. Enfin, confronter le délai aux contraintes métier : une fenêtre d'une semaine n'a de sens que si le retour arrière est testé et si les tests applicatifs sont automatisés. Un rapport de paquets n'est pas une validation applicative."
+        }
+      ],
+      "tip": "Un paquet « inconnu » n'est pas un détail : c'est souvent un composant métier installé manuellement, donc celui qui casse la migration au dernier moment."
+    },
+    {
+      "heading": "Porter le code et les dépendances",
+      "body": "Le portage du code commence par une question simple : d'où vient chaque binaire ? Un projet moderne combine du code maison, des bibliothèques tierces, des modules natifs et parfois des exécutables téléchargés. Chacun doit être disponible en aarch64 ou recompilé.\n\nPour le code C et C++, la chaîne croisée aarch64-linux-gnu-gcc permet de produire un binaire ARM depuis une machine x86, ce qui est utile en intégration continue. L'assembly inline et les intrinsics SSE/AVX doivent être réécrits, remplacés par une implémentation NEON ou par une bibliothèque portable. Les scripts de build contiennent souvent des tests d'architecture en dur : uname -m comparé à x86_64, ou un chemin /usr/lib64 supposé universel.\n\nLes runtimes gérés méritent une attention particulière : un module Python compilé, un binding Node.js ou une extension Ruby doivent être reconstruits. Une simple copie de répertoire donne l'illusion du succès jusqu'au premier import. Enfin, les scripts d'installation et les unités systemd doivent être relus : chemins, noms de paquets, dépendances.",
+      "bullets": [
+        "Recenser chaque binaire et vérifier sa disponibilité en aarch64",
+        "aarch64-linux-gnu-gcc permet la compilation croisée depuis x86",
+        "Remplacer l'assembly et les intrinsics x86, pas seulement les recompiler",
+        "Reconstruire les modules natifs Python, Node.js et Ruby"
+      ],
+      "code": [
+        "aarch64-linux-gnu-gcc -O2 -march=armv8.2-a main.c -o app",
+        "file ./app",
+        "python3 -c \"import numpy; print(numpy.__file__)\"",
+        "grep -rn 'x86_64\\|uname -m' scripts/ install/ 2>/dev/null"
+      ],
+      "table": {
+        "headers": [
+          "Élément",
+          "Risque principal",
+          "Action"
+        ],
+        "rows": [
+          [
+            "Assembly inline",
+            "Instructions inconnues, plantage",
+            "Réécrire ou supprimer"
+          ],
+          [
+            "Intrinsics SSE/AVX",
+            "Compilation impossible ou résultat faux",
+            "Passer à NEON ou au C portable"
+          ],
+          [
+            "Module Python natif",
+            "Import en erreur au démarrage",
+            "Reconstruire le wheel aarch64"
+          ],
+          [
+            "Script d'installation",
+            "Détection d'architecture erronée",
+            "Tester aarch64 explicitement"
+          ],
+          [
+            "Unité systemd",
+            "Chemin ou binaire inexistant",
+            "Relire ExecStart et dépendances"
+          ]
+        ]
+      },
+      "exercises": [],
+      "tip": "Un script qui teste « uname -m = x86_64 » ne casse pas au build : il casse à l'installation, souvent en production et hors fenêtre de maintenance."
+    },
+    {
+      "heading": "Migrer les données : choisir le bon chemin",
+      "body": "Le choix d'une méthode de migration de données se fait sur trois axes : volume, durée de la fenêtre et tolérance à la perte. L'export logique, avec gs_dump et gs_restore, est simple et portable, mais il ralentit la source et devient impraticable au-delà de quelques centaines de gigaoctets dans une fenêtre courte.\n\nLa réplication physique copie les blocs et rejoue les journaux en continu : la cible reste presque synchronisée, et la bascule ne demande qu'un arrêt bref des écritures. Elle exige généralement la même version majeure et une compatibilité stricte entre source et cible, ce qui est restrictif lors d'un changement de moteur.\n\nLa capture de changements, ou CDC, lit le journal des transactions et rejoue les modifications sur la cible. Elle permet une synchronisation continue entre moteurs différents, au prix d'une complexité plus grande et d'un risque d'écart sur les types exotiques.\n\nQuelle que soit la méthode, la preuve d'intégrité repose sur des contrôles objectifs : nombre de lignes par table, sommes de contrôle, comparaison d'échantillons et validation des contraintes.",
+      "bullets": [
+        "Export logique : simple, portable, limité par le volume et la fenêtre",
+        "Réplication physique : bascule courte, mais forte contrainte de compatibilité",
+        "CDC : synchronisation continue entre moteurs différents, plus complexe",
+        "Preuve d'intégrité : comptages, sommes de contrôle, échantillons"
+      ],
+      "code": [
+        "gs_dump -d prod -Fc -f /backup/prod.dump",
+        "gs_restore -d prod_new -j 4 /backup/prod.dump",
+        "gsql -d prod -c 'SELECT count(*) FROM orders;'"
+      ],
+      "table": {
+        "headers": [
+          "Méthode",
+          "Fenêtre d'arrêt",
+          "Quand la choisir"
+        ],
+        "rows": [
+          [
+            "Export logique",
+            "Longue",
+            "Petit volume, changement de moteur"
+          ],
+          [
+            "Réplication physique",
+            "Très courte",
+            "Gros volume, même famille de moteur"
+          ],
+          [
+            "CDC",
+            "Courte",
+            "Synchronisation continue, moteurs différents"
+          ],
+          [
+            "Copie de fichiers",
+            "Longue",
+            "Volume de fichiers, pas une base active"
+          ]
+        ]
+      },
+      "diagram": "Source                    Cible\n+--------+   journaux   +--------+\n|  base  | -----------> |  base  |\n| active |  replication |  ARM64 |\n+--------+              +--------+\n     |                       ^\n     |  gel des ecritures    |\n     +---- cutover ----------+\n          verification : counts + checksums",
+      "exercises": [
+        {
+          "prompt": "Une base de 2 To doit migrer vers openGauss sur Kunpeng avec une fenêtre d'arrêt de 2 heures et un RPO de 5 minutes. Un export gs_dump est-il adapté ? Justifiez et proposez une stratégie.",
+          "correction": "Non : un export logique de 2 To dépasse largement deux heures, et il ne permet pas de rejouer les modifications survenues pendant l'export sans un mécanisme supplémentaire. Avec un RPO de 5 minutes, il faut une synchronisation continue. La stratégie consiste à mettre en place une réplication ou un flux CDC vers la cible, à vérifier régulièrement le retard de synchronisation, puis à geler les écritures le temps de rattraper les dernières transactions. On valide ensuite l'intégrité par comptage de lignes et sommes de contrôle par table, et on conserve la source intacte jusqu'à la fin de la période de garantie. La fenêtre de deux heures sert alors au basculement et aux vérifications, pas au transfert massif."
+        }
+      ],
+      "tip": "Ne confondez pas « copie terminée » et « données cohérentes » : sans comptage ni somme de contrôle, vous ne saurez pas que la migration a perdu des lignes."
+    },
+    {
+      "heading": "Réussir la bascule et préparer le retour arrière",
+      "body": "La bascule est le moment où le risque devient visible. Elle se prépare comme une procédure industrielle : chaque étape a un responsable, une durée estimée, un point de contrôle et un critère d'échec. Le runbook est relu à froid, puis répété au moins une fois sur un environnement de recette.\n\nLe déroulé classique consiste à annoncer le début de la fenêtre, geler les écritures applicatives, vérifier que la réplication a rattrapé son retard, basculer les entrées — adresse virtuelle, DNS ou load balancer — puis démarrer les services sur la cible et exécuter les tests de fumée. Chaque contrôle doit être observable : un simple « ça a l'air bon » ne suffit pas.\n\nLe retour arrière se décide sur des critères écrits, pas sur l'émotion du moment. Si les tests de fumée échouent ou si le taux d'erreur dépasse le seuil, on revient à l'ancien site. Cela suppose que les données écrites sur la cible soient répliquées en sens inverse, ou que l'on accepte de les perdre. Cette décision se prend avant, jamais pendant.",
+      "bullets": [
+        "Chaque étape du runbook a un responsable et un point de contrôle",
+        "Geler les écritures, rattraper la réplication, puis basculer les entrées",
+        "Tests de fumée observables avant d'ouvrir largement le trafic",
+        "Critères de rollback écrits et données inversement répliquées"
+      ],
+      "code": [
+        "kubectl rollout status deploy/app -n prod",
+        "dig +short app.example.com",
+        "ss -lntp | grep ':443'",
+        "tail -f /var/log/app/error.log"
+      ],
+      "diagram": "1. annonce fenetre\n2. gel des ecritures\n3. lag de replication = 0 ?\n4. bascule VIP / DNS\n5. demarrage cible + smoke tests\n6. ouverture du trafic\n   |\n   +-- echec --> retour arriere (DNS + replication inverse)",
+      "exercises": [],
+      "tip": "Baissez le TTL DNS plusieurs heures avant la bascule : un enregistrement à 24 heures de TTL rend le retour arrière beaucoup trop lent."
+    },
+    {
+      "heading": "Valider : tests de fumée, rejeu et canary",
+      "body": "La validation ne se limite pas à vérifier que l'application répond. Elle se construit en couches : tests unitaires hérités du projet, tests d'intégration sur les interfaces réelles, tests de fumée sur les parcours critiques, puis test de charge avec un trafic représentatif du pic.\n\nLe rejeu de traces de production est particulièrement efficace : on rejoue les requêtes réelles, anonymisées, contre la nouvelle plateforme, et on compare les réponses et les latences à celles de la référence. Les écarts de performance se lisent aux percentiles, pas à la moyenne, qui masque les queues de distribution.\n\nLe déploiement progressif ajoute une sécurité : on expose d'abord une petite fraction du trafic, on observe les indicateurs pendant une durée suffisante, puis on élargit. Les critères de poursuite doivent être définis à l'avance : taux d'erreur, latence p99, saturation CPU, files d'attente. Un canary sans critère n'est qu'un déploiement lent.",
+      "bullets": [
+        "Pyramide de validation : unitaire, intégration, fumée, charge",
+        "Le rejeu de traces compare réponses et latences à la référence",
+        "Lire p95 et p99, pas la moyenne",
+        "Canary avec critères de poursuite et d'arrêt définis avant"
+      ],
+      "code": [
+        "kubectl set image deploy/app app=registry/app:1.4 --record",
+        "kubectl rollout status deploy/app",
+        "kubectl rollout undo deploy/app"
+      ],
+      "table": {
+        "headers": [
+          "Porte",
+          "Critère",
+          "Décision si échec"
+        ],
+        "rows": [
+          [
+            "Tests de fumée",
+            "Parcours critiques fonctionnels",
+            "Rollback immédiat"
+          ],
+          [
+            "Latence",
+            "p99 dans la marge convenue",
+            "Geler l'extension du canary"
+          ],
+          [
+            "Erreurs",
+            "Taux sous le seuil",
+            "Rollback ou correction"
+          ],
+          [
+            "Saturation",
+            "CPU et mémoire sous les limites",
+            "Redimensionner avant extension"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Après 30 minutes de canary à 5 pour cent, le taux d'erreur est identique à la référence, la latence p99 a augmenté de 8 pour cent et le throttling CPU est passé de 2 à 18 pour cent. Faut-il étendre à 100 pour cent ? Justifiez.",
+          "correction": "Non, pas encore. Le taux d'erreur stable indique que le service fonctionne, mais la hausse de p99 et surtout le throttling à 18 pour cent montrent que la cible est bridée en CPU. Étendre le trafic aggraverait la contention et ferait probablement apparaître des erreurs. Il faut d'abord soit augmenter la limite CPU, soit réduire la consommation réelle en profilant le service, puis observer de nouveau. La décision doit suivre les critères écrits avant le canary : si la marge de p99 est dépassée, on gèle l'extension. On prolonge l'observation ou on corrige, puis on reprend la montée progressive."
+        }
+      ],
+      "tip": "Un canary qui ne compare que le taux d'erreur rate les régressions de latence : surveillez simultanément p99, throttling et saturation."
+    },
+    {
+      "heading": "Stabiliser, décommissionner et capitaliser",
+      "body": "Après la bascule, la migration entre dans une phase d'hypercare : surveillance renforcée, astreinte dédiée, revue quotidienne des incidents et des métriques. Cette période dure généralement plusieurs semaines ; trente jours sans régression constitue un repère courant pour déclarer la plateforme stable.\n\nLes tâches de cette phase sont moins visibles mais décisives : ajuster les alertes héritées de l'ancien environnement, corriger les scripts d'exploitation, mettre à jour la documentation et former les équipes. Un runbook qui référence encore des chemins x86 est un incident futur.\n\nLa clôture comprend le décommissionnement des serveurs d'origine, après archivage des sauvegardes et vérification qu'aucun flux ne les utilise plus. Elle comprend aussi le retour d'expérience : ce qui a coûté du temps, ce qui a bien fonctionné, et les éléments à intégrer au prochain lot. Le gain économique et énergétique se mesure enfin sur des données réelles, pas sur une projection.",
+      "bullets": [
+        "Hypercare : surveillance renforcée et astreinte dédiée après la bascule",
+        "Trente jours sans régression : repère courant de stabilité",
+        "Mettre à jour alertes, scripts et documentation avant de clôturer",
+        "Décommissionner seulement après archivage et vérification des flux"
+      ],
+      "code": [
+        "systemctl list-units --failed",
+        "journalctl -p err --since '7 days ago'",
+        "df -h",
+        "uptime"
+      ],
+      "table": {
+        "headers": [
+          "Phase",
+          "Durée indicative",
+          "Objectif"
+        ],
+        "rows": [
+          [
+            "Bascule",
+            "Quelques heures",
+            "Service disponible sur la cible"
+          ],
+          [
+            "Hypercare",
+            "2 à 4 semaines",
+            "Détecter les régressions différées"
+          ],
+          [
+            "Stabilisation",
+            "Jusqu'à 30 jours",
+            "Confirmer l'absence de régression"
+          ],
+          [
+            "Clôture",
+            "Quelques jours",
+            "Décommissionner et capitaliser"
+          ]
+        ]
+      },
+      "exercises": [],
+      "tip": "Le projet n'est pas terminé quand la bascule réussit : il l'est quand l'ancien site est décommissionné et que le retour d'expérience est écrit."
+    }
+  ],
+  "key_points": [
+    "L'inventaire précède toute migration : applications, dépendances, données et scripts",
+    "RTO et RPO traduisent les contraintes métier en choix techniques",
+    "x2openEuler évalue la couche OS, pas la validité applicative",
+    "Tout binaire natif doit être disponible ou recompilé pour aarch64",
+    "Export logique, réplication physique et CDC répondent à des contraintes différentes",
+    "Bascule : gel des écritures, rattrapage, switch, tests de fumée",
+    "Rollback décidé sur des critères écrits et préparé avant la bascule",
+    "La migration se termine après une période de stabilité et le décommissionnement"
+  ],
+  "traps": [
+    "Un rapport x2openEuler favorable ne prouve pas que l'application fonctionne : seul un test réel sur ARM64 le montre",
+    "« uname -m » renvoie aarch64 sur Kunpeng, pas arm64 : les scripts comparant à arm64 échouent silencieusement",
+    "Une réplication qui affiche un retard nul ne garantit pas l'intégrité logique : comptages et sommes de contrôle restent nécessaires",
+    "Un TTL DNS élevé rallonge le retour arrière bien au-delà de la fenêtre prévue",
+    "Un canary sans critère d'arrêt écrit à l'avance n'est qu'un déploiement progressif sans garde-fou"
+  ],
+  "quiz": [
+    {
+      "id": "hcip-kp-03-q01",
+      "type": "single",
+      "prompt": "Which Huawei tool assesses an existing system's compatibility for migration to openEuler?",
+      "options": [
+        "x2openEuler",
+        "iSula CLI",
+        "perf top",
+        "Helm"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "x2openEuler analyse les paquets, services et configurations d'un système existant et produit un rapport de compatibilité vers openEuler. iSula est un moteur de conteneurs, perf top un outil de profilage et Helm un gestionnaire de paquets Kubernetes. Aucun de ces trois outils n'évalue la compatibilité d'un système d'exploitation.",
+      "topic": "Évaluation"
+    },
+    {
+      "id": "hcip-kp-03-q02",
+      "type": "single",
+      "prompt": "Which method best proves data integrity after a database migration?",
+      "options": [
+        "Measuring server uptime",
+        "Comparing row counts and checksums table by table",
+        "Reading the application log for warnings",
+        "Checking the replication lag once"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le comptage de lignes et les sommes de contrôle par table donnent une preuve objective que le contenu transféré correspond à la source. Un journal applicatif peut ne signaler aucune erreur alors que des lignes manquent. Un retard de réplication nul indique seulement que le flux est à jour, pas que les données sont identiques, et l'uptime ne dit rien de l'intégrité.",
+      "topic": "Données"
+    },
+    {
+      "id": "hcip-kp-03-q03",
+      "type": "single",
+      "prompt": "During cutover, what is the first controlled action on the source site?",
+      "options": [
+        "Restart all network equipment",
+        "Change the application source code",
+        "Freeze application writes",
+        "Delete the old database"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Il faut d'abord geler les écritures pour que la cible puisse rattraper son retard et rester cohérente au moment du basculement. Supprimer l'ancienne base interdirait tout retour arrière. Redémarrer l'équipement réseau et modifier le code n'ont pas leur place dans une fenêtre de bascule maîtrisée.",
+      "topic": "Bascule"
+    },
+    {
+      "id": "hcip-kp-03-q04",
+      "type": "single",
+      "prompt": "A 2 TB database must move with a 2-hour outage window and a 5-minute RPO. Which approach fits best?",
+      "options": [
+        "A single gs_dump performed during the window",
+        "Copying the data directory after shutting down the source",
+        "Asking users to re-enter their data",
+        "Continuous replication or CDC, then a short write freeze"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Un export logique de 2 To ne tient pas dans deux heures et ne respecte pas un RPO de cinq minutes. La réplication continue ou le CDC maintient la cible presque à jour, puis un gel bref des écritures permet de rattraper les dernières transactions. Copier le répertoire après arrêt allongerait l'indisponibilité et ne garantirait pas la cohérence applicative.",
+      "topic": "Données"
+    },
+    {
+      "id": "hcip-kp-03-q05",
+      "type": "single",
+      "prompt": "What does uname -m print on a Kunpeng server running Linux?",
+      "options": [
+        "aarch64",
+        "arm64",
+        "x86_64",
+        "armv8"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le noyau Linux ARM64 rapporte l'architecture sous le nom aarch64, tandis que arm64 est la convention utilisée par Docker, Go et Kubernetes. Un script qui compare la sortie à arm64 ne se déclenchera donc jamais. C'est une cause fréquente d'échec d'installation silencieux lors d'une migration.",
+      "topic": "Portage"
+    },
+    {
+      "id": "hcip-kp-03-q06",
+      "type": "single",
+      "prompt": "Why should the DNS TTL be lowered several hours before a cutover?",
+      "options": [
+        "To reduce the size of database backups",
+        "So that a rollback or a switch propagates quickly to clients",
+        "To increase the bandwidth of the new site",
+        "To encrypt DNS queries"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Les clients mettent en cache les réponses DNS pendant la durée du TTL. Un TTL de 24 heures signifie qu'une partie du trafic peut continuer à viser l'ancien site très longtemps après le changement. Le baisser à l'avance rend le basculement et le retour arrière beaucoup plus rapides.",
+      "topic": "Bascule"
+    },
+    {
+      "id": "hcip-kp-03-q07",
+      "type": "single",
+      "prompt": "What makes a rollback after cutover possible without losing the writes made on the target?",
+      "options": [
+        "Disabling monitoring during the window",
+        "Increasing the DNS TTL",
+        "Replicating target writes back to the original site, or accepting a defined data loss",
+        "Deleting the target database"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Si des écritures ont eu lieu sur la cible, revenir en arrière sans réplication inverse revient à les perdre. Il faut donc soit répliquer dans l'autre sens, soit décider à l'avance quelle perte est acceptable et l'inscrire dans le plan. Supprimer la base ou couper la surveillance aggraverait l'incident, et augmenter le TTL ralentirait le retour.",
+      "topic": "Bascule"
+    },
+    {
+      "id": "hcip-kp-03-q08",
+      "type": "single",
+      "prompt": "On which basis should a canary deployment be extended to full traffic?",
+      "options": [
+        "The team's confidence after a successful build",
+        "The number of commits merged during the sprint",
+        "The time elapsed since the deployment started",
+        "Predefined error rate, latency and saturation thresholds observed over a sufficient period"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "L'extension du canary doit reposer sur des seuils écrits avant le déploiement : taux d'erreur, latence p99 et saturation. Un build réussi ne dit rien du comportement en charge, et le simple écoulement du temps n'est pas un critère. Le nombre de commits est sans rapport avec la santé du service.",
+      "topic": "Validation"
+    },
+    {
+      "id": "hcip-kp-03-q09",
+      "type": "single",
+      "prompt": "In gs_dump, what does the -Fc option produce?",
+      "options": [
+        "A custom-format archive suitable for gs_restore",
+        "A plain SQL text file",
+        "A tar archive of the data directory",
+        "A CSV export of a single table"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "-Fc demande le format personnalisé, compressé, que gs_restore sait lire et paralléliser avec -j. Le format texte simple correspond à -Fp, l'archive tar à -Ft, et l'export CSV relève de COPY ou de \\copy. Le format personnalisé est le choix courant pour une sauvegarde destinée à être restaurée.",
+      "topic": "Données"
+    },
+    {
+      "id": "hcip-kp-03-q10",
+      "type": "single",
+      "prompt": "Which element is NOT sufficient to declare a migration complete?",
+      "options": [
+        "A return-of-experience report is written",
+        "The build succeeds on the new platform",
+        "A defined period without production regressions",
+        "The old servers are decommissioned"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un build réussi ne prouve ni la correction fonctionnelle, ni la performance, ni la stabilité en production. La clôture s'appuie sur une période d'observation sans régression, le décommissionnement de l'ancien site et un retour d'expérience. Le build n'est qu'une étape technique intermédiaire.",
+      "topic": "Clôture"
+    },
+    {
+      "id": "hcip-kp-03-q11",
+      "type": "single",
+      "prompt": "Why are install scripts that compare uname -m with x86_64 dangerous during a migration?",
+      "options": [
+        "They automatically reformat the disk",
+        "They disable the network interface",
+        "They silently take the wrong branch on aarch64 and may skip required steps",
+        "They prevent the kernel from booting"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Sur Kunpeng, uname -m renvoie aarch64 : la comparaison avec x86_64 est fausse et le script emprunte la mauvaise branche, souvent sans message d'erreur. L'installation peut alors se terminer en apparence tout en omettant des étapes. Il faut tester explicitement aarch64 et x86_64 plutôt que de supposer une valeur.",
+      "topic": "Portage"
+    },
+    {
+      "id": "hcip-kp-03-q12",
+      "type": "multi",
+      "prompt": "Which channels are valid for migrating database data to a new platform? (Choose 3)",
+      "options": [
+        "Copying only the configuration files",
+        "Logical dump and restore",
+        "Physical replication",
+        "Change data capture"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "L'export logique, la réplication physique et le CDC sont trois voies éprouvées, adaptées à des volumes et des fenêtres différents. Copier uniquement les fichiers de configuration ne transfère aucune donnée métier. Le choix entre les trois dépend du volume, du RPO et de la compatibilité des moteurs.",
+      "topic": "Données"
+    },
+    {
+      "id": "hcip-kp-03-q13",
+      "type": "multi",
+      "prompt": "Which observations justify extending a canary to full traffic? (Choose 3)",
+      "options": [
+        "p99 latency shows no regression",
+        "The deployment script ran without syntax errors",
+        "Smoke tests pass on critical flows",
+        "The error rate stays within the agreed threshold"
+      ],
+      "answer": [
+        0,
+        2,
+        3
+      ],
+      "explanation_fr": "Les tests de fumée valident les parcours critiques, le taux d'erreur confirme la stabilité et la latence p99 vérifie l'expérience réelle. Un script sans erreur de syntaxe ne garantit rien sur le comportement du service en charge. Ces trois critères doivent être observés sur une durée suffisante avant d'élargir.",
+      "topic": "Validation"
+    },
+    {
+      "id": "hcip-kp-03-q14",
+      "type": "multi",
+      "prompt": "Which items belong in a pre-migration inventory? (Choose 3)",
+      "options": [
+        "Scheduled jobs and integration scripts",
+        "The personal calendar of the project manager",
+        "Installed packages and their architectures",
+        "Native libraries and external binaries"
+      ],
+      "answer": [
+        0,
+        2,
+        3
+      ],
+      "explanation_fr": "L'inventaire doit couvrir les paquets, les bibliothèques natives, les binaires externes, les tâches planifiées et les scripts d'intégration, car ce sont les dépendances qui cassent le plus souvent. Le calendrier personnel du chef de projet n'a aucun rôle technique dans l'évaluation. Un inventaire incomplet se traduit par des surprises pendant la fenêtre de bascule.",
+      "topic": "Cadrage"
+    },
+    {
+      "id": "hcip-kp-03-q15",
+      "type": "tf",
+      "prompt": "The rollback plan must be prepared and tested before the cutover, not improvised after a failure.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le plan de retour arrière définit les déclencheurs, la procédure, les responsabilités et le traitement des données écrites sur la cible. Il se teste sur un environnement de recette avant la bascule. L'improviser pendant un incident revient à ajouter du risque à un système déjà dégradé.",
+      "topic": "Bascule"
+    },
+    {
+      "id": "hcip-kp-03-q16",
+      "type": "tf",
+      "prompt": "A migration is complete as soon as the application builds successfully on ARM64.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un build réussi ne démontre ni la correction fonctionnelle, ni la performance, ni la stabilité. La migration se termine après une période d'observation sans régression et le décommissionnement de l'ancien site. Le build est une condition nécessaire mais largement insuffisante.",
+      "topic": "Clôture"
+    },
+    {
+      "id": "hcip-kp-03-q17",
+      "type": "tf",
+      "prompt": "QEMU emulation is an acceptable basis for the final performance validation of an ARM64 migration.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "L'émulation ajoute un surcoût variable qui ne reflète pas le comportement d'un processeur ARM64 natif. Elle peut servir à vérifier qu'un binaire démarre, pas à valider des latences ou un débit. La validation finale exige du matériel ARM réel et une charge représentative.",
+      "topic": "Validation"
+    },
+    {
+      "id": "hcip-kp-03-q18",
+      "type": "text",
+      "prompt": "Which gs_dump command exports database prod in custom format to /backup/prod.dump?",
+      "accept": [
+        "gs_dump -d prod -Fc -f /backup/prod.dump",
+        "gs_dump -d prod -f /backup/prod.dump -Fc",
+        "gs_dump -d prod -F c -f /backup/prod.dump"
+      ],
+      "sample_answer": "gs_dump -d prod -Fc -f /backup/prod.dump",
+      "explanation_fr": "gs_dump -d désigne la base, -Fc demande le format personnalisé compressé et -f indique le fichier de sortie. Ce format est celui que gs_restore lit le plus efficacement, avec parallélisation possible. Un export en texte simple utiliserait -Fp.",
+      "topic": "Données"
+    },
+    {
+      "id": "hcip-kp-03-q19",
+      "type": "text",
+      "prompt": "Which kubectl command reports the progress of a rolling update for deployment app?",
+      "accept": [
+        "kubectl rollout status deploy/app",
+        "kubectl rollout status deployment/app",
+        "kubectl rollout status deployment app"
+      ],
+      "sample_answer": "kubectl rollout status deploy/app",
+      "explanation_fr": "kubectl rollout status suit l'avancement du déploiement jusqu'à ce que les réplicas soient disponibles, ou signale un blocage. Il permet d'attendre explicitement la fin d'une mise à jour avant de lancer les tests de fumée. kubectl rollout undo annule, mais ne surveille pas.",
+      "topic": "Bascule"
+    },
+    {
+      "id": "hcip-kp-03-q20",
+      "type": "text",
+      "prompt": "Which Linux command prints the machine hardware architecture, for example aarch64?",
+      "accept": [
+        "uname -m",
+        "uname --machine",
+        "arch"
+      ],
+      "sample_answer": "uname -m",
+      "explanation_fr": "uname -m affiche le nom matériel de l'architecture, qui vaut aarch64 sur un serveur ARM64 Linux. Il ne faut pas le confondre avec uname -r, qui donne la version du noyau. Les scripts de migration doivent tester cette valeur explicitement plutôt que de supposer x86_64.",
+      "topic": "Portage"
+    }
+  ]
+}

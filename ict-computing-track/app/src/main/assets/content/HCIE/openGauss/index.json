@@ -1,0 +1,27 @@
+{
+  "phase": "HCIE",
+  "subject": "openGauss",
+  "name": "openGauss — expert : transactions, optimizer et dépannage",
+  "tagline": "MVCC, hints avancés, diagnostics expert et recovery",
+  "weight": 30,
+  "chapters": [
+    {
+      "id": "hcie-og-01",
+      "file": "ch01.json",
+      "title": "Transactions, MVCC et gestion des blocages",
+      "minutes": 90
+    },
+    {
+      "id": "hcie-og-02",
+      "file": "ch02.json",
+      "title": "Optimizer et SQL avancé",
+      "minutes": 90
+    },
+    {
+      "id": "hcie-og-03",
+      "file": "ch03.json",
+      "title": "Dépannage expert openGauss",
+      "minutes": 85
+    }
+  ]
+}

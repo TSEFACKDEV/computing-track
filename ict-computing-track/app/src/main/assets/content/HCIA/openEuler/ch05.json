@@ -1,0 +1,662 @@
+{
+  "id": "hcia-oe-05",
+  "phase": "HCIA",
+  "subject": "openEuler",
+  "number": 5,
+  "title_fr": "Scripts bash, cron et conteneurs iSula",
+  "title_en": "Bash Scripts, cron, and iSula Containers",
+  "minutes": 55,
+  "source": "HCIA-openEuler V2.0 Training Material — Sessions «Shell Basics» et «iSula Containers» · Lab Guide (shell, scripts, conteneurs)",
+  "objectives": [
+    "Écrire, rendre exécutable et sécuriser un script bash simple",
+    "Utiliser variables, arguments, conditions, boucles et fonctions",
+    "Planifier une tâche récurrente avec cron et diagnostiquer son environnement",
+    "Gérer le cycle de vie d'un conteneur avec isula et isulad",
+    "Appliquer des bonnes pratiques d'idempotence et de journalisation"
+  ],
+  "sections": [
+    {
+      "heading": "1. Anatomie d'un script bash",
+      "body": "Un script bash est un fichier texte contenant une suite de commandes exécutées par l'interpréteur. La première ligne, appelée shebang, indique quel interpréteur utiliser : #!/bin/bash. Sans elle, le fichier peut être exécuté par un autre shell ou échouer selon la façon dont il est lancé.\n\nPour rendre un script exécutable, on utilise chmod +x script.sh, puis on le lance avec ./script.sh. On peut aussi l'exécuter avec bash script.sh, ce qui ignore le bit exécutable mais utilise explicitement Bash. Le répertoire courant n'est pas dans le PATH par défaut : ./ est donc nécessaire pour lancer un script local.\n\nUn bon script commence par des commentaires décrivant son objectif, puis par des garde-fous. set -e arrête l'exécution à la première erreur, set -u refuse les variables non définies et set -o pipefail fait échouer un tube si l'une de ses commandes échoue. Ces trois options évitent qu'une erreur silencieuse produise un résultat incohérent.",
+      "bullets": [
+        "#!/bin/bash indique l'interpréteur du script",
+        "chmod +x puis ./script.sh pour exécuter localement",
+        "bash script.sh exécute sans se soucier du bit exécutable",
+        "set -e, set -u et set -o pipefail renforcent la robustesse",
+        "Des commentaires en tête documentent l'objectif et les paramètres"
+      ],
+      "code": [
+        "#!/bin/bash",
+        "set -euo pipefail",
+        "echo \"Bonjour $USER\"",
+        "",
+        "chmod +x bonjour.sh",
+        "./bonjour.sh"
+      ],
+      "exercises": [
+        {
+          "prompt": "Écris un script bonjour.sh qui affiche un message d'accueil, s'arrête en cas d'erreur et refuse les variables non définies. Indique aussi comment le rendre exécutable et le lancer.",
+          "correction": "Le fichier commence par #!/bin/bash, puis set -euo pipefail, puis echo \"Bonjour $USER\". On le rend exécutable avec chmod +x bonjour.sh et on le lance avec ./bonjour.sh. L'option -e arrête à la première commande en échec, -u traite une variable non définie comme une erreur et pipefail propage l'échec dans un tube."
+        }
+      ],
+      "tip": "Un script exécuté avec bash script.sh n'a pas besoin du bit x, mais il utilise Bash même si le shebang désigne un autre interpréteur. Le shebang ne s'applique que lors d'une exécution directe."
+    },
+    {
+      "heading": "2. Variables, quoting et arguments",
+      "body": "Une variable stocke une valeur nommée. En bash, l'affectation s'écrit NOM=valeur, sans espace autour du signe égal, et la lecture s'écrit $NOM. Les guillemets doubles préservent les espaces et développent les variables ; les guillemets simples empêchent toute expansion. \"$NOM\" est donc plus sûr que $NOM lorsque la valeur peut contenir des espaces.\n\nLes variables d'environnement sont exportées aux processus enfants par export NOM=valeur. PATH, HOME, USER et LANG en sont des exemples. Une variable locale à une fonction se déclare avec local pour ne pas polluer l'espace global.\n\nLes arguments positionnels sont accessibles par $1, $2, etc. $0 contient le nom du script, $# le nombre d'arguments, $@ la liste complète et $? le code de retour de la dernière commande. read -p \"Nom : \" nom demande une saisie. Toute variable lue dans un calcul doit être protégée : \"$1\" évite qu'un argument contenant des espaces soit découpé en plusieurs mots.",
+      "bullets": [
+        "Affectation NOM=valeur sans espaces ; lecture $NOM",
+        "Guillemets doubles : expansion ; guillemets simples : littéral",
+        "export transmet une variable aux processus enfants",
+        "$0 = script, $1..$n = arguments, $# = nombre, $? = code retour",
+        "Toujours citer \"$variable\" pour préserver les espaces"
+      ],
+      "code": [
+        "nom=\"openEuler\"",
+        "echo \"Distribution : $nom\"",
+        "export PATH=\"$PATH:/opt/bin\"",
+        "./deploy.sh /data/app \"serveur principal\"",
+        "echo \"Arguments : $# - $@\""
+      ],
+      "table": {
+        "headers": [
+          "Variable",
+          "Contenu"
+        ],
+        "rows": [
+          [
+            "$0",
+            "Nom du script"
+          ],
+          [
+            "$1 ... $9",
+            "Arguments positionnels"
+          ],
+          [
+            "$#",
+            "Nombre d'arguments"
+          ],
+          [
+            "$@",
+            "Liste de tous les arguments"
+          ],
+          [
+            "$?",
+            "Code retour de la dernière commande"
+          ],
+          [
+            "$$",
+            "PID du shell courant"
+          ]
+        ]
+      },
+      "tip": "Sans guillemets, $1 contenant « mon fichier » est découpé en deux arguments. C'est la cause n°1 de bugs de scripts, surtout avec des noms de fichiers contenant des espaces."
+    },
+    {
+      "heading": "3. Conditions et tests",
+      "body": "Les structures conditionnelles permettent d'adapter le comportement du script. La forme de base est if condition; then commandes; elif autre_condition; then commandes; else commandes; fi. La condition est une commande dont le code de retour est testé : 0 signifie vrai, tout autre code signifie faux. C'est l'inverse de la plupart des langages, où 0 est faux.\n\nLe test [ ... ] évalue des expressions. -f fichier est vrai si c'est un fichier régulier, -d si c'est un répertoire, -x si c'est exécutable, -z chaîne si la chaîne est vide. Pour les nombres, on utilise -eq, -ne, -lt, -le, -gt et -ge ; pour les chaînes, = et !=. [[ ... ]] est une extension Bash plus sûre, qui gère mieux les motifs et les espaces.\n\nLa commande case compare une valeur à plusieurs motifs et évite une longue cascade de if. Les opérateurs && et || enchaînent des commandes selon leur succès : commande1 && commande2 n'exécute la seconde que si la première réussit. Un script robuste vérifie ses arguments avant d'agir.",
+      "bullets": [
+        "if teste un code retour : 0 = succès, donc vrai",
+        "-f fichier, -d répertoire, -x exécutable, -z chaîne vide",
+        "-eq, -ne, -lt, -gt pour les nombres ; = et != pour les chaînes",
+        "[[ ]] est plus sûr que [ ] en Bash",
+        "case et &&/|| simplifient les choix multiples"
+      ],
+      "code": [
+        "if [ -f /etc/nginx/nginx.conf ]; then",
+        "  echo \"configuration presente\"",
+        "else",
+        "  echo \"configuration absente\" >&2",
+        "fi",
+        "",
+        "if [ \"$#\" -lt 1 ]; then exit 1; fi",
+        "systemctl is-active sshd && echo actif || echo arrete"
+      ],
+      "table": {
+        "headers": [
+          "Test",
+          "Vrai si..."
+        ],
+        "rows": [
+          [
+            "[ -f chemin ]",
+            "Le chemin est un fichier régulier"
+          ],
+          [
+            "[ -d chemin ]",
+            "Le chemin est un répertoire"
+          ],
+          [
+            "[ -x chemin ]",
+            "Le chemin est exécutable"
+          ],
+          [
+            "[ -z \"$var\" ]",
+            "La chaîne est vide"
+          ],
+          [
+            "[ \"$a\" -eq \"$b\" ]",
+            "Les deux entiers sont égaux"
+          ],
+          [
+            "[ \"$a\" = \"$b\" ]",
+            "Les deux chaînes sont identiques"
+          ]
+        ]
+      },
+      "tip": "En bash, 0 signifie vrai car c'est un code de retour de succès. Une condition if [ 0 ] est donc vraie, tandis que if [ 1 ] est fausse : ne transpose pas la logique des langages classiques."
+    },
+    {
+      "heading": "4. Boucles et fonctions",
+      "body": "Les boucles répètent un traitement. for parcourt une liste de valeurs : for fichier in *.log; do echo \"$fichier\"; done. La liste peut venir d'un glob, d'une suite numérique ou d'une commande. while répète tant qu'une condition est vraie, et until répète jusqu'à ce qu'elle le devienne.\n\nPour lire un fichier ligne par ligne, la forme recommandée est while IFS= read -r ligne; do ...; done < fichier. IFS= préserve les espaces de début et de fin, et -r empêche l'interprétation des antislashs. Une boucle for sur la sortie de cat découpe les lignes en mots et produit des erreurs subtiles.\n\nLes fonctions regroupent du code réutilisable : nom() { commandes; }. Les arguments d'une fonction sont accessibles par $1, $2, etc., comme ceux du script. local limite la portée d'une variable à la fonction, et return fixe le code de retour. Les fonctions rendent un script lisible et testable.",
+      "bullets": [
+        "for parcourt une liste, while répète selon une condition",
+        "while IFS= read -r ligne est la bonne façon de lire un fichier",
+        "Une fonction se déclare nom() { ...; }",
+        "local limite la portée d'une variable",
+        "return fixe le code de retour d'une fonction"
+      ],
+      "code": [
+        "for f in /var/log/*.log; do",
+        "  echo \"Traitement de $f\"",
+        "done",
+        "",
+        "while IFS= read -r ligne; do",
+        "  echo \"$ligne\"",
+        "done < /etc/hosts",
+        "",
+        "compter() {",
+        "  local fichier=\"$1\"",
+        "  wc -l \"$fichier\"",
+        "}"
+      ],
+      "tip": "Ne lis jamais un fichier avec for ligne in $(cat fichier) : le découpage se fait sur les espaces, pas sur les lignes, et les lignes vides disparaissent. Utilise while read."
+    },
+    {
+      "heading": "5. Planifier avec cron",
+      "body": "cron exécute des commandes à des moments planifiés. Chaque utilisateur possède sa crontab, modifiable avec crontab -e et consultable avec crontab -l. Une ligne contient cinq champs de temps suivis de la commande : minute, heure, jour du mois, mois, jour de la semaine. Les valeurs vont de 0 à 59 pour les minutes, de 0 à 23 pour les heures, de 1 à 31 pour le jour, de 1 à 12 pour le mois et de 0 à 7 pour le jour de la semaine, 0 et 7 désignant dimanche.\n\nLes caractères spéciaux évitent les répétitions. * signifie toutes les valeurs, */10 toutes les dix unités, 1-5 une plage et 1,15 une liste. 0 3 * * * exécute la commande chaque jour à 3 h 00. @reboot exécute au démarrage. Les sorties de cron sont généralement envoyées par mail à l'utilisateur ; sans serveur de messagerie, elles sont perdues, d'où l'intérêt de rediriger vers un fichier de journal.\n\nLe piège classique est l'environnement : cron ne charge pas le profil interactif et son PATH est minimal. Une commande qui fonctionne dans le terminal peut échouer dans cron. Utilise des chemins absolus et définis PATH dans la crontab ou dans le script.",
+      "bullets": [
+        "Cinq champs : minute, heure, jour du mois, mois, jour de la semaine",
+        "0 3 * * * = chaque jour à 3 h 00 ; */10 = toutes les dix minutes",
+        "crontab -e édite, crontab -l liste les tâches",
+        "cron ne charge pas le profil interactif : PATH est minimal",
+        "Rediriger stdout et stderr vers un journal pour ne rien perdre"
+      ],
+      "code": [
+        "crontab -e",
+        "0 3 * * * /usr/local/bin/sauvegarde.sh >> /var/log/sauvegarde.log 2>&1",
+        "*/10 * * * * /usr/local/bin/verifier.sh",
+        "crontab -l",
+        "@reboot /usr/local/bin/init.sh"
+      ],
+      "diagram": "Champ :   minute  heure  jour  mois  jour_semaine   commande\nExemple:     0       3      *     *         *        /root/daily.sh\n\n0 3 * * *   -> tous les jours a 03:00\n*/10 * * * * -> toutes les 10 minutes\n0 3 * * 0   -> chaque dimanche a 03:00\n\nOrdre a retenir : Min Heure Jour Mois Semaine",
+      "table": {
+        "headers": [
+          "Expression",
+          "Signification"
+        ],
+        "rows": [
+          [
+            "0 3 * * *",
+            "Chaque jour à 03 h 00"
+          ],
+          [
+            "*/10 * * * *",
+            "Toutes les dix minutes"
+          ],
+          [
+            "0 3 * * 0",
+            "Chaque dimanche à 03 h 00"
+          ],
+          [
+            "0 0 1 * *",
+            "Le premier jour de chaque mois à minuit"
+          ],
+          [
+            "@reboot",
+            "Au démarrage de la machine"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Planifie /usr/local/bin/sauvegarde.sh chaque jour à 02 h 30, en conservant sa sortie et ses erreurs dans /var/log/sauvegarde.log. Donne la ligne crontab.",
+          "correction": "30 2 * * * /usr/local/bin/sauvegarde.sh >> /var/log/sauvegarde.log 2>&1. Les champs 30 et 2 correspondent à 02 h 30 ; les trois étoiles couvrent tous les jours, tous les mois et tous les jours de la semaine. >> ajoute au journal sans l'écraser, et 2>&1 y envoie aussi les erreurs. Le chemin doit être absolu car le PATH de cron est minimal."
+        }
+      ],
+      "tip": "30 3 * * * signifie 03 h 30, pas 30 minutes après 03 h 30 de façon répétée. Et * 3 * * * s'exécuterait à chaque minute de la troisième heure : ne mets pas * dans le champ des minutes quand tu veux une exécution unique."
+    },
+    {
+      "heading": "6. Conteneurs avec iSula",
+      "body": "iSula est le moteur de conteneurs d'openEuler. Un conteneur partage le noyau de l'hôte et isole les processus grâce aux namespaces et aux cgroups : il est plus léger qu'une machine virtuelle, mais moins isolé. Le démon isulad tourne en arrière-plan et le client isula lui parle via un socket.\n\nLes commandes essentielles ressemblent à celles de Docker : isula pull télécharge une image, isula images liste les images, isula run crée et démarre un conteneur, isula ps liste les conteneurs en cours, isula exec exécute une commande dans un conteneur actif, isula stop l'arrête et isula rm le supprime. isula rmi supprime une image.\n\nLes options de isula run sont importantes : -d détache le conteneur, --name lui donne un nom, -p 8080:80 publie le port 80 du conteneur sur le port 8080 de l'hôte et -v /data:/app monte un volume. Un conteneur dont le processus principal se termine s'arrête : il faut un programme qui reste au premier plan. isula logs affiche sa sortie standard.",
+      "bullets": [
+        "isulad est le démon, isula le client en ligne de commande",
+        "Un conteneur partage le noyau de l'hôte, contrairement à une VM",
+        "run crée, ps liste, exec entre, stop arrête, rm supprime",
+        "-p hôte:conteneur publie un port ; -v monte un volume",
+        "Le conteneur s'arrête quand son processus principal se termine"
+      ],
+      "code": [
+        "isula pull nginx",
+        "isula images",
+        "isula run -d --name web -p 8080:80 nginx",
+        "isula ps",
+        "isula exec -it web /bin/bash",
+        "isula logs web",
+        "isula stop web && isula rm web"
+      ],
+      "diagram": "Client isula  <---- socket ---->  isulad (demon)\n                                      |\n                                      v\n                         +--------------------------+\n                         | Conteneur web            |\n                         | processus isoles         |\n                         | noyau partage avec l'hote|\n                         +--------------------------+\n                               | port 80\n                               v\n                         hote : port 8080 (-p 8080:80)",
+      "table": {
+        "headers": [
+          "Commande",
+          "Rôle"
+        ],
+        "rows": [
+          [
+            "isula pull",
+            "Télécharger une image"
+          ],
+          [
+            "isula run -d",
+            "Créer et démarrer en arrière-plan"
+          ],
+          [
+            "isula ps",
+            "Lister les conteneurs en cours"
+          ],
+          [
+            "isula exec -it",
+            "Ouvrir un shell dans un conteneur actif"
+          ],
+          [
+            "isula logs",
+            "Afficher la sortie du conteneur"
+          ],
+          [
+            "isula rm / rmi",
+            "Supprimer un conteneur / une image"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Lance un conteneur nginx nommé web, détaché, en publiant le port 80 du conteneur sur le port 8080 de l'hôte. Donne la commande et explique comment vérifier puis entrer dans le conteneur.",
+          "correction": "isula run -d --name web -p 8080:80 nginx. -d détache le processus, --name fixe le nom et -p 8080:80 associe le port hôte 8080 au port conteneur 80. On vérifie avec isula ps, on consulte la sortie avec isula logs web et on entre dans le conteneur avec isula exec -it web /bin/bash, à condition que l'image contienne un shell."
+        }
+      ],
+      "tip": "L'ordre de -p est hôte:conteneur. -p 8080:80 publie le port 80 du conteneur sur 8080 de l'hôte. L'inverser est l'erreur la plus fréquente des exercices iSula."
+    },
+    {
+      "heading": "7. Robustesse, idempotence et diagnostic",
+      "body": "Un script utile est compris par quelqu'un d'autre six mois plus tard. Quelques règles simples améliorent la qualité : un en-tête décrivant l'objectif et les paramètres, des noms de variables explicites, des guillemets autour des expansions, et des messages d'erreur qui indiquent quoi faire. shellcheck, s'il est installé, détecte automatiquement de nombreuses erreurs de quoting et de logique.\n\nL'idempotence est la capacité d'un script à produire le même résultat même s'il est relancé. mkdir -p, dnf install -y ou une vérification avant création évitent les échecs au second passage. Un script de déploiement doit pouvoir être rejoué sans casser l'existant.\n\nLe diagnostic se prépare dès l'écriture : journaliser les étapes importantes, capturer les codes de retour, et séparer les sorties normales des erreurs. Pour les tâches planifiées, rediriger stdout et stderr vers un fichier daté. Pour les conteneurs, isula logs et isula inspect sont les premiers réflexes avant de recréer une instance.",
+      "bullets": [
+        "En-tête, noms explicites, guillemets et messages d'erreur clairs",
+        "Idempotence : rejouer le script sans casser l'existant",
+        "mkdir -p et les vérifications préalables évitent les erreurs au second passage",
+        "Journaliser les étapes et capturer les codes de retour",
+        "isula logs et isula inspect avant de recréer un conteneur"
+      ],
+      "code": [
+        "command -v shellcheck && shellcheck deploy.sh",
+        "mkdir -p /data/app",
+        "if ! systemctl is-enabled sshd >/dev/null 2>&1; then systemctl enable sshd; fi",
+        "isula inspect web",
+        "isula logs --tail 50 web"
+      ],
+      "table": {
+        "headers": [
+          "Besoin",
+          "Réflexe"
+        ],
+        "rows": [
+          [
+            "Script rejouable",
+            "Tester l'existence avant de créer"
+          ],
+          [
+            "Erreur silencieuse",
+            "set -euo pipefail et codes de retour"
+          ],
+          [
+            "Tâche cron sans sortie",
+            "Rediriger vers un journal daté"
+          ],
+          [
+            "Conteneur qui redémarre",
+            "isula logs et isula inspect"
+          ],
+          [
+            "Qualité du script",
+            "shellcheck"
+          ]
+        ]
+      },
+      "tip": "Un conteneur qui s'arrête immédiatement n'est pas forcément en panne : son processus principal s'est peut-être terminé. Consulte isula logs avant de conclure à un problème d'image."
+    }
+  ],
+  "key_points": [
+    "Le shebang #!/bin/bash désigne l'interpréteur du script",
+    "set -euo pipefail transforme les erreurs silencieuses en échecs visibles",
+    "Les guillemets autour des variables préservent les espaces",
+    "$# compte les arguments, $? contient le code retour",
+    "En bash, un code retour 0 signifie succès et donc vrai",
+    "cron utilise cinq champs : minute, heure, jour, mois, jour de semaine",
+    "cron ne charge pas le profil : utiliser des chemins absolus",
+    "iSula partage le noyau de l'hôte ; isula exec entre dans un conteneur actif"
+  ],
+  "traps": [
+    "Écrire if [ $? -eq 0 ] après une autre commande et tester le mauvais code retour",
+    "Oublier les guillemets et casser les chemins contenant des espaces",
+    "Croire que 0 est faux dans un test bash",
+    "Planifier */10 dans le champ des minutes en croyant obtenir une fois par jour",
+    "Inverser l'ordre de -p dans isula run"
+  ],
+  "quiz": [
+    {
+      "id": "hcia-oe-05-q01",
+      "type": "single",
+      "prompt": "Which shell variable holds the exit status of the last executed command?",
+      "options": [
+        "$?",
+        "$$",
+        "$@",
+        "$#"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "$? contient le code retour de la dernière commande : 0 indique un succès, une autre valeur un échec. $# donne le nombre d'arguments, $$ le PID du shell et $@ la liste des arguments.",
+      "topic": "Bash variables"
+    },
+    {
+      "id": "hcia-oe-05-q02",
+      "type": "single",
+      "prompt": "Which cron entry runs a task every day at 03:00?",
+      "options": [
+        "* 3 * * * /root/daily.sh",
+        "0 3 * * * /root/daily.sh",
+        "30 3 * * 0 /root/daily.sh",
+        "3 0 * * * /root/daily.sh"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "0 3 * * * signifie minute 0, heure 3, tous les jours, tous les mois et tous les jours de la semaine. * 3 * * * s'exécuterait à chaque minute de la troisième heure, 30 3 * * 0 vise le dimanche à 03 h 30 et 3 0 * * * vise 00 h 03.",
+      "topic": "cron"
+    },
+    {
+      "id": "hcia-oe-05-q03",
+      "type": "single",
+      "prompt": "In iSula, which command enters a running container to execute a shell?",
+      "options": [
+        "isula restart",
+        "isula run",
+        "isula exec",
+        "isula attach"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "isula exec exécute un processus dans un conteneur existant et en marche, par exemple isula exec -it web /bin/bash. isula run crée un nouveau conteneur, isula attach se connecte au processus principal sans en lancer un nouveau et isula restart redémarre le conteneur.",
+      "topic": "iSula"
+    },
+    {
+      "id": "hcia-oe-05-q04",
+      "type": "multi",
+      "prompt": "Which constructs capture the output of a command into a variable? (Choose two.)",
+      "options": [
+        "$(command)",
+        "backticks `command`",
+        "| command",
+        "$command"
+      ],
+      "answer": [
+        0,
+        1
+      ],
+      "explanation_fr": "$(commande) et les backticks réalisent la substitution de commandes : le résultat remplace l'expression. Le tube | envoie la sortie vers une autre commande, et $commande lit la valeur d'une variable, pas la sortie d'une commande.",
+      "topic": "Command substitution"
+    },
+    {
+      "id": "hcia-oe-05-q05",
+      "type": "multi",
+      "prompt": "Which are valid iSula commands? (Choose three.)",
+      "options": [
+        "isula ps",
+        "isula rmi",
+        "docker build",
+        "isula pull"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "pull télécharge une image, ps liste les conteneurs et rmi supprime une image : ce sont des sous-commandes du client isula. docker build appartient au moteur Docker et ne fait pas partie de l'interface isula.",
+      "topic": "iSula"
+    },
+    {
+      "id": "hcia-oe-05-q06",
+      "type": "tf",
+      "prompt": "The crontab schedule field order is: minute, hour, day of month, month, day of week.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : l'ordre canonique est minute, heure, jour du mois, mois, jour de la semaine, suivi de la commande. Retenir cet ordre évite de placer l'heure dans le champ des minutes, erreur fréquente dans les exercices.",
+      "topic": "cron"
+    },
+    {
+      "id": "hcia-oe-05-q07",
+      "type": "tf",
+      "prompt": "isulad is the daemon process of the iSula container engine.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : isulad tourne en arrière-plan et gère les conteneurs et les images. Le client isula lui transmet les demandes via un socket. Le conteneur, lui, n'est pas un démon : c'est un processus isolé lancé par isulad.",
+      "topic": "iSula"
+    },
+    {
+      "id": "hcia-oe-05-q08",
+      "type": "text",
+      "prompt": "Give the shebang line usually written at the top of a bash script.",
+      "accept": [
+        "#!/bin/bash",
+        "#! /bin/bash",
+        "#!/usr/bin/bash",
+        "#!/usr/bin/env bash"
+      ],
+      "sample_answer": "#!/bin/bash",
+      "explanation_fr": "Le shebang commence par #! et indique le chemin de l'interpréteur, ici /bin/bash. Il n'est utilisé que lorsque le script est exécuté directement, par exemple avec ./script.sh, et non lorsqu'on le lance avec bash script.sh.",
+      "topic": "Bash scripts"
+    },
+    {
+      "id": "hcia-oe-05-q09",
+      "type": "text",
+      "prompt": "Give the cron entry to run /root/cleanup.sh every 10 minutes.",
+      "accept": [
+        "*/10 * * * * /root/cleanup.sh",
+        "*/10 * * * * /root/cleanup.sh."
+      ],
+      "sample_answer": "*/10 * * * * /root/cleanup.sh",
+      "explanation_fr": "*/10 dans le champ des minutes signifie toutes les dix minutes, et les quatre champs suivants restent à * pour couvrir toutes les heures et tous les jours. Le chemin doit être absolu, car l'environnement de cron ne charge pas le profil de l'utilisateur.",
+      "topic": "cron"
+    },
+    {
+      "id": "hcia-oe-05-q10",
+      "type": "single",
+      "prompt": "In bash, which test checks that the file exists and is a regular file?",
+      "options": [
+        "[ -x file ]",
+        "[ -e file ]",
+        "[ -d file ]",
+        "[ -f file ]"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "-f vérifie qu'il s'agit d'un fichier régulier existant. -e teste seulement l'existence, -d teste un répertoire et -x teste le droit d'exécution. Un répertoire existant rend -e vrai mais -f faux.",
+      "topic": "Bash tests"
+    },
+    {
+      "id": "hcia-oe-05-q11",
+      "type": "single",
+      "prompt": "Which command makes a script executable before running it as ./deploy.sh?",
+      "options": [
+        "chmod +x deploy.sh",
+        "chown +x deploy.sh",
+        "bash +x deploy.sh",
+        "chmod 644 deploy.sh"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "chmod +x ajoute le droit d'exécution au fichier, ce qui permet de le lancer avec ./deploy.sh. chown change le propriétaire, bash +x n'est pas une syntaxe valide et chmod 644 laisse le fichier en lecture seule pour le propriétaire, sans exécution.",
+      "topic": "Bash scripts"
+    },
+    {
+      "id": "hcia-oe-05-q12",
+      "type": "single",
+      "prompt": "What does $# contain inside a bash script?",
+      "options": [
+        "The list of all arguments",
+        "The number of positional parameters",
+        "The process ID of the script",
+        "The exit status of the last command"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "$# contient le nombre d'arguments positionnels transmis au script. $$ donne le PID du shell, $? le code retour de la dernière commande et $@ la liste des arguments. $# sert typiquement à vérifier que le bon nombre de paramètres a été fourni.",
+      "topic": "Bash variables"
+    },
+    {
+      "id": "hcia-oe-05-q13",
+      "type": "multi",
+      "prompt": "Which test operators compare integers in bash? (Choose three.)",
+      "options": [
+        "-eq",
+        "-ne",
+        "-lt",
+        "-f"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "-eq teste l'égalité, -ne la différence et -lt l'infériorité numérique. -f ne compare pas des nombres : il vérifie qu'un chemin est un fichier régulier. Pour les chaînes, on utilise = et != à la place de ces opérateurs.",
+      "topic": "Bash tests"
+    },
+    {
+      "id": "hcia-oe-05-q14",
+      "type": "tf",
+      "prompt": "In bash, single quotes prevent variable expansion inside the quoted string.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : 'texte $VAR' affiche littéralement $VAR, car les guillemets simples désactivent toute expansion. Les guillemets doubles développent les variables et les substitutions, tout en préservant les espaces. C'est une distinction essentielle pour construire des commandes sûres.",
+      "topic": "Bash quoting"
+    },
+    {
+      "id": "hcia-oe-05-q15",
+      "type": "text",
+      "prompt": "Which command lists the cron entries of the current user? (Give the full command.)",
+      "accept": [
+        "crontab -l",
+        "crontab -l."
+      ],
+      "sample_answer": "crontab -l",
+      "explanation_fr": "crontab -l affiche la crontab de l'utilisateur courant. crontab -e ouvre le même fichier dans l'éditeur pour le modifier. Pour consulter la crontab d'un autre utilisateur, root peut utiliser crontab -l -u nom.",
+      "topic": "cron"
+    },
+    {
+      "id": "hcia-oe-05-q16",
+      "type": "text",
+      "prompt": "Which isula command lists the running containers? (Give the isula subcommand.)",
+      "accept": [
+        "isula ps",
+        "isula ps -a",
+        "isula ps -a."
+      ],
+      "sample_answer": "isula ps",
+      "explanation_fr": "isula ps liste les conteneurs en cours d'exécution, comme docker ps. L'option -a inclut les conteneurs arrêtés. isula images liste les images et isula run crée un nouveau conteneur : aucune des deux ne répond à la question.",
+      "topic": "iSula"
+    },
+    {
+      "id": "hcia-oe-05-q17",
+      "type": "single",
+      "prompt": "What does the option -p 8080:80 mean in isula run?",
+      "options": [
+        "Set the container priority to 8080",
+        "Limit the container to 8080 MB of memory",
+        "Publish container port 80 on host port 8080",
+        "Publish container port 8080 on host port 80"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Le format de -p est port_hôte:port_conteneur. Ici, le port 80 du conteneur est accessible sur le port 8080 de l'hôte. L'inverser publierait le port 8080 du conteneur sur le port 80 de l'hôte, ce qui n'est pas la même chose.",
+      "topic": "iSula"
+    },
+    {
+      "id": "hcia-oe-05-q18",
+      "type": "single",
+      "prompt": "Which construct reads a file line by line while preserving leading and trailing spaces?",
+      "options": [
+        "for line in $(cat file); do ...; done",
+        "while cat file; do ...; done",
+        "for line in file; do ...; done",
+        "while IFS= read -r line; do ...; done < file"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "while IFS= read -r line préserve la ligne complète : IFS= empêche le découpage des espaces et -r désactive l'interprétation des antislashs. for line in $(cat file) découpe sur les espaces et perd les lignes vides, while cat file ne lit pas ligne par ligne et for line in file itère sur le nom du fichier.",
+      "topic": "Bash loops"
+    },
+    {
+      "id": "hcia-oe-05-q19",
+      "type": "single",
+      "prompt": "What is the effect of set -e in a bash script?",
+      "options": [
+        "The script exits when a command returns a non-zero status",
+        "The script prints every command before executing it",
+        "Undefined variables become empty strings",
+        "All commands run in the background"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "set -e demande au shell de quitter dès qu'une commande renvoie un code non nul, ce qui évite de poursuivre après une erreur. set -x affiche les commandes exécutées, set -u traite les variables non définies comme une erreur et le caractère & lance une commande en arrière-plan.",
+      "topic": "Bash scripts"
+    },
+    {
+      "id": "hcia-oe-05-q20",
+      "type": "single",
+      "prompt": "Which statement about iSula containers is correct?",
+      "options": [
+        "They require a full hardware hypervisor",
+        "They share the host kernel and are lighter than virtual machines",
+        "Each container runs its own independent kernel",
+        "They cannot use host network ports"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un conteneur partage le noyau de l'hôte et isole les processus avec les namespaces et les cgroups, ce qui le rend plus léger qu'une machine virtuelle. Il n'embarque pas de noyau propre, peut publier des ports avec -p et n'a pas besoin d'un hyperviseur matériel.",
+      "topic": "iSula"
+    }
+  ]
+}

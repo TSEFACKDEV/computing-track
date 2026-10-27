@@ -1,0 +1,733 @@
+{
+  "id": "hcie-og-03",
+  "phase": "HCIE",
+  "subject": "openGauss",
+  "number": 3,
+  "title_fr": "Dépannage expert openGauss",
+  "title_en": "Expert Troubleshooting",
+  "minutes": 85,
+  "source": "HCIE-openGauss V1.0 Training Material — Sessions 6 et 8 «Backup/Restoration/Flashback/DR · Troubleshooting» · Lab Guide",
+  "objectives": [
+    "Conduire un incident par l'impact, la chronologie et la stabilisation",
+    "Collecter et corréler logs, métriques système et vues internes",
+    "Diagnostiquer blocages, idle in transaction et chaînes de verrous",
+    "Réagir à une saturation WAL, disque ou checkpoint sans aggraver",
+    "Expliquer le crash recovery, le PITR et les outils de sauvegarde",
+    "Distinguer switchover et failover et sécuriser le retour d'un nœud"
+  ],
+  "sections": [
+    {
+      "heading": "Cadrer l'incident : impact, chronologie et stabilisation",
+      "body": "Un incident se gère d'abord par l'impact, pas par la technique. Qualifiez la sévérité : service totalement indisponible, dégradé, ou simple alerte. Identifiez le périmètre : un nœud, une base, toutes les applications. Établissez la chronologie et corrélez avec les changements récents, déploiement, DDL, paramètre ou montée de version. Stabilisez avant d'enquêter : basculez sur le standby, annulez une requête pathologique, limitez le trafic, mais préservez les preuves. Un redémarrage réflexe efface les files d'attente, les verrous et parfois les traces mémoire : collectez d'abord pg_stat_activity, pg_locks, les logs, un rapport WDR et les métriques système. La méthode OODA (observer, orienter, décider, agir) aide à garder ce rythme. Enfin, communiquez : un incident sans information génère plus de dégâts qu'un incident expliqué. Chaque action doit être datée et réversible ; notez ce que vous tentez pour ne pas répéter deux fois la même hypothèse.",
+      "bullets": [
+        "Qualifier l'impact avant de choisir une action technique",
+        "Corréler l'heure de début avec les changements récents",
+        "Stabiliser sans détruire les preuves (logs, vues, WDR)",
+        "Toute action doit être datée, réversible et communiquée"
+      ],
+      "code": [
+        "SELECT now(), pid, state, wait_event_type, wait_event,",
+        "       now() - xact_start AS xact_age, query",
+        "FROM pg_stat_activity",
+        "ORDER BY xact_age DESC NULLS LAST;",
+        "SELECT * FROM pg_locks WHERE NOT granted;"
+      ],
+      "diagram": "Alerte\n  |\n  v\nQualifier l'impact --> Stabiliser (failover, cancel, throttle)\n  |                              |\n  v                              v\nCollecter les preuves -------> Diagnostiquer\n  |                              |\n  +---------> Chronologie <------+\n                 |\n                 v\n          Corriger, vérifier, documenter",
+      "tip": "Avant de redémarrer, demandez-vous ce que vous perdez : contenu de pg_stat_activity, verrous, requêtes lentes, état mémoire. Un redémarrage peut résoudre le symptôme et rendre la cause invisible pour toujours."
+    },
+    {
+      "heading": "Sources de preuve : logs, métriques système et vues internes",
+      "body": "Un diagnostic solide croise trois sources. Les logs applicatifs et base : pg_log pour les erreurs serveur, les logs gs_ctl et gs_om pour les démarrages, arrêts et opérations OM, les logs système pour les OOM et erreurs disque. Les métriques système : CPU, run queue, iostat, IOPS et latence, mémoire, swap, df et inodes ; un iowait élevé avec un disque saturé ne se corrige pas avec un paramètre SQL. Les vues internes : pg_stat_activity pour les sessions, pg_locks pour les verrous, pg_stat_database pour les commits, rollbacks et tuples, pg_stat_bgwriter pour les checkpoints, pg_stat_replication pour le retard des standbys, pg_stat_user_tables pour les autovacuum et tuples morts. À cela s'ajoutent statement_history pour les requêtes historiques et les rapports WDR pour l'activité par période. La clé est la corrélation temporelle : les sources doivent être alignées sur la même horloge, sinon on attribue une cause à un effet qui la précède.",
+      "bullets": [
+        "Croiser logs, métriques OS et vues base, jamais une seule source",
+        "Un iowait élevé oriente vers le stockage, pas vers le SQL",
+        "pg_stat_replication mesure le retard, pas la santé applicative",
+        "WDR et statement_history donnent la dimension historique"
+      ],
+      "code": [
+        "echo $GAUSSLOG",
+        "ls $GAUSSLOG/pg_log $GAUSSLOG/gs_ctl $GAUSSLOG/gs_om",
+        "SELECT node_name, sender_sent_location, receiver_replay_location,",
+        "       pg_xlog_location_diff(sender_sent_location, receiver_replay_location) AS lag",
+        "FROM pg_stat_replication;",
+        "SELECT datname, xact_commit, xact_rollback, blks_read, blks_hit",
+        "FROM pg_stat_database;",
+        "SELECT * FROM statement_history ORDER BY start_time DESC LIMIT 20;"
+      ],
+      "table": {
+        "headers": [
+          "Source",
+          "Question à laquelle elle répond"
+        ],
+        "rows": [
+          [
+            "pg_log",
+            "quelle erreur serveur, à quelle heure ?"
+          ],
+          [
+            "gs_ctl / gs_om logs",
+            "démarrage, arrêt, opération OM ?"
+          ],
+          [
+            "dmesg / sar / iostat",
+            "OOM, disque, CPU, réseau ?"
+          ],
+          [
+            "pg_stat_activity",
+            "qui fait quoi maintenant ?"
+          ],
+          [
+            "pg_stat_bgwriter",
+            "checkpoints et pression d'écriture ?"
+          ],
+          [
+            "WDR / statement_history",
+            "quel était le profil avant l'incident ?"
+          ]
+        ]
+      },
+      "tip": "Le serveur et les équipements doivent partager la même référence de temps (NTP). Sans horloge commune, la corrélation entre un pic iostat et une erreur pg_log devient une conjecture."
+    },
+    {
+      "heading": "Blocages, idle in transaction et tempêtes de requêtes",
+      "body": "Le blocage est l'incident le plus fréquent. Une session peut attendre un verrou de ligne, un verrou de table, un I/O, le WAL ou un client. pg_locks indique les verrous accordés et les demandes en attente ; joint à pg_stat_activity, il révèle la chaîne : la session bloquée, la session bloquante, et parfois une troisième en amont. La cause typique est une transaction idle in transaction : l'application a fait BEGIN, un SELECT ou un UPDATE, puis attend un appel réseau ou un utilisateur, en tenant des verrous et un snapshot. Les timeouts sont la première défense : idle_in_transaction_session_timeout ferme les transactions inactives, lock_timeout borne l'attente d'un verrou, statement_timeout borne l'exécution. pg_cancel_backend annule la requête en cours mais laisse la session et sa transaction ; pg_terminate_backend ferme la session et libère tout. On corrige ensuite la cause : pool mal configuré, transaction ouverte autour d'un appel HTTP, index manquant qui verrouille trop de lignes, ou ordre d'accès incohérent.",
+      "bullets": [
+        "Une chaîne de blocage se lit dans pg_locks joint à pg_stat_activity",
+        "idle in transaction tient verrous et snapshot sans travailler",
+        "Les timeouts bornent l'attente et évitent le blocage infini",
+        "Annuler la requête n'est pas corriger la cause"
+      ],
+      "code": [
+        "SELECT w.pid AS waiting_pid, w.query AS waiting_query,",
+        "       b.pid AS blocking_pid, b.query AS blocking_query,",
+        "       l.mode, l.relation::regclass",
+        "FROM pg_stat_activity w",
+        "JOIN pg_locks l ON l.pid = w.pid AND NOT l.granted",
+        "JOIN pg_locks bl ON bl.locktype = l.locktype",
+        "  AND bl.database IS NOT DISTINCT FROM l.database",
+        "  AND bl.relation IS NOT DISTINCT FROM l.relation",
+        "  AND bl.granted",
+        "JOIN pg_stat_activity b ON b.pid = bl.pid;",
+        "SELECT pg_cancel_backend(12345);",
+        "SELECT pg_terminate_backend(12345);"
+      ],
+      "table": {
+        "headers": [
+          "Situation",
+          "Commande",
+          "Effet"
+        ],
+        "rows": [
+          [
+            "requête trop longue",
+            "pg_cancel_backend(pid)",
+            "annule la requête, garde la session"
+          ],
+          [
+            "transaction bloquante",
+            "pg_terminate_backend(pid)",
+            "ferme la session, libère les verrous"
+          ],
+          [
+            "transaction inactive",
+            "idle_in_transaction_session_timeout",
+            "fermeture automatique"
+          ],
+          [
+            "attente de verrou",
+            "lock_timeout",
+            "erreur au lieu d'attendre indéfiniment"
+          ],
+          [
+            "requête pathologique",
+            "statement_timeout",
+            "borne la durée d'exécution"
+          ]
+        ]
+      },
+      "diagram": "Session A (bloquante)        Session B (bloquée)\n  BEGIN; UPDATE ligne 1;       UPDATE ligne 1;\n  -- attend un client              |\n  -- idle in transaction           v\n  verrou ligne 1  ----------->  attente\n                                (granted = false)\n\nChaîne : B attend A\nAction : terminer A ou attendre son COMMIT",
+      "exercises": [
+        {
+          "prompt": "Une application ne répond plus. pg_stat_activity montre une session A en idle in transaction depuis 40 minutes, qui a exécuté un UPDATE sur la table accounts, et douze sessions B en attente sur la même table. Décrivez la requête de diagnostic et la décision à prendre.",
+          "correction": "On interroge pg_locks pour les demandes non accordées et on joint deux fois pg_stat_activity, une fois pour la session en attente, une fois pour le détenteur du verrou, comme dans l'exemple de la section. On confirme que les douze sessions B attendent un verrou de ligne ou de table détenu par A, et que A est idle in transaction. La décision dépend de l'impact : si A appartient à un pool et que son travail est incomplet, on peut d'abord tenter pg_cancel_backend(A) ; s'il s'agit d'une transaction abandonnée, pg_terminate_backend(A) libère immédiatement les verrous et les snapshots. On vérifie ensuite que B progresse. La correction durable consiste à ne jamais tenir une transaction pendant un appel réseau, à configurer idle_in_transaction_session_timeout et lock_timeout, et à instrumenter le pool pour détecter les connexions fuitées."
+        }
+      ],
+      "tip": "Piège d'examen : pg_cancel_backend n'annule pas une session idle in transaction, car il n'y a aucune requête en cours. Pour libérer les verrous d'une transaction inactive, il faut pg_terminate_backend ou laisser le timeout agir."
+    },
+    {
+      "heading": "Saturation du WAL, du disque et des checkpoints",
+      "body": "Le WAL est un journal circulaire : chaque transaction écrit ses enregistrements dans pg_xlog avant que les pages de données soient réécrites. Si l'archivage échoue, si un standby ne consomme plus, si wal_keep_segments est trop grand ou si une transaction énorme retarde le checkpoint, les segments s'accumulent et le disque se remplit. Les symptômes sont une latence qui explose, des erreurs No space left on device, des checkpoints en boucle et parfois un arrêt des écritures. La première action est de rétablir l'archivage ou la réplication, puis de vérifier l'espace avec df et du. On ne supprime jamais des fichiers de pg_xlog à la main : le contrôleur de checkpoint et les standbys en ont besoin ; le moteur nettoie les segments obsolètes après un checkpoint réussi. On peut réduire la rétention avec wal_keep_segments et surveiller le taux de génération. Un volume WAL séparé, dimensionné pour absorber un pic, évite que la base et les logs se disputent le même disque.",
+      "bullets": [
+        "Le WAL est circulaire : il ne grandit que si le recyclage est bloqué",
+        "Archivage en échec et standby en retard sont les causes classiques",
+        "Ne jamais supprimer pg_xlog à la main",
+        "Surveiller le taux de génération et l'espace disponible"
+      ],
+      "code": [
+        "df -h $PGDATA $PGDATA/pg_xlog",
+        "du -sh $PGDATA/pg_xlog",
+        "SELECT * FROM pg_stat_archiver;",
+        "SHOW archive_mode;",
+        "SHOW archive_command;",
+        "SHOW wal_keep_segments;",
+        "SELECT pg_current_xlog_location();",
+        "gs_ctl checkpoint -D $PGDATA;"
+      ],
+      "table": {
+        "headers": [
+          "Symptôme",
+          "Cause probable",
+          "Action"
+        ],
+        "rows": [
+          [
+            "pg_xlog grossit sans fin",
+            "archive_command en échec",
+            "corriger l'archivage, vérifier pg_stat_archiver"
+          ],
+          [
+            "standby très en retard",
+            "réseau ou rejeu lent",
+            "rétablir le lien, vérifier pg_stat_replication"
+          ],
+          [
+            "checkpoints fréquents",
+            "pression d'écriture ou checkpoint_timeout court",
+            "lisser, augmenter la capacité"
+          ],
+          [
+            "disque à 100 %",
+            "logs, WAL ou données",
+            "libérer un autre volume, étendre, purger les logs"
+          ],
+          [
+            "écritures bloquées",
+            "plus d'espace WAL",
+            "rétablir le recyclage, ne pas supprimer à l'aveugle"
+          ]
+        ]
+      },
+      "diagram": "Checkpoint réussi : segments < redo LSN recyclables\n\n [seg 01][seg 02][seg 03][seg 04][seg 05]\n                  ^redo                ^write\n\nArchivage en échec : les segments restent consommés\n [01][02][03][04][05][06][07][08] --> disque plein\n\nAprès correction : checkpoint puis recyclage",
+      "tip": "Un disque plein n'est pas toujours un problème de WAL : vérifiez aussi les logs applicatifs, les fichiers temporaires de tri, les cores et les sauvegardes locales. La commande du -sh sur les répertoires suspects évite de supprimer la mauvaise chose."
+    },
+    {
+      "heading": "Redémarrage après crash et rejeu du WAL",
+      "body": "Après une coupure, openGauss redémarre en recovery. Il lit le dernier checkpoint, repart du point de redo et rejoue les enregistrements WAL jusqu'à la fin du journal, puis écrit un checkpoint de fin et ouvre les connexions. Les transactions non validées sont ignorées, les validées sont rejouées : c'est la durabilité. Le rejeu est parallèle, ce qui réduit le temps de démarrage sur les gros volumes. Les pages partiellement écrites sont détectées grâce au full_page_writes ou au doublewrite selon la configuration. Un démarrage qui boucle ou échoue sur un segment corrompu exige de restaurer une sauvegarde et de rejouer l'archive jusqu'au dernier LSN sain. Les commandes utiles sont gs_ctl start, gs_ctl query, pg_controldata pour le dernier checkpoint et l'état du cluster, et pg_current_xlog_location pour le LSN courant. On vérifie ensuite l'intégrité applicative : les transactions perdues sont celles qui n'avaient pas reçu de COMMIT.",
+      "bullets": [
+        "Le recovery part du redo LSN du dernier checkpoint",
+        "Les transactions non validées ne sont pas rejouées",
+        "full_page_writes ou doublewrite protège les pages partiellement écrites",
+        "Un segment corrompu impose restauration et rejeu de l'archive"
+      ],
+      "code": [
+        "gs_ctl start -D $PGDATA",
+        "gs_ctl query -D $PGDATA",
+        "pg_controldata $PGDATA",
+        "SELECT pg_current_xlog_location();",
+        "tail -n 100 $GAUSSLOG/pg_log/postgresql-*.log"
+      ],
+      "diagram": "Temps -->\n\n checkpoint          crash\n    |                  |\n    v                  v\n----+------------------+------------> WAL\n    ^                  ^\n    redo LSN           fin du journal\n\n1. lire le checkpoint\n2. rejouer depuis redo LSN\n3. ignorer les transactions non validées\n4. checkpoint de fin, puis ouvrir",
+      "tip": "Un redémarrage qui prend longtemps n'est pas forcément bloqué : le rejeu de millions de pages peut durer. Surveillez les logs et le LSN plutôt que de tuer le processus, ce qui risquerait d'aggraver l'état."
+    },
+    {
+      "heading": "Sauvegarde, PITR et flashback",
+      "body": "Une sauvegarde n'a de valeur que si la restauration est testée. openGauss propose deux familles. La physique copie les fichiers : gs_basebackup réalise une sauvegarde complète à chaud sur un primaire ou un standby, gs_probackup gère des sauvegardes complètes et incrémentales avec catalogue et restauration. La logique exporte du SQL ou une archive : gs_dump pour une base, gs_dumpall pour tout le cluster, gs_restore pour réimporter une archive. La physique permet le PITR : on restaure la sauvegarde, on configure restore_command et recovery_target_time dans recovery.conf, puis on rejoue les WAL archivés jusqu'à l'instant voulu avant promotion. Le RPO dépend donc de la fréquence des sauvegardes et de la continuité de l'archivage. Le flashback complète le dispositif pour les erreurs humaines : flashback query lit un snapshot passé, flashback table restaure une table, flashback drop récupère une table supprimée via la corbeille. Ces outils ne remplacent pas une sauvegarde externalisée : un disque perdu emporte base et sauvegarde.",
+      "bullets": [
+        "gs_basebackup : physique complète ; gs_probackup : complète et incrémentale",
+        "gs_dump/gs_restore : logique, utile pour une table ou une migration",
+        "PITR = sauvegarde physique + WAL archivés + cible temporelle",
+        "Flashback traite l'erreur humaine, pas la perte de disque"
+      ],
+      "code": [
+        "gs_basebackup -D /backup/base -h 127.0.0.1 -p 15400 -F t",
+        "gs_dump -U omm -f /backup/db.sql -p 15400 postgres -F p",
+        "gs_restore -U omm -d postgres -p 15400 /backup/db.tar",
+        "gs_probackup backup -B /backup/probackup --instance main -b FULL",
+        "# recovery.conf",
+        "restore_command = 'cp /archive/%f %p'",
+        "recovery_target_time = '2026-03-15 14:30:00+01'"
+      ],
+      "table": {
+        "headers": [
+          "Outil",
+          "Périmètre",
+          "Type",
+          "Usage"
+        ],
+        "rows": [
+          [
+            "gs_basebackup",
+            "cluster ou instance",
+            "physique complet",
+            "base d'un PITR, standby"
+          ],
+          [
+            "gs_probackup",
+            "instance",
+            "physique complet/incrémental",
+            "sauvegardes planifiées"
+          ],
+          [
+            "gs_dump",
+            "base ou objets",
+            "logique",
+            "export ciblé, migration"
+          ],
+          [
+            "gs_dumpall",
+            "tout le cluster",
+            "logique",
+            "rôles et bases"
+          ],
+          [
+            "flashback",
+            "table ou requête",
+            "logique interne",
+            "erreur humaine récente"
+          ]
+        ]
+      },
+      "tip": "Un PITR se répète à blanc, avec chronomètre : restauration de la sauvegarde, rejeu, promotion, vérification applicative. La première exécution réelle ne doit jamais être celle de l'incident."
+    },
+    {
+      "heading": "Haute disponibilité, CM et bascule",
+      "body": "La haute disponibilité repose sur un primaire et des standbys synchronisés par WAL. Le composant CM (cm_server, cm_agent, om_monitor) surveille les processus, arbitre par quorum et déclenche le failover. Un switchover est planifié : on choisit un standby à jour, on bascule sans perte (RPO nul) et l'ancien primaire devient standby. Un failover est subi : le primaire est mort, CM promeut le standby le plus avancé, avec un RPO non nul possible. Après coup, l'ancien primaire doit être reconstruit par gs_ctl build, en mode incrémental si l'écart est limité, sinon en mode full, avant de rejoindre. Le split-brain est évité par le quorum : un nœud isolé ne doit pas continuer à accepter des écritures. Le mode most_available_sync privilégie la disponibilité en cas de perte du standby synchrone, au prix du RPO ; synchronous_commit et synchronous_standby_names règlent le compromis. Des drills réguliers mesurent le RTO réel.",
+      "bullets": [
+        "Switchover planifié et sans perte ; failover subi et avec RPO possible",
+        "CM surveille, arbitre par quorum et déclenche la promotion",
+        "L'ancien primaire doit être réaligné ou reconstruit avant de rejoindre",
+        "most_available_sync échange du RPO contre de la disponibilité"
+      ],
+      "code": [
+        "cm_ctl query -Cv",
+        "cm_ctl switchover -n 1 -D /data/dn",
+        "gs_ctl switchover -D $PGDATA",
+        "gs_ctl build -D $PGDATA -b incremental",
+        "gs_ctl build -D $PGDATA -b full",
+        "SHOW synchronous_standby_names;",
+        "SHOW most_available_sync;",
+        "SELECT client_addr, state, sync_state, sync_priority",
+        "FROM pg_stat_replication;"
+      ],
+      "table": {
+        "headers": [
+          "Événement",
+          "Déclencheur",
+          "Perte de données",
+          "Retour de l'ancien primaire"
+        ],
+        "rows": [
+          [
+            "Switchover",
+            "planifié, primaire sain",
+            "aucune (RPO 0)",
+            "devient standby, simple"
+          ],
+          [
+            "Failover",
+            "panne du primaire",
+            "possible (RPO > 0)",
+            "reconstruit par gs_ctl build"
+          ],
+          [
+            "Redémarrage simple",
+            "maintenance",
+            "aucune",
+            "reprend son rôle"
+          ]
+        ]
+      },
+      "diagram": "            CM Server (quorum)\n             /            \\\n      cm_agent          cm_agent\n        |                  |\n   +---------+        +---------+\n   | Primary |--WAL-->| Standby |\n   +---------+        +---------+\n        |                  |\n        +---- sync ------->+\n\nPanne du primaire : CM promeut le standby\nAncien primaire : gs_ctl build (incrémental ou full)",
+      "exercises": [
+        {
+          "prompt": "Le primaire est en panne matérielle depuis dix minutes. Le standby le plus avancé a 30 secondes de retard WAL. Le directeur demande une bascule immédiate. Expliquez la différence avec un switchover et décrivez les étapes.",
+          "correction": "Il s'agit d'un failover, pas d'un switchover : le primaire n'est pas disponible, la bascule est subie et le RPO n'est pas nul. Les 30 secondes de WAL non reçues correspondent à des transactions validées côté primaire mais absentes du standby : elles seront perdues, ce qu'il faut annoncer explicitement. Les étapes sont : confirmer la panne et l'absence de split-brain, vérifier l'état du cluster avec cm_ctl query -Cv, laisser CM promouvoir le standby le plus avancé ou déclencher la promotion contrôlée, vérifier que le nouveau primaire accepte les écritures et que les applications sont reconnectées, puis reconstruire l'ancien primaire avec gs_ctl build (incrémental ou full) avant de le réintégrer. Un switchover, à l'inverse, suppose les deux nœuds sains et garantit un RPO nul."
+        }
+      ],
+      "tip": "Piège d'examen : un switchover ne perd pas de données car il est planifié et attend que le standby soit à jour. Un failover peut perdre les dernières transactions : c'est le RPO qui distingue les deux, pas la commande utilisée."
+    },
+    {
+      "heading": "Post-mortem, runbook et prévention",
+      "body": "Le post-mortem transforme un incident en amélioration durable. Il est sans blame : on cherche les causes systémiques, pas un coupable. On reconstruit la chronologie factuelle depuis les alertes, les logs et les actions, puis on identifie la cause racine avec les cinq pourquoi, en distinguant le déclencheur, un DDL ou un pic, des conditions latentes, absence de timeout, index manquant, alerte trop tardive. Chaque action correctrice reçoit un propriétaire, une échéance et un critère de vérification ; sinon elle reste un vœu. Le runbook est mis à jour avec les signaux de détection, les étapes de diagnostic, les commandes exactes, les critères de décision, la procédure de rollback et les contacts. Les exercices de panne valident le runbook et le RTO. Enfin, on ajuste la supervision : seuils d'alerte, tableaux de bord, capacité et tests de restauration. Un incident bien documenté devient un actif ; le même incident répété est une faute de processus.",
+      "bullets": [
+        "Post-mortem sans blame, centré sur les causes systémiques",
+        "Distinguer le déclencheur des conditions latentes",
+        "Chaque action a un propriétaire, une date et un critère de succès",
+        "Un runbook se valide par des drills, pas par relecture"
+      ],
+      "code": [
+        "SELECT query, calls, total_time, mean_time",
+        "FROM statement_history",
+        "ORDER BY total_time DESC LIMIT 20;",
+        "SELECT relname, n_dead_tup, last_autovacuum",
+        "FROM pg_stat_user_tables",
+        "ORDER BY n_dead_tup DESC LIMIT 10;",
+        "SELECT create_wdr_snapshot();"
+      ],
+      "table": {
+        "headers": [
+          "Section du runbook",
+          "Contenu attendu"
+        ],
+        "rows": [
+          [
+            "Détection",
+            "alerte, seuil, tableau de bord, heure"
+          ],
+          [
+            "Qualification",
+            "impact, sévérité, périmètre"
+          ],
+          [
+            "Diagnostic",
+            "commandes exactes, vues, logs"
+          ],
+          [
+            "Décision",
+            "critères pour attendre, annuler, basculer"
+          ],
+          [
+            "Rollback",
+            "procédure inverse, vérification"
+          ],
+          [
+            "Post-mortem",
+            "timeline, causes, actions, propriétaires"
+          ]
+        ]
+      },
+      "tip": "Une action corrective sans propriétaire ni date de vérification n'est pas une action : c'est une intention. Le succès d'un post-mortem se mesure au nombre d'actions réellement closes et testées."
+    }
+  ],
+  "key_points": [
+    "Stabiliser d'abord, mais préserver les preuves avant tout redémarrage",
+    "La corrélation temporelle entre logs, métriques et vues est décisive",
+    "idle in transaction est la cause majeure de blocages et de bloat",
+    "pg_cancel_backend annule une requête, pg_terminate_backend ferme la session",
+    "Le WAL ne se supprime jamais à la main : il se recycle après checkpoint",
+    "Le crash recovery rejoue depuis le redo LSN du dernier checkpoint",
+    "Le PITR exige une sauvegarde physique, les WAL archivés et une cible",
+    "Switchover est planifié (RPO 0), failover est subi (RPO possible)"
+  ],
+  "traps": [
+    "pg_cancel_backend ne libère pas une transaction idle in transaction",
+    "Supprimer des fichiers pg_xlog à la main peut rendre le cluster irrécupérable",
+    "Un failover peut perdre les dernières transactions validées sur le primaire",
+    "Un standby en retard n'est pas forcément en panne : vérifiez le rejeu et le réseau",
+    "Une sauvegarde jamais restaurée n'est pas une sauvegarde fiable"
+  ],
+  "quiz": [
+    {
+      "id": "hcie-og-03-q01",
+      "type": "single",
+      "prompt": "Which view shows the session state and current query needed to identify a blocking session?",
+      "options": [
+        "pg_stat_activity",
+        "pg_stat_user_tables",
+        "pg_stat_replication",
+        "pg_indexes"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "pg_stat_activity expose le pid, l'utilisateur, l'état, l'heure de début de transaction et le texte de la requête de chaque session : c'est la première vue pour repérer une session bloquante ou idle in transaction. pg_stat_user_tables donne les compteurs de tuples et d'autovacuum, pas l'état des sessions. pg_stat_replication concerne les standbys. pg_indexes décrit les index.",
+      "topic": "session diagnosis"
+    },
+    {
+      "id": "hcie-og-03-q02",
+      "type": "single",
+      "prompt": "What happens when the pg_xlog directory cannot grow because the disk is full?",
+      "options": [
+        "A full backup is triggered",
+        "Writes stall and the instance may stop accepting new transactions",
+        "Data is silently corrupted",
+        "A standby is automatically promoted"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Sans espace pour écrire le WAL, les commits ne peuvent plus être garantis : les écritures se bloquent et l'instance peut cesser d'accepter de nouvelles transactions. Les données déjà validées ne sont pas corrompues, mais la disponibilité est perdue. Aucune promotion automatique ni sauvegarde ne se déclenche à cause d'un disque plein. La correction consiste à rétablir l'archivage ou le recyclage, puis à libérer de l'espace proprement.",
+      "topic": "wal saturation"
+    },
+    {
+      "id": "hcie-og-03-q03",
+      "type": "single",
+      "prompt": "Which command rebuilds a standby or a former primary from the current primary?",
+      "options": [
+        "cm_ctl query -Cv",
+        "pg_controldata $PGDATA",
+        "gs_ctl build -D $PGDATA -b incremental",
+        "gs_ctl build -D $PGDATA -b full",
+        "gs_dump -D $PGDATA"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "gs_ctl build reconstruit les données d'un standby ou réaligne un ancien primaire à partir du primaire courant. gs_dump exporte une base en SQL et ne reconstruit pas une instance. cm_ctl query affiche l'état du cluster sans modifier les données. pg_controldata lit les informations de contrôle et ne copie rien.",
+      "topic": "standby rebuild"
+    },
+    {
+      "id": "hcie-og-03-q04",
+      "type": "multi",
+      "prompt": "Which practices accelerate effective troubleshooting? (Choose 3)",
+      "options": [
+        "Collecting evidence layer by layer",
+        "Recording configuration change timestamps",
+        "Using runbooks with rollback steps",
+        "Guessing from intuition only"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Une collecte structurée, couche par couche, évite d'oublier une source et permet de corréler les symptômes. L'historique horodaté des changements relie souvent l'incident à un déploiement ou un paramètre. Un runbook avec étapes de rollback réduit le temps de décision et sécurise l'action. Deviner sans données conduit à des changements non maîtrisés et peut aggraver l'incident.",
+      "topic": "troubleshooting method"
+    },
+    {
+      "id": "hcie-og-03-q05",
+      "type": "multi",
+      "prompt": "Which actions should follow a real incident? (Choose 3)",
+      "options": [
+        "Add or refine monitoring alerts",
+        "Update the runbook with lessons learned",
+        "Document the root cause in a blameless post-mortem",
+        "Disable the alert to reduce noise"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "De nouvelles alertes ou des seuils ajustés détectent plus tôt une récidive. La mise à jour du runbook transforme l'expérience en procédure réutilisable. Un post-mortem sans blame documente la cause racine et les actions correctives. Désactiver l'alerte supprime le signal sans traiter la cause et rend l'incident invisible.",
+      "topic": "post-incident"
+    },
+    {
+      "id": "hcie-og-03-q06",
+      "type": "tf",
+      "prompt": "An idle-in-transaction session can block vacuum and grow dead tuples.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "La session conserve un snapshot et un xmin actif : le VACUUM ne peut pas nettoyer les versions encore potentiellement visibles. Les tuples morts s'accumulent et la table gonfle. La session peut aussi détenir des verrous. Un timeout idle_in_transaction_session_timeout et un pool bien configuré limitent ce risque.",
+      "topic": "vacuum blocking"
+    },
+    {
+      "id": "hcie-og-03-q07",
+      "type": "tf",
+      "prompt": "After a failover, a former primary must be rebuilt before rejoining as a standby.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "L'ancien primaire peut avoir des transactions que le nouveau primaire n'a pas : il faut le reconstruire avant de le réintégrer, par exemple avec gs_ctl build -b incremental si l'écart est faible, sinon -b full. Une simple remise en service provoquerait un split-brain ou un conflit de timeline. Le choix dépend de l'écart de WAL et du temps acceptable.",
+      "topic": "failover recovery"
+    },
+    {
+      "id": "hcie-og-03-q08",
+      "type": "text",
+      "prompt": "Which command displays the CM cluster state, including node roles (two words)?",
+      "accept": [
+        "cm_ctl query",
+        "cm_ctl query -Cv",
+        "cm_ctl query -v"
+      ],
+      "sample_answer": "cm_ctl query",
+      "explanation_fr": "cm_ctl query interroge le CM Server et affiche l'état des nœuds, les rôles primaire/standby et les éventuelles anomalies. L'option -Cv ajoute une vue détaillée par instance. gs_ctl query ne concerne qu'une instance locale, pas l'état du cluster CM. La commande ne modifie rien : elle est le premier réflexe avant un switchover.",
+      "topic": "cm cluster"
+    },
+    {
+      "id": "hcie-og-03-q09",
+      "type": "text",
+      "prompt": "Which command reports the total disk usage of a data directory in human-readable form (two words)?",
+      "accept": [
+        "du -sh",
+        "du -sh $PGDATA"
+      ],
+      "sample_answer": "du -sh",
+      "explanation_fr": "du -sh résume l'espace occupé par un répertoire en unités lisibles (K, M, G) sans détailler chaque fichier. df -h montre l'espace des systèmes de fichiers, pas la taille d'un répertoire précis. ls -l liste les fichiers mais n'additionne pas leur taille. Sur un incident disque, du -sh ciblé sur pg_xlog, les logs et les fichiers temporaires localise rapidement le coupable.",
+      "topic": "disk diagnosis"
+    },
+    {
+      "id": "hcie-og-03-q10",
+      "type": "single",
+      "prompt": "What should you do first when a production database becomes unstable?",
+      "options": [
+        "Restart the instance immediately",
+        "Drop and recreate indexes",
+        "Disable all monitoring alerts",
+        "Assess impact and preserve diagnostic evidence"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "La priorité est de qualifier l'impact et de préserver les preuves : sessions, verrous, logs, métriques. Un redémarrage immédiat peut effacer les signaux nécessaires à la cause racine et ne pas résoudre le problème. Recréer des index est une opération lourde et non pertinente sans diagnostic. Désactiver les alertes masque l'incident au lieu de le traiter.",
+      "topic": "incident response"
+    },
+    {
+      "id": "hcie-og-03-q11",
+      "type": "single",
+      "prompt": "What does a WDR report provide?",
+      "options": [
+        "A performance snapshot and comparison over a time range",
+        "A binary backup of the cluster",
+        "A list of SQL hints for the optimizer",
+        "An automatic failover procedure"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "WDR collecte des instantanés de statistiques et génère un rapport de performance sur une période, utile pour comparer avant et après un incident. Il ne réalise pas de sauvegarde physique. Il ne produit pas de hints ni de procédure de failover. Les snapshots sont créés manuellement ou périodiquement selon enable_wdr_snapshot.",
+      "topic": "wdr"
+    },
+    {
+      "id": "hcie-og-03-q12",
+      "type": "single",
+      "prompt": "What is the difference between pg_cancel_backend and pg_terminate_backend?",
+      "options": [
+        "Terminate only works on standbys",
+        "Cancel stops the running query; terminate closes the session",
+        "Cancel closes the session; terminate stops one query",
+        "Both only release locks"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "pg_cancel_backend envoie une demande d'annulation à la requête en cours mais laisse la session et sa transaction ouvertes. pg_terminate_backend ferme la session, ce qui libère les verrous et le snapshot. Annuler une requête ne suffit donc pas à débloquer une transaction idle in transaction. Les deux fonctions s'appliquent au primaire comme au standby selon les droits.",
+      "topic": "session control"
+    },
+    {
+      "id": "hcie-og-03-q13",
+      "type": "single",
+      "prompt": "Which statement correctly distinguishes a switchover from a failover?",
+      "options": [
+        "Both are always unplanned",
+        "Failover requires a healthy primary",
+        "Switchover is planned with no data loss; failover is unplanned and may lose data",
+        "Switchover loses data; failover never does"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Un switchover est planifié alors que le primaire est sain : on attend que le standby soit à jour, donc le RPO est nul. Un failover intervient après une panne du primaire et le standby peut avoir du retard, d'où une perte possible des dernières transactions. Un failover ne nécessite pas un primaire sain, c'est même l'inverse. Les deux événements changent la topologie et exigent une vérification applicative.",
+      "topic": "ha concepts"
+    },
+    {
+      "id": "hcie-og-03-q14",
+      "type": "single",
+      "prompt": "What does point-in-time recovery require?",
+      "options": [
+        "Only a logical gs_dump",
+        "A running standby and no archive",
+        "A VACUUM FULL before restore",
+        "A base backup, archived WAL files and a recovery target"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Le PITR restaure une sauvegarde physique puis rejoue les WAL archivés jusqu'à la cible temporelle voulue, avant promotion. Un gs_dump seul ne permet pas de rejouer les transactions jusqu'à un instant précis. Un standby n'est pas nécessaire au PITR et l'archivage est au contraire indispensable. VACUUM FULL n'a aucun rôle dans la restauration.",
+      "topic": "pitr"
+    },
+    {
+      "id": "hcie-og-03-q15",
+      "type": "single",
+      "prompt": "What is the first consequence of a failing archive_command?",
+      "options": [
+        "WAL segments accumulate and can fill the disk",
+        "The optimizer stops collecting statistics",
+        "All indexes are rebuilt automatically",
+        "The standby is promoted immediately"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Si l'archivage échoue, les segments WAL ne peuvent plus être recyclés et s'accumulent dans pg_xlog jusqu'à saturer le disque. Les statistiques et les index ne sont pas concernés. Aucune promotion automatique ne se déclenche à cause de l'archivage. La correction consiste à rétablir l'archivage puis à laisser le checkpoint recycler les segments.",
+      "topic": "archiving"
+    },
+    {
+      "id": "hcie-og-03-q16",
+      "type": "multi",
+      "prompt": "Which sources are relevant when diagnosing a database incident? (Choose 3)",
+      "options": [
+        "pg_stat_activity and pg_locks",
+        "Operating system logs and I/O metrics",
+        "WDR reports and statement history",
+        "Only the application source code"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Les vues de sessions et de verrous montrent l'état courant. Les logs système et les métriques d'I/O révèlent les causes externes, OOM, disque ou réseau. WDR et statement_history fournissent l'historique des charges et des requêtes. Le code applicatif peut être utile mais ne suffit pas : il n'indique ni l'état du cluster ni la saturation matérielle.",
+      "topic": "evidence sources"
+    },
+    {
+      "id": "hcie-og-03-q17",
+      "type": "multi",
+      "prompt": "Which tool-to-purpose matches are correct? (Choose 3)",
+      "options": [
+        "gs_basebackup performs a physical base backup",
+        "gs_dump exports a logical dump of a database",
+        "gs_probackup manages full and incremental backups",
+        "gs_ctl query performs a point-in-time restore"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "gs_basebackup copie les fichiers de l'instance pour une sauvegarde physique. gs_dump produit un export logique en SQL ou en archive. gs_probackup catalogue et gère des sauvegardes complètes et incrémentales. gs_ctl query affiche l'état d'une instance ; il ne restaure pas et ne rejoue pas les WAL jusqu'à un instant donné.",
+      "topic": "backup tools"
+    },
+    {
+      "id": "hcie-og-03-q18",
+      "type": "tf",
+      "prompt": "A switchover is an unplanned event caused by a primary failure.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un switchover est au contraire une bascule planifiée, réalisée lorsque le primaire et le standby sont sains, avec un RPO nul. C'est le failover qui est subi après une panne du primaire et peut entraîner une perte des dernières transactions. La confusion entre les deux est un piège classique d'examen et de production.",
+      "topic": "switchover vs failover"
+    },
+    {
+      "id": "hcie-og-03-q19",
+      "type": "text",
+      "prompt": "Name the SQL function that returns the current WAL insert location in openGauss (one function name).",
+      "accept": [
+        "pg_current_xlog_location",
+        "pg_current_xlog_location()"
+      ],
+      "sample_answer": "pg_current_xlog_location()",
+      "explanation_fr": "pg_current_xlog_location() renvoie le LSN courant du WAL sous forme hexadécimale. Il permet de comparer la position du primaire et celle rejouée par un standby, ou de vérifier jusqu'où le recovery est allé. pg_controldata donne le dernier checkpoint enregistré, pas la position courante. La fonction ne modifie rien et peut être appelée en supervision.",
+      "topic": "wal location"
+    },
+    {
+      "id": "hcie-og-03-q20",
+      "type": "single",
+      "prompt": "What makes a runbook genuinely usable during an incident?",
+      "options": [
+        "A promise to investigate later",
+        "Exact commands, decision criteria and tested rollback steps",
+        "A long theoretical description of the architecture",
+        "A list of all possible SQL syntaxes"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un runbook utile contient les commandes exactes, les critères qui déclenchent chaque décision, la procédure de rollback et les points de vérification. Une description théorique ne guide pas l'action sous pression. Une liste exhaustive de syntaxes noie l'information. Promettre une enquête ultérieure ne résout pas l'incident. Le runbook doit être testé en drill et mis à jour après chaque incident.",
+      "topic": "runbook"
+    }
+  ]
+}

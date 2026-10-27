@@ -1,0 +1,598 @@
+{
+  "id": "hcip-oe-02",
+  "phase": "HCIP",
+  "subject": "openEuler",
+  "number": 2,
+  "title_fr": "Stockage partagé : iSCSI, NFS et GlusterFS",
+  "title_en": "Shared Storage: iSCSI, NFS and GlusterFS",
+  "minutes": 50,
+  "source": "HCIP-openEuler V1.0 Training Material — Session 3 «Storage · Shared Storage · Distributed Storage» · Lab Guide",
+  "objectives": [
+    "Distinguer stockage bloc, fichier et objet et choisir le modèle adapté",
+    "Configurer une cible iSCSI avec targetcli et un initiateur avec iscsiadm",
+    "Exporter et sécuriser un répertoire NFS avec /etc/exports et exportfs",
+    "Créer, étendre et réparer un volume GlusterFS répliqué ou distribué",
+    "Exploiter et sauvegarder un stockage partagé sans corrompre les données"
+  ],
+  "sections": [
+    {
+      "heading": "Panorama : DAS, NAS, SAN et stockage distribué",
+      "body": "Le stockage se pense d'abord en termes d'accès, pas de technologie. Le DAS est un disque branché directement à un serveur : rapide et simple, mais non partageable. Le NAS expose des fichiers sur le réseau, généralement via NFS ou SMB, et convient aux répertoires partagés. Le SAN expose des blocs via iSCSI ou Fibre Channel : le client voit un disque brut, le formate et le monte comme un disque local. Le stockage objet, enfin, manipule des objets via une API HTTP de type S3, sans arborescence POSIX.\n\nCette distinction explique les usages. Une base de données préfère le bloc, car elle maîtrise le système de fichiers et les entrées-sorties. Un partage d'équipe utilise le fichier, car plusieurs machines doivent lire et écrire les mêmes chemins. Des archives ou des images immuables vont vers l'objet, qui supporte une montée en charge massive.\n\nAttention au piège classique : un LUN bloc partagé en lecture-écriture par deux hôtes sans système de fichiers clusterisé provoque une corruption. Le fichier, lui, gère la concurrence au niveau du serveur NFS.",
+      "bullets": [
+        "DAS : accès local, non partagé, très faible latence",
+        "NAS : accès fichier par NFS ou SMB, partage multi-clients",
+        "SAN : accès bloc par iSCSI ou Fibre Channel, vu comme un disque local",
+        "Objet : API HTTP de type S3, adapté aux archives et au très grande échelle"
+      ],
+      "code": [],
+      "table": {
+        "headers": [
+          "Modèle",
+          "Unité exposée",
+          "Protocole",
+          "Usage typique"
+        ],
+        "rows": [
+          [
+            "DAS",
+            "Bloc local",
+            "SATA, SAS, NVMe",
+            "Disque système, serveur isolé"
+          ],
+          [
+            "NAS",
+            "Fichier",
+            "NFS, SMB",
+            "Partage de répertoires"
+          ],
+          [
+            "SAN",
+            "Bloc réseau",
+            "iSCSI, Fibre Channel",
+            "Bases, machines virtuelles"
+          ],
+          [
+            "Objet",
+            "Objet",
+            "HTTP, S3",
+            "Archives, images, sauvegardes"
+          ]
+        ]
+      },
+      "tip": "Un LUN n'est pas un système de fichiers : il faut le partitionner, le formater et le monter. Confondre les deux niveaux est l'erreur la plus fréquente en examen."
+    },
+    {
+      "heading": "iSCSI : principes et configuration de la cible",
+      "body": "iSCSI transporte des commandes SCSI dans TCP/IP. Le client, appelé initiateur, ouvre une session vers une cible qui expose un ou plusieurs LUN. Chaque extrémité possède un IQN, identifiant de la forme iqn.aaaa-mm.domaine-inverse:nom. Le portail d'écoute est le port TCP 3260. Cette architecture permet de construire un SAN sur un réseau Ethernet standard, sans switch Fibre Channel.\n\nCôté serveur, targetcli configure le backstore, c'est-à-dire le disque ou le fichier qui porte les données, puis crée un LUN, un target et un portail. Une ACL restreint l'accès à l'IQN de l'initiateur autorisé. Sans ACL, la cible peut être visible par des clients indésirables ; avec CHAP, on ajoute une authentification par secret partagé.\n\nLes commandes targetcli sont hiérarchiques : /backstores, /iscsi, /loopback. On termine par saveconfig pour rendre la configuration persistante. Le service target doit être activé et le port 3260 ouvert dans firewalld.",
+      "bullets": [
+        "Initiator côté client, target côté serveur, LUN comme unité logique",
+        "IQN obligatoire et unique pour identifier chaque extrémité",
+        "targetcli configure backstore, LUN, portail et ACL",
+        "CHAP ajoute une authentification, le portail écoute sur 3260"
+      ],
+      "code": [
+        "sudo dnf install -y targetcli",
+        "sudo targetcli /backstores/block create disk1 /dev/sdb",
+        "sudo targetcli /iscsi create iqn.2026-01.lab.openeuler:target1",
+        "sudo targetcli /iscsi/iqn.2026-01.lab.openeuler:target1/tpg1/luns create /backstores/block/disk1",
+        "sudo targetcli /iscsi/iqn.2026-01.lab.openeuler:target1/tpg1/acls create iqn.2026-01.lab.openeuler:client1",
+        "sudo targetcli /iscsi/iqn.2026-01.lab.openeuler:target1/tpg1/portals create 10.0.0.5 3260",
+        "sudo targetcli saveconfig"
+      ],
+      "diagram": "+----------------+        TCP 3260        +----------------+\n| Initiateur     |<---------------------->| Cible iSCSI    |\n| IQN client1    |   commandes SCSI/IP    | IQN target1    |\n| /dev/sdb       |                        | LUN -> /dev/sdb|\n+----------------+                        +----------------+\n        ^                                          ^\n        |            ACL + CHAP                   |\n        +------------------------------------------+\n\nLe LUN expose un bloc brut : partitionnement\net formatage restent a la charge du client.",
+      "exercises": [
+        {
+          "prompt": "Sur le serveur 10.0.0.5, exposez le disque /dev/sdb comme LUN dans la cible iqn.2026-01.lab.openeuler:target1, autorisez uniquement l'initiateur iqn.2026-01.lab.openeuler:client1 et écoutez sur le port 3260.",
+          "correction": "On crée d'abord un backstore bloc nommé disk1 sur /dev/sdb, puis la cible avec /iscsi create. On ajoute le LUN dans le tpg1 avec luns create /backstores/block/disk1. L'ACL se crée avec acls create suivi de l'IQN client, ce qui restreint l'accès. Le portail se déclare avec portals create 10.0.0.5 3260. Enfin, saveconfig rend la configuration persistante et firewalld doit autoriser le port 3260/tcp."
+        }
+      ],
+      "tip": "Un backstore file est un simple fichier, plus lent qu'un backstore block. Pour une base de données, préférez un disque dédié en backstore block."
+    },
+    {
+      "heading": "iSCSI côté initiateur : découverte, session et montage",
+      "body": "Sur le client, le paquet iscsi-initiator-utils fournit iscsid et iscsiadm. La découverte interroge le portail avec sendtargets et enregistre les cibles trouvées. La connexion se fait ensuite par iscsiadm -m node -T IQN -p IP --login. Le noyau crée alors un périphérique bloc, par exemple /dev/sdb, qu'il faut partitionner, formater et monter.\n\nDeux précautions sont essentielles. D'abord, l'IQN de l'initiateur doit correspondre à celui autorisé dans l'ACL de la cible. Ensuite, un même LUN ne doit jamais être monté en écriture par deux hôtes indépendants : les caches des deux noyaux divergent et le système de fichiers se corrompt. Pour un partage réel, il faut GFS2, OCFS2 ou un verrou applicatif.\n\nEn production, on ajoute souvent multipath pour utiliser deux liens réseau redondants. multipath -ll affiche les chemins et leurs états. La persistance se règle avec node.startup=automatic et le montage dans fstab avec _netdev.",
+      "bullets": [
+        "iscsiadm -m discovery -t sendtargets -p IP découvre les cibles",
+        "iscsiadm -m node -T IQN -p IP --login ouvre la session",
+        "Le LUN apparaît comme /dev/sdX puis doit être formaté et monté",
+        "Multipath apporte la redondance des chemins réseau"
+      ],
+      "code": [
+        "sudo dnf install -y iscsi-initiator-utils",
+        "sudo cat /etc/iscsi/initiatorname.iscsi",
+        "sudo iscsiadm -m discovery -t sendtargets -p 10.0.0.5",
+        "sudo iscsiadm -m node -T iqn.2026-01.lab.openeuler:target1 -p 10.0.0.5 --login",
+        "lsblk",
+        "sudo mkfs.xfs /dev/sdb",
+        "sudo mount /dev/sdb /mnt/data"
+      ],
+      "exercises": [
+        {
+          "prompt": "Le portail est 10.0.0.5 et la cible iqn.2026-01.lab.openeuler:target1. Donnez la séquence de découverte puis de connexion, et indiquez comment vérifier que la session est active.",
+          "correction": "La découverte s'effectue avec iscsiadm -m discovery -t sendtargets -p 10.0.0.5, ce qui enregistre la cible dans la base locale. La connexion utilise iscsiadm -m node -T iqn.2026-01.lab.openeuler:target1 -p 10.0.0.5 --login. On vérifie avec iscsiadm -m session -P 3, qui affiche l'état de la session et les LUN, puis avec lsblk pour repérer le nouveau disque. Si la connexion échoue, contrôler l'IQN local dans /etc/iscsi/initiatorname.iscsi et l'ACL côté cible."
+        }
+      ],
+      "tip": "La session iSCSI revient après redémarrage seulement si node.startup vaut automatic. Un montage fstab sans _netdev peut échouer car le réseau n'est pas encore prêt."
+    },
+    {
+      "heading": "NFS : export, options et sécurité",
+      "body": "NFS partage un répertoire, pas un disque brut : le serveur reste propriétaire du système de fichiers et arbitre les accès. Le fichier /etc/exports décrit chaque export, le réseau autorisé et les options. rw autorise l'écriture, ro la lecture seule, sync force l'écriture disque avant l'acquittement et root_squash ramène l'UID 0 du client à nobody.\n\nroot_squash est le comportement par défaut et la bonne pratique. no_root_squash donne au root du client les pleins pouvoirs sur les fichiers exportés : pratique en laboratoire, dangereux en production. all_squash ramène tous les utilisateurs à un compte anonyme, utile pour un dépôt public. anonuid et anongid fixent l'identité de ce compte anonyme.\n\nAprès modification, exportfs -ra recharge la table sans redémarrer NFS. showmount -e localhost vérifie ce que le serveur publie. Le port 2049 doit être ouvert, et NFSv4 n'a plus besoin de rpcbind contrairement à NFSv3.",
+      "bullets": [
+        "/etc/exports : chemin, réseau autorisé et options entre parenthèses",
+        "root_squash est le défaut, no_root_squash est une exception à éviter",
+        "exportfs -ra applique la configuration sans redémarrer le service",
+        "showmount -e et exportfs -v vérifient les exports actifs"
+      ],
+      "code": [
+        "sudo dnf install -y nfs-utils",
+        "echo '/srv/nfs/data 10.0.0.0/24(rw,sync,root_squash)' | sudo tee -a /etc/exports",
+        "sudo exportfs -ra",
+        "sudo showmount -e localhost",
+        "sudo firewall-cmd --permanent --add-service=nfs",
+        "sudo firewall-cmd --reload"
+      ],
+      "table": {
+        "headers": [
+          "Option",
+          "Effet",
+          "Recommandation"
+        ],
+        "rows": [
+          [
+            "rw",
+            "Autorise lecture et écriture",
+            "Selon le besoin"
+          ],
+          [
+            "ro",
+            "Lecture seule",
+            "Exports de référence"
+          ],
+          [
+            "sync",
+            "Écriture disque avant acquittement",
+            "Valeur sûre par défaut"
+          ],
+          [
+            "root_squash",
+            "Root client mappé en nobody",
+            "Défaut à conserver"
+          ],
+          [
+            "no_root_squash",
+            "Root client conservé",
+            "À éviter en production"
+          ],
+          [
+            "all_squash",
+            "Tous les utilisateurs anonymisés",
+            "Dépôt public"
+          ]
+        ]
+      },
+      "tip": "Sans root_squash, un conteneur ou un utilisateur root sur le client peut modifier les fichiers du serveur avec les droits de root. C'est une élévation de privilèges classique."
+    },
+    {
+      "heading": "NFS côté client : versions, montage et pannes",
+      "body": "Le client monte un export avec mount -t nfs, ou une entrée fstab contenant _netdev pour attendre la disponibilité du réseau. NFSv4 utilise uniquement le port 2049 et intègre la gestion des verrous ; NFSv3 s'appuie sur rpcbind, mountd et statd, ce qui complique le filtrage. En environnement moderne, vers=4.2 est un bon choix par défaut.\n\nLe type de montage change le comportement en cas de panne. Un hard mount réessaie indéfiniment et peut figer le processus client ; c'est le choix sûr pour l'intégrité des données. Un soft mount renvoie une erreur après un timeout, ce qui évite le blocage mais expose à des écritures partielles. timeo et retrans règlent les délais et les tentatives.\n\nPour le diagnostic, mount | grep nfs, nfsstat -m et dmesg montrent les options réellement appliquées et les erreurs. Attention aux UID : sans annuaire centralisé, un utilisateur peut perdre ses droits sur l'export.",
+      "bullets": [
+        "NFSv4 ne dépend que du port 2049, NFSv3 exige rpcbind et mountd",
+        "_netdev retarde le montage jusqu'à la disponibilité du réseau",
+        "hard mount privilégie l'intégrité, soft mount privilégie la disponibilité",
+        "nfsstat -m et dmesg révèlent les options et erreurs réelles"
+      ],
+      "code": [
+        "sudo mount -t nfs -o vers=4.2 10.0.0.5:/srv/nfs/data /mnt/data",
+        "echo '10.0.0.5:/srv/nfs/data /mnt/data nfs defaults,_netdev,vers=4.2 0 0' | sudo tee -a /etc/fstab",
+        "nfsstat -m",
+        "sudo umount /mnt/data"
+      ],
+      "tip": "Un montage soft peut provoquer des corruptions silencieuses en écriture. Pour une base de données, utilisez hard et surveillez le serveur, ou un stockage bloc."
+    },
+    {
+      "heading": "GlusterFS : architecture et types de volumes",
+      "body": "GlusterFS agrège des serveurs en un pool de confiance et expose un système de fichiers distribué aux clients. L'unité de base est le brick : un répertoire exporté sur un serveur. Un volume est un ensemble de bricks. Le démon glusterd gère le cluster, tandis que le client monte le volume via FUSE ou le module natif.\n\nLes types de volumes déterminent le compromis entre capacité et sécurité. Un volume distribué répartit les fichiers par hachage, comme un RAID 0 : la capacité s'additionne, mais la perte d'un brick perd les fichiers qu'il contenait. Un volume répliqué copie chaque fichier sur chaque brick, comme un RAID 1 : la capacité utile est celle du plus petit brick. Un volume distribué-répliqué combine les deux, avec un nombre de bricks multiple du facteur de réplication.\n\nLe volume dispersé utilise des codes d'effacement, proche d'un RAID 5 ou 6 : il économise de l'espace tout en tolérant la perte de plusieurs bricks.",
+      "bullets": [
+        "Brick = répertoire exporté par un nœud du pool de confiance",
+        "Distribué = capacité sans redondance, comparable à RAID 0",
+        "Répliqué = copie complète sur chaque brick, comparable à RAID 1",
+        "Distribué-répliqué combine capacité et haute disponibilité",
+        "Dispersé utilise des codes d'effacement et tolère plusieurs pertes"
+      ],
+      "code": [
+        "sudo gluster peer probe node2",
+        "sudo gluster volume create vol1 replica 2 node1:/data/brick1 node2:/data/brick1 force",
+        "sudo gluster volume start vol1",
+        "sudo gluster volume info vol1",
+        "sudo mount -t glusterfs node1:/vol1 /mnt/vol1"
+      ],
+      "diagram": "Volume replique 2\n\n  node1                  node2\n+---------+            +---------+\n| brick1  |<--sync---->| brick1  |\n| F1 F2   |            | F1 F2   |\n+---------+            +---------+\n     \\                    /\n      \\                  /\n       +---- clients ----+\n\nChaque fichier existe en double.\nUn noeud peut tomber : le volume\nreste lisible, puis se resynchronise\navec gluster volume heal.",
+      "exercises": [
+        {
+          "prompt": "Créez un volume GlusterFS nommé vol1 répliqué deux fois avec node1:/data/brick1 et node2:/data/brick1, démarrez-le et vérifiez sa configuration.",
+          "correction": "On joint node2 au pool avec gluster peer probe node2 depuis node1. On crée le volume avec gluster volume create vol1 replica 2 node1:/data/brick1 node2:/data/brick1 force. Le facteur replica 2 impose au moins deux bricks et chaque fichier sera copié sur les deux. On démarre avec gluster volume start vol1, puis on contrôle avec gluster volume info vol1. Le montage client se fait avec mount -t glusterfs node1:/vol1 /mnt/vol1."
+        }
+      ],
+      "tip": "Avec replica 2, un split-brain est possible si les deux nœuds divergent pendant une coupure. La documentation GlusterFS recommande au moins trois réplicas pour les données critiques."
+    },
+    {
+      "heading": "Exploitation, extension et choix du stockage",
+      "body": "La création d'un volume GlusterFS suit un ordre précis. gluster peer probe joint un serveur au pool, gluster volume create déclare les bricks, puis gluster volume start rend le volume disponible. Le client monte avec mount -t glusterfs serveur:/volume /mnt. Une ACL auth.allow limite les clients autorisés.\n\nL'exploitation courante consiste à ajouter de la capacité avec add-brick, puis à rééquilibrer avec rebalance. Après une panne, heal resynchronise les répliques ; sans lui, un fichier modifié pendant l'indisponibilité peut rester divergent. Les snapshots et la géo-réplication couvrent la sauvegarde, mais ne remplacent pas une copie hors site.\n\nLe choix final dépend du besoin. Pour une machine virtuelle ou une base, le bloc iSCSI offre les meilleures performances. Pour un partage simple entre serveurs Linux, NFS reste le plus rapide à exploiter. Pour un volume critique réparti sur plusieurs nœuds, GlusterFS répliqué apporte capacité et continuité de service.",
+      "bullets": [
+        "peer probe, volume create, volume start : l'ordre de mise en place",
+        "add-brick puis rebalance pour étendre un volume",
+        "heal resynchronise les répliques après une panne",
+        "Le choix dépend du besoin : performance bloc, simplicité fichier, échelle distribué"
+      ],
+      "code": [
+        "sudo gluster volume add-brick vol1 replica 2 node3:/data/brick1 node4:/data/brick1 force",
+        "sudo gluster volume rebalance vol1 start",
+        "sudo gluster volume heal vol1 full",
+        "sudo gluster volume status vol1",
+        "sudo gluster volume set vol1 auth.allow 10.0.0.*"
+      ],
+      "table": {
+        "headers": [
+          "Besoin",
+          "Solution",
+          "Justification"
+        ],
+        "rows": [
+          [
+            "Base de données, machine virtuelle",
+            "iSCSI bloc",
+            "Latence faible, contrôle du système de fichiers"
+          ],
+          [
+            "Partage de fichiers entre serveurs",
+            "NFS",
+            "Mise en œuvre simple, concurrence gérée"
+          ],
+          [
+            "Volume critique multi-nœuds",
+            "GlusterFS répliqué",
+            "Continuité de service et redondance"
+          ],
+          [
+            "Archive massive, API HTTP",
+            "Stockage objet S3",
+            "Scalabilité et accès par API"
+          ]
+        ]
+      },
+      "tip": "rebalance ne se lance pas après chaque ajout de brick sans vérifier l'espace : il déplace des données et peut saturer temporairement un nœud."
+    }
+  ],
+  "key_points": [
+    "DAS, NAS, SAN et objet se distinguent par l'unité exposée et le protocole",
+    "iSCSI : initiateur, cible, LUN et IQN, portail TCP 3260",
+    "targetcli configure backstore, LUN, ACL et portail, puis saveconfig",
+    "iscsiadm découvre avec sendtargets puis ouvre une session par IQN",
+    "Un LUN en écriture partagée exige un système de fichiers clusterisé",
+    "NFS : exportfs -ra applique /etc/exports, root_squash est le défaut sûr",
+    "NFSv4 tient sur le port 2049, NFSv3 dépend de rpcbind et mountd",
+    "GlusterFS : distribué pour la capacité, répliqué pour la disponibilité, heal après panne"
+  ],
+  "traps": [
+    "Monter le même LUN iSCSI en lecture-écriture sur deux hôtes sans GFS2 ou OCFS2",
+    "Croire que no_root_squash est plus sûr que root_squash : c'est l'inverse",
+    "Oublier exportfs -ra après modification de /etc/exports et tester une configuration non appliquée",
+    "Confondre volume distribué et répliqué : le premier n'offre aucune redondance",
+    "Lancer un rebalance sans espace libre suffisant et saturer un brick"
+  ],
+  "quiz": [
+    {
+      "id": "hcip-oe-02-q01",
+      "type": "single",
+      "prompt": "Which TCP port does an iSCSI portal listen on by default?",
+      "options": [
+        "3260",
+        "445",
+        "111",
+        "2049"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le portail iSCSI écoute par défaut sur TCP 3260. Le port 2049 est celui de NFSv4, 445 celui de SMB et 111 celui de rpcbind. Ces trois derniers appartiennent à d'autres protocoles de stockage ou de partage de fichiers.",
+      "topic": "iSCSI ports"
+    },
+    {
+      "id": "hcip-oe-02-q02",
+      "type": "single",
+      "prompt": "Which command discovers iSCSI targets exposed by portal 10.0.0.5?",
+      "options": [
+        "gluster peer probe 10.0.0.5",
+        "iscsiadm -m discovery -t sendtargets -p 10.0.0.5",
+        "targetcli /iscsi create 10.0.0.5",
+        "showmount -e 10.0.0.5"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "iscsiadm en mode discovery avec le type sendtargets interroge le portail et enregistre les cibles trouvées. targetcli sert à configurer la cible côté serveur, pas à la découvrir. showmount concerne NFS et gluster peer probe joint un nœud GlusterFS.",
+      "topic": "iSCSI discovery"
+    },
+    {
+      "id": "hcip-oe-02-q03",
+      "type": "single",
+      "prompt": "Which identifier format is used for an iSCSI initiator or target?",
+      "options": [
+        "iscsi://ip:port/lun",
+        "wwn.xxxxxxxxxxxxxxxx",
+        "iqn.yyyy-mm.reverse-domain:identifier",
+        "uuid://domain/identifier"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Un IQN suit le format iqn.aaaa-mm.domaine-inverse:identifiant, par exemple iqn.2026-01.lab.openeuler:target1. Les UUID et les adresses iscsi:// ne sont pas des IQN. Le format wwn désigne un identifiant Fibre Channel, pas iSCSI.",
+      "topic": "iSCSI naming"
+    },
+    {
+      "id": "hcip-oe-02-q04",
+      "type": "single",
+      "prompt": "With the default root_squash option, what identity does the client's root user receive on an NFS export?",
+      "options": [
+        "daemon",
+        "admin",
+        "root",
+        "nobody"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "root_squash ramène l'UID 0 du client vers le compte anonyme nobody, ce qui empêche un root distant de modifier les fichiers avec les pleins pouvoirs. Les comptes daemon et admin ne sont pas les cibles de ce mappage. Sans cette protection, il faudrait explicitement no_root_squash.",
+      "topic": "NFS security"
+    },
+    {
+      "id": "hcip-oe-02-q05",
+      "type": "single",
+      "prompt": "Which port does NFSv4 use for its communication?",
+      "options": [
+        "2049",
+        "3260",
+        "445",
+        "111"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "NFSv4 centralise ses échanges sur le port 2049 et intègre la gestion des verrous. Le port 111 est celui de rpcbind, nécessaire à NFSv3 mais pas à NFSv4. Les ports 3260 et 445 correspondent respectivement à iSCSI et à SMB.",
+      "topic": "NFS versions"
+    },
+    {
+      "id": "hcip-oe-02-q06",
+      "type": "single",
+      "prompt": "Which command applies changes made to /etc/exports without restarting the NFS service?",
+      "options": [
+        "systemctl reload nfs",
+        "exportfs -ra",
+        "showmount -e",
+        "nfsstat -m"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "exportfs -ra relit /etc/exports et applique immédiatement les exports, sans interrompre les clients existants. showmount se contente d'afficher les exports publiés. nfsstat affiche des statistiques et systemctl reload nfs n'est pas la méthode canonique de rechargement des exports.",
+      "topic": "NFS export management"
+    },
+    {
+      "id": "hcip-oe-02-q07",
+      "type": "single",
+      "prompt": "Which GlusterFS volume type stores a complete copy of every file on each brick?",
+      "options": [
+        "Distributed dispersed",
+        "Distributed",
+        "Replicated",
+        "Dispersed"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Un volume répliqué copie chaque fichier sur tous les bricks, comme un RAID 1, et conserve le service si un nœud tombe. Un volume distribué répartit les fichiers sans copie, et un volume dispersé utilise des codes d'effacement. Le distribué-dispersé combine distribution et codage, mais ne duplique pas intégralement chaque fichier.",
+      "topic": "GlusterFS volume types"
+    },
+    {
+      "id": "hcip-oe-02-q08",
+      "type": "single",
+      "prompt": "What is a brick in GlusterFS?",
+      "options": [
+        "A physical hard disk dedicated to RAID",
+        "A client-side cache block",
+        "A TCP port used by glusterd",
+        "An exported directory on a server in the trusted storage pool"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Le brick est l'unité de stockage de base : un répertoire exporté par un serveur membre du pool de confiance. Ce n'est pas nécessairement un disque entier ni un périphérique RAID. Ce n'est pas non plus un cache client ni un port ; glusterd est le démon de gestion du cluster.",
+      "topic": "GlusterFS architecture"
+    },
+    {
+      "id": "hcip-oe-02-q09",
+      "type": "single",
+      "prompt": "How many bricks are required at minimum for a GlusterFS volume with replica 2?",
+      "options": [
+        "2",
+        "3",
+        "4",
+        "1"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Un facteur de réplication 2 exige au moins deux bricks, un par copie. Trois bricks ne sont pas un minimum mais sont recommandés pour réduire le risque de split-brain. Un seul brick ne peut pas porter deux réplicas et quatre bricks correspondent déjà à un volume distribué-répliqué 2x2.",
+      "topic": "GlusterFS sizing"
+    },
+    {
+      "id": "hcip-oe-02-q10",
+      "type": "single",
+      "prompt": "Which storage model is generally best for a database that needs low latency and full control of its filesystem?",
+      "options": [
+        "Object storage over S3",
+        "Block storage over iSCSI",
+        "NFS shared directory",
+        "SMB network share"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le stockage bloc expose un disque brut que la base formate et utilise directement, avec une latence faible et un contrôle total du système de fichiers. NFS et SMB ajoutent une couche réseau et un arbitrage de fichiers moins adapté aux I/O de base. Le stockage objet n'offre pas d'arborescence POSIX et convient mal à ce cas.",
+      "topic": "Storage selection"
+    },
+    {
+      "id": "hcip-oe-02-q11",
+      "type": "multi",
+      "prompt": "Which statements about NFS are correct? (Choose 2)",
+      "options": [
+        "NFSv3 locking does not require any auxiliary service",
+        "NFSv4 can operate with only TCP port 2049",
+        "exportfs -ra reloads the exports configuration",
+        "NFS is an object store compatible with S3"
+      ],
+      "answer": [
+        1,
+        2
+      ],
+      "explanation_fr": "NFSv4 regroupe ses services sur le port 2049 et gère les verrous en interne, tandis que exportfs -ra applique la configuration des exports. NFS est un système de fichiers réseau, pas un stockage objet S3. NFSv3 s'appuie au contraire sur statd et NLM pour les verrous.",
+      "topic": "NFS characteristics"
+    },
+    {
+      "id": "hcip-oe-02-q12",
+      "type": "multi",
+      "prompt": "Which are valid GlusterFS volume types? (Choose 3)",
+      "options": [
+        "Replicated",
+        "Distributed replicated",
+        "Mirrored LUN",
+        "Distributed"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "GlusterFS propose des volumes distribués, répliqués, distribués-répliqués, dispersés et distribués-dispersés. Mirrored LUN n'est pas un type de volume GlusterFS : la réplication se fait au niveau des bricks, pas par un miroir de LUN matériel. Les trois premières réponses sont donc correctes.",
+      "topic": "GlusterFS volume types"
+    },
+    {
+      "id": "hcip-oe-02-q13",
+      "type": "multi",
+      "prompt": "Which elements are part of an iSCSI storage setup? (Choose 3)",
+      "options": [
+        "Initiator",
+        "Target",
+        "LUN",
+        "NFS export"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "L'initiateur est le client, la cible expose le stockage et le LUN est l'unité logique présentée. L'export NFS appartient au partage de fichiers et n'intervient pas dans une session iSCSI. Une cible peut exposer plusieurs LUN, chacun identifié par un numéro.",
+      "topic": "iSCSI components"
+    },
+    {
+      "id": "hcip-oe-02-q14",
+      "type": "multi",
+      "prompt": "Which options are valid in /etc/exports for controlling NFS permissions? (Choose 3)",
+      "options": [
+        "root_squash",
+        "all_squash",
+        "no_root_squash",
+        "chmod_squash"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "root_squash anonymise root, all_squash anonymise tous les utilisateurs et no_root_squash conserve les privilèges de root. chmod_squash n'existe pas dans la syntaxe NFS. Ces options se placent entre parenthèses après le réseau autorisé.",
+      "topic": "NFS export options"
+    },
+    {
+      "id": "hcip-oe-02-q15",
+      "type": "tf",
+      "prompt": "A single iSCSI LUN can be mounted read-write by two unrelated servers at the same time without any cluster filesystem and without data corruption.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : deux noyaux indépendants mettent en cache les blocs et écrivent sans coordination, ce qui corrompt le système de fichiers. Il faut un système clusterisé comme GFS2 ou OCFS2, ou un seul propriétaire en écriture. Le fait que le LUN soit visible par deux hôtes ne signifie pas qu'il soit sûr de l'écrire simultanément.",
+      "topic": "Shared block storage"
+    },
+    {
+      "id": "hcip-oe-02-q16",
+      "type": "tf",
+      "prompt": "A GlusterFS replicated volume can continue serving reads and writes when one of its bricks is offline.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : chaque brick répliqué possède une copie complète, donc le volume reste accessible tant qu'une copie est disponible. Au retour du nœud, gluster volume heal resynchronise les données modifiées pendant la panne. Un volume simplement distribué ne bénéficierait pas de cette tolérance.",
+      "topic": "GlusterFS availability"
+    },
+    {
+      "id": "hcip-oe-02-q17",
+      "type": "tf",
+      "prompt": "no_root_squash is safer than root_squash because it preserves the client's administrative privileges.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : conserver les privilèges de root distant permet à un client compromis de modifier tous les fichiers de l'export. root_squash est la valeur par défaut et la pratique recommandée. no_root_squash ne se justifie que dans un laboratoire isolé ou pour un besoin très encadré.",
+      "topic": "NFS security"
+    },
+    {
+      "id": "hcip-oe-02-q18",
+      "type": "text",
+      "prompt": "Give the iscsiadm command that discovers targets with sendtargets on portal 10.0.0.5.",
+      "accept": [
+        "iscsiadm -m discovery -t sendtargets -p 10.0.0.5",
+        "iscsiadm -m discovery -t st -p 10.0.0.5",
+        "iscsiadm --mode discovery --type sendtargets --portal 10.0.0.5"
+      ],
+      "sample_answer": "iscsiadm -m discovery -t sendtargets -p 10.0.0.5",
+      "explanation_fr": "Le mode discovery interroge le portail indiqué, et le type sendtargets demande au serveur la liste de ses cibles. -p précise l'adresse et éventuellement le port, 3260 par défaut. La commande enregistre les cibles dans la base locale, mais n'ouvre pas encore de session.",
+      "topic": "iSCSI discovery command"
+    },
+    {
+      "id": "hcip-oe-02-q19",
+      "type": "text",
+      "prompt": "Which command re-reads /etc/exports and applies all NFS exports immediately?",
+      "accept": [
+        "exportfs -ra",
+        "exportfs -r -a",
+        "exportfs -rav",
+        "exportfs -a -r"
+      ],
+      "sample_answer": "exportfs -ra",
+      "explanation_fr": "exportfs -r relit la table des exports et -a applique l'ensemble des entrées. La commande ne redémarre pas NFS et préserve les montages existants. Pour un affichage détaillé, on ajoute -v, soit exportfs -rav.",
+      "topic": "NFS export command"
+    },
+    {
+      "id": "hcip-oe-02-q20",
+      "type": "text",
+      "prompt": "Which command adds node2 to a GlusterFS trusted storage pool from node1?",
+      "accept": [
+        "gluster peer probe node2",
+        "gluster peer probe node2.local",
+        "gluster peer probe node2 -p"
+      ],
+      "sample_answer": "gluster peer probe node2",
+      "explanation_fr": "gluster peer probe contacte le nœud cible et l'ajoute au pool de confiance, après quoi les volumes peuvent être créés sur ses bricks. La commande s'exécute depuis un nœud déjà membre du pool. Elle ne crée ni volume ni brick : elle établit seulement la relation de confiance.",
+      "topic": "GlusterFS cluster setup"
+    }
+  ]
+}

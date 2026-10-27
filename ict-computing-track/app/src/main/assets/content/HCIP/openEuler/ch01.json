@@ -1,0 +1,648 @@
+{
+  "id": "hcip-oe-01",
+  "phase": "HCIP",
+  "subject": "openEuler",
+  "number": 1,
+  "title_fr": "Services réseau et haute disponibilité LVS/Keepalived",
+  "title_en": "Network Services and HA with LVS/Keepalived",
+  "minutes": 50,
+  "source": "HCIP-openEuler V1.0 Training Material — Sessions 1-2 «Web Services (Apache/NGINX/DNS/MySQL/LAMP)» + «Clusters» · Lab Guide",
+  "objectives": [
+    "Publier un service HTTP avec NGINX et comprendre le rôle d'un reverse proxy",
+    "Construire un cluster LVS en modes NAT, DR et TUN avec ipvsadm",
+    "Choisir un algorithme de répartition adapté à la nature de l'application",
+    "Configurer Keepalived et VRRP pour rendre la VIP disponible en continu",
+    "Diagnostiquer une bascule ratée, une sonde inefficace ou un split-brain"
+  ],
+  "sections": [
+    {
+      "heading": "Services réseau : le socle systemd de production",
+      "body": "Un serveur openEuler de production n'est pas une collection de démons lancés à la main : c'est un ensemble d'unités systemd déclarées, activées et supervisées. La différence entre systemctl start et systemctl enable --now est fondamentale. start démarre le service pour la session courante, alors que enable crée les liens dans les cibles de démarrage et garantit sa reprise après un redémarrage. Sur un frontal web, on active donc nginx, firewalld, chronyd et, si nécessaire, named.\n\nChaque service doit être pensé avec son port, son utilisateur et son contexte SELinux. SSH reste la porte d'entrée administrative : authentification par clé, PermitRootLogin no, PasswordAuthentication no et éventuellement un port non standard réduisent fortement la surface d'attaque. firewalld n'ouvre que les flux nécessaires, par exemple https et ssh, et SELinux cible le type httpd_t pour NGINX. Enfin, chronyd doit être synchronisé : une dérive d'horloge casse les certificats TLS, brouille les journaux et fausse les corrélations d'incident.",
+      "bullets": [
+        "systemctl enable --now active un service immédiatement et le rend persistant au démarrage",
+        "SSH de production : clés uniquement, root interdit, nombre d'essais limité",
+        "firewalld n'expose que les services strictement nécessaires",
+        "chronyd maintient une horloge cohérente, indispensable à TLS et aux journaux"
+      ],
+      "code": [
+        "sudo systemctl enable --now nginx firewalld chronyd",
+        "sudo firewall-cmd --permanent --add-service=https",
+        "sudo firewall-cmd --reload",
+        "sudo sshd -T | grep -E 'permitrootlogin|passwordauthentication'"
+      ],
+      "table": {
+        "headers": [
+          "Commande",
+          "Effet",
+          "Persistance"
+        ],
+        "rows": [
+          [
+            "systemctl start nginx",
+            "Démarre pour la session courante",
+            "Non"
+          ],
+          [
+            "systemctl enable nginx",
+            "Active au prochain démarrage",
+            "Oui"
+          ],
+          [
+            "systemctl enable --now nginx",
+            "Démarre et active",
+            "Oui"
+          ],
+          [
+            "systemctl mask nginx",
+            "Interdit tout démarrage",
+            "Oui"
+          ]
+        ]
+      },
+      "tip": "À l'examen, enable ne démarre pas le service et start ne le rend pas persistant. La combinaison attendue pour un déploiement est enable --now."
+    },
+    {
+      "heading": "NGINX : publication HTTP et reverse proxy",
+      "body": "NGINX assure deux fonctions complémentaires : servir des contenus statiques et proxifier vers des applications. Dans un déploiement HA, il se place derrière LVS ou Keepalived et répartit la charge vers plusieurs instances applicatives. Le bloc upstream décrit les serveurs, leurs poids et leurs paramètres de santé. La directive proxy_pass transporte ensuite la requête vers ce pool.\n\nLe choix de l'algorithme dépend de l'état applicatif. Round robin convient à des serveurs identiques et sans session. least_conn avantage le serveur le moins chargé, alors que ip_hash colle un client à un serveur, utile pour une session locale mais fragile derrière un proxy NAT. weight permet de refléter une capacité différente. Les paramètres max_fails et fail_timeout retirent temporairement un backend défaillant, tandis que backup désigne un secours.\n\nUn reverse proxy correct transmet aussi les en-têtes X-Forwarded-For et Host, et gère les timeouts. Sans cela, les journaux applicatifs ne voient que l'adresse du proxy et le diagnostic devient aveugle.",
+      "bullets": [
+        "upstream définit le pool, proxy_pass route la requête vers ce pool",
+        "least_conn pour des requêtes de durée variable, weight pour des serveurs hétérogènes",
+        "max_fails et fail_timeout écartent temporairement un backend en échec",
+        "X-Forwarded-For et Host préservent l'information client pour les applications"
+      ],
+      "code": [
+        "upstream backend {\n    least_conn;\n    server 10.0.0.11:8080 weight=3 max_fails=3 fail_timeout=30s;\n    server 10.0.0.12:8080 weight=1 max_fails=3 fail_timeout=30s;\n    server 10.0.0.13:8080 backup;\n}",
+        "server {\n    listen 443 ssl;\n    location / {\n        proxy_pass http://backend;\n        proxy_set_header Host $host;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    }\n}"
+      ],
+      "table": {
+        "headers": [
+          "Algorithme NGINX",
+          "Principe",
+          "Cas d'usage"
+        ],
+        "rows": [
+          [
+            "round-robin",
+            "Tour à tour, défaut",
+            "Serveurs identiques, sans session"
+          ],
+          [
+            "least_conn",
+            "Moins de connexions actives",
+            "Requêtes longues et hétérogènes"
+          ],
+          [
+            "ip_hash",
+            "Hachage de l'adresse source",
+            "Affinité de session simple"
+          ],
+          [
+            "weight",
+            "Répartition pondérée",
+            "Capacités matérielles différentes"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Deux applications écoutent sur 10.0.0.11:8080 et 10.0.0.12:8080. Le second serveur est deux fois moins puissant. Écrivez un bloc upstream NGINX qui envoie deux fois plus de trafic au premier et retire un serveur après trois échecs pendant trente secondes.",
+          "correction": "On déclare un upstream nommé app, on donne weight=2 au premier serveur et weight=1 au second, puis on ajoute max_fails=3 et fail_timeout=30s sur chaque ligne server. Le bloc server utilise proxy_pass http://app. La pondération traduit la capacité, tandis que max_fails et fail_timeout évitent d'envoyer du trafic à un backend momentanément indisponible."
+        }
+      ],
+      "tip": "weight ne rend pas un serveur prioritaire au sens strict : il augmente sa part de requêtes. Un serveur backup ne reçoit du trafic que si tous les serveurs normaux sont considérés comme indisponibles."
+    },
+    {
+      "heading": "LVS et le mode NAT : la VIP au centre",
+      "body": "LVS, ou Linux Virtual Server, est un répartiteur de charge noyau fondé sur IPVS. Il expose une adresse virtuelle, la VIP, que les clients contactent. Le directeur reçoit la requête et choisit un serveur réel, abrégé RS, selon l'algorithme configuré. IPVS vit dans le noyau ; ipvsadm n'est que l'outil de configuration en espace utilisateur.\n\nEn mode NAT, le directeur réécrit la destination de la requête vers l'adresse du RS, puis réécrit la source de la réponse vers la VIP. Tous les paquets, aller et retour, traversent donc le directeur. Le routage IP doit être activé et le retour doit être correctement routé. Ce mode est simple et permet de placer les RS derrière le directeur, mais il devient un goulot d'étranglement et ne passe pas à l'échelle au-delà de quelques serveurs.\n\nLe mode NAT accepte aussi la modification de port : le client appelle le port 80 et le RS peut servir sur 8080. Cette souplesse explique son usage fréquent dans les maquettes et les clusters de petite taille.",
+      "bullets": [
+        "Le directeur porte la VIP ; les RS restent en réseau privé",
+        "NAT réécrit la destination à l'aller et la source au retour",
+        "net.ipv4.ip_forward=1 est obligatoire sur le directeur",
+        "Le directeur voit tout le trafic : c'est un point de saturation"
+      ],
+      "code": [
+        "sudo sysctl -w net.ipv4.ip_forward=1",
+        "sudo ipvsadm -A -t 192.168.1.10:80 -s rr",
+        "sudo ipvsadm -a -t 192.168.1.10:80 -r 10.0.0.2:8080 -m",
+        "sudo ipvsadm -a -t 192.168.1.10:80 -r 10.0.0.3:8080 -m",
+        "sudo ipvsadm -Ln"
+      ],
+      "diagram": "Client 192.168.1.50\n        |  requete : VIP:80\n        v\n+-----------------------+\n| Directeur LVS         |\n| VIP 192.168.1.10      |\n| DIP 10.0.0.1          |\n+-----------------------+\n        |  destination reecrite\n        v\n+-----------------------+\n| RS1 10.0.0.2:8080     |\n| RS2 10.0.0.3:8080     |\n+-----------------------+\n  retour via le directeur,\n  source reecrite en VIP",
+      "tip": "En NAT, oublier ip_forward=1 ou le masquerade de retour donne un cluster qui accepte la connexion mais dont les réponses n'arrivent jamais au client."
+    },
+    {
+      "heading": "LVS-DR et LVS-TUN : le retour direct",
+      "body": "Le mode DR, Direct Routing, est le mode par défaut de LVS et le plus performant. Le directeur ne réécrit pas les adresses IP : il change uniquement l'adresse MAC de destination pour celle du RS sélectionné, puis transmet la trame sur le même segment L2. Le RS voit une requête dont l'IP destination est la VIP, la traite, et renvoie sa réponse directement au client avec la VIP comme source. Seule l'entrée traverse le directeur.\n\nConséquence : le directeur et les RS doivent être dans le même domaine de diffusion, et chaque RS doit posséder la VIP sur une interface loopback ou factice. Pour éviter que plusieurs machines répondent aux ARP de la VIP, on applique arp_ignore=1 et arp_announce=2 sur les interfaces concernées. Le mode TUN conserve le retour direct mais encapsule la requête dans un tunnel IP, ce qui autorise des RS sur des réseaux différents.\n\nDR ne permet pas de changer le port de destination : le service doit écouter sur le même port que la VIP.",
+      "bullets": [
+        "DR réécrit les MAC, pas les IP : le RS répond directement au client",
+        "Directeur et RS doivent être sur le même segment L2",
+        "VIP sur loopback du RS, avec arp_ignore=1 et arp_announce=2",
+        "TUN encapsule la requête et autorise des RS distants"
+      ],
+      "code": [
+        "sudo ip addr add 10.0.0.10/32 dev lo",
+        "sudo sysctl -w net.ipv4.conf.all.arp_ignore=1",
+        "sudo sysctl -w net.ipv4.conf.all.arp_announce=2",
+        "sudo ipvsadm -A -t 10.0.0.10:80 -s wrr",
+        "sudo ipvsadm -a -t 10.0.0.10:80 -r 10.0.0.2:80 -g",
+        "sudo ipvsadm -a -t 10.0.0.10:80 -r 10.0.0.3:80 -g"
+      ],
+      "table": {
+        "headers": [
+          "Critère",
+          "NAT",
+          "DR",
+          "TUN"
+        ],
+        "rows": [
+          [
+            "Retour client",
+            "Via le directeur",
+            "Direct depuis le RS",
+            "Direct depuis le RS"
+          ],
+          [
+            "Réseau L2 commun",
+            "Non requis",
+            "Obligatoire",
+            "Non requis"
+          ],
+          [
+            "Changement de port",
+            "Possible",
+            "Impossible",
+            "Impossible"
+          ],
+          [
+            "Charge du directeur",
+            "Élevée",
+            "Faible",
+            "Faible"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Ajoutez le serveur réel 10.0.0.12, port 80, au service VIP 10.0.0.200:80 en mode Direct Routing, puis vérifiez que la ligne apparaît en mode Route.",
+          "correction": "La commande est ipvsadm -a -t 10.0.0.200:80 -r 10.0.0.12:80 -g. Le -a ajoute un serveur réel au service existant et -g sélectionne le forwarding par passerelle, c'est-à-dire DR. La vérification ipvsadm -Ln doit afficher une entrée TCP 10.0.0.200:80 avec la ligne 10.0.0.12:80 en Forward Route. Si le service n'existe pas encore, il faut d'abord le créer avec ipvsadm -A."
+        }
+      ],
+      "tip": "En DR, le test depuis le directeur lui-même peut échouer à cause du routage local vers la VIP. Testez toujours depuis un client du même segment, pas depuis le nœud qui porte la VIP."
+    },
+    {
+      "heading": "Algorithmes de répartition : statiques et dynamiques",
+      "body": "Le choix de l'algorithme détermine la qualité de répartition. Les algorithmes statiques ignorent la charge réelle : RR distribue à tour de rôle, WRR pondère par capacité, SH hache l'adresse source et DH hache la destination. Les algorithmes dynamiques observent les connexions actives. LC choisit le serveur le moins connecté, WLC, algorithme par défaut, divise ce compte par le poids. SED et NQ affinent le comportement en présence de poids hétérogènes.\n\nIl faut distinguer la répartition de la persistance. Une application qui stocke la session en mémoire locale a besoin d'affinité : -p avec un timeout, ou une table partagée type Redis. Pour un site statique, RR ou WRR suffisent. Pour une base de données ou un service à connexions longues, LC ou WLC sont plus adaptés.\n\nAttention : un algorithme ne remplace pas une sonde. Si un RS tombe, IPVS continue de lui envoyer du trafic tant que Keepalived ou un contrôle externe ne l'a pas retiré du pool.",
+      "bullets": [
+        "RR et WRR ignorent la charge, LC et WLC la prennent en compte",
+        "WLC est l'algorithme par défaut de LVS",
+        "SH assure une affinité par adresse source, utile pour les sessions",
+        "-p persistence_timeout complète l'affinité sur une période donnée"
+      ],
+      "code": [
+        "sudo ipvsadm -A -t 10.0.0.10:80 -s wlc",
+        "sudo ipvsadm -E -t 10.0.0.10:80 -s wrr",
+        "sudo ipvsadm -A -t 10.0.0.10:443 -s sh -p 600",
+        "sudo ipvsadm -Ln --sort"
+      ],
+      "table": {
+        "headers": [
+          "Algorithme",
+          "Type",
+          "Point fort"
+        ],
+        "rows": [
+          [
+            "rr",
+            "Statique",
+            "Répartition simple et prévisible"
+          ],
+          [
+            "wrr",
+            "Statique",
+            "Pondération par capacité"
+          ],
+          [
+            "lc",
+            "Dynamique",
+            "Suit les connexions actives"
+          ],
+          [
+            "wlc",
+            "Dynamique",
+            "Défaut, pondéré par le poids"
+          ],
+          [
+            "sh",
+            "Statique",
+            "Affinité par IP source"
+          ],
+          [
+            "dh",
+            "Statique",
+            "Affinité par IP destination, cache"
+          ]
+        ]
+      },
+      "tip": "Ne confondez pas SH et persistance : SH colle toutes les connexions d'une même IP source au même RS, alors que -p impose un délai de persistance même si l'algorithme change de cible entre-temps."
+    },
+    {
+      "heading": "Keepalived, VRRP et bascule de la VIP",
+      "body": "Keepalived apporte la haute disponibilité du frontal. Il implémente VRRP : plusieurs nœuds partagent une VIP, un seul est maître et répond aux ARP, les autres sont en secours. Le maître envoie périodiquement des annonces VRRP ; si les secours ne les reçoivent plus, celui qui a la plus forte priorité prend le relais et envoie un ARP gratuit pour déplacer la VIP.\n\nLa priorité va de 1 à 254, la valeur 255 étant réservée au propriétaire de l'adresse. Le virtual_router_id doit être identique sur les nœuds d'un même groupe et différent entre groupes. Par défaut, la préemption réinstalle le maître d'origine dès son retour ; nopreempt l'empêche. En cloud ou sur un réseau qui filtre le multicast, on remplace celui-ci par unicast_peer.\n\nUn script suivi par track_script ajuste la priorité si NGINX ou une sonde applicative échoue : le nœud cède la VIP avant même que la machine ne tombe. C'est la différence entre haute disponibilité machine et haute disponibilité de service.",
+      "bullets": [
+        "VRRP élit un maître par priorité, les autres restent en secours",
+        "virtual_router_id identique dans un groupe, unique entre groupes",
+        "track_script dégrade la priorité quand le service local échoue",
+        "unicast_peer remplace le multicast quand celui-ci est filtré"
+      ],
+      "code": [
+        "vrrp_script chk_nginx {\n    script \"/usr/local/bin/check_nginx.sh\"\n    interval 2\n    fall 3\n    rise 2\n    weight -60\n}",
+        "vrrp_instance VI_1 {\n    state BACKUP\n    interface ens3\n    virtual_router_id 51\n    priority 150\n    advert_int 1\n    authentication { auth_type PASS\n                     auth_pass Huawei@1 }\n    virtual_ipaddress { 192.168.1.10/24 }\n    track_script { chk_nginx }\n}"
+      ],
+      "diagram": "        VIP 192.168.1.10\n               |\n     +---------+---------+\n     |                   |\n+---------+         +---------+\n| MASTER  |<--VRRP-->| BACKUP  |\n| prio150 |  advert  | prio100 |\n+---------+  1 s     +---------+\n     |                   |\n  Nginx actif        Nginx pret\n\nSi le maitre tombe ou perd\nson script : le backup prend\nla VIP et envoie un ARP gratuit.",
+      "exercises": [
+        {
+          "prompt": "Deux nœuds NGINX doivent partager la VIP 192.168.1.10. Le premier doit être maître avec la priorité 150, le second secours avec 100. La bascule doit survenir si le script local check_nginx.sh échoue trois fois en deux secondes. Rédigez le bloc vrrp_instance du nœud maître.",
+          "correction": "On écrit vrrp_instance VI_1 avec state MASTER, interface ens3, virtual_router_id 51, priority 150 et advert_int 1. Le bloc authentication utilise auth_type PASS avec un mot de passe identique sur les deux nœuds. virtual_ipaddress contient 192.168.1.10/24. Le vrrp_script chk_nginx définit script, interval 2, fall 3 et weight -60, puis track_script appelle chk_nginx. Le poids négatif fait chuter la priorité de 150 à 90, ce qui passe sous le backup à 100 et déclenche la bascule. Avec un weight de -40, la priorité serait restée à 110 et aucun changement de maître ne se serait produit : le calibrage du poids est donc essentiel."
+        }
+      ],
+      "tip": "Un weight négatif mal calibré ne provoque aucune bascule : la priorité dégradée doit devenir inférieure à celle du backup. Vérifiez ce calcul avant de tester."
+    },
+    {
+      "heading": "Sondes, diagnostic et anti-split-brain",
+      "body": "Un cluster n'est fiable que si ses sondes le sont. Keepalived propose TCP_CHECK, qui teste l'ouverture d'un port, HTTP_GET, qui vérifie un code ou un digest sur une URL, et MISC_CHECK, qui exécute un script et interprète son code de sortie. Une sonde TCP peut réussir alors que l'application répond 500 : préférez une URL de santé applicative.\n\nLe diagnostic combine plusieurs niveaux. ipvsadm -Ln montre la table de services et les poids ; ipvsadm -Lnc affiche les connexions actives. ss -tlnp vérifie l'écoute locale, curl -v teste la VIP, tcpdump capture le VRRP ou le trafic client. Un split-brain se reconnaît à deux maîtres qui annoncent la même VIP : les journaux montrent des bascules répétées et les ARP se contredisent.\n\nLes contre-mesures sont l'unicast dédié, l'authentification VRRP, plusieurs liens de heartbeat et un script d'arbitrage. En production, on documente aussi la procédure de bascule manuelle et on teste le retour arrière.",
+      "bullets": [
+        "TCP_CHECK teste un port, HTTP_GET une URL, MISC_CHECK un script",
+        "ipvsadm -Lnc et ss -tlnp confirment l'état réel du trafic",
+        "Deux maîtres pour une même VIP signalent un split-brain",
+        "Unicast, authentification et liens redondants limitent le split-brain"
+      ],
+      "code": [
+        "sudo ipvsadm -Lnc",
+        "sudo tcpdump -i ens3 -nn proto 112",
+        "sudo ausearch -m avc -ts recent",
+        "sudo journalctl -u keepalived --since '30 min ago'"
+      ],
+      "table": {
+        "headers": [
+          "Sonde",
+          "Niveau",
+          "Échec détecté"
+        ],
+        "rows": [
+          [
+            "TCP_CHECK",
+            "Couche 4",
+            "Port fermé ou injoignable"
+          ],
+          [
+            "HTTP_GET",
+            "Couche 5",
+            "Code HTTP ou contenu incorrect"
+          ],
+          [
+            "SSL_GET",
+            "Couche 5",
+            "Erreur TLS ou contenu incorrect"
+          ],
+          [
+            "MISC_CHECK",
+            "Externe",
+            "Script métier en échec"
+          ]
+        ]
+      },
+      "tip": "Le protocole VRRP est le numéro 112, pas un port TCP. Un filtre tcpdump sur port 112 ne capture donc rien : utilisez proto 112."
+    }
+  ],
+  "key_points": [
+    "systemctl enable --now démarre et rend un service persistant au boot",
+    "NGINX répartit avec upstream et choisit round-robin, least_conn, ip_hash ou weight",
+    "LVS-NAT réécrit destination et source, tout le trafic traverse le directeur",
+    "LVS-DR réécrit les MAC, le RS répond directement et doit porter la VIP sur loopback",
+    "DR exige le même segment L2 et la suppression ARP avec arp_ignore=1, arp_announce=2",
+    "ipvsadm -A crée un service, -a ajoute un RS, -g pour DR, -m pour NAT, -Ln pour lister",
+    "Keepalived assure la VIP par VRRP, avec priorité, track_script et éventuel unicast",
+    "La détection d'échec applicatif distingue haute disponibilité machine et service"
+  ],
+  "traps": [
+    "Oublier ip_forward=1 en NAT : la connexion s'établit mais les réponses ne reviennent pas",
+    "Configurer la VIP DR sans arp_ignore et arp_announce : plusieurs RS répondent aux ARP",
+    "Croire que enable démarre le service : il ne fait que l'activer au boot",
+    "Utiliser une sonde TCP seule alors que l'application renvoie des erreurs HTTP",
+    "Laisser un weight de track_script trop faible : la priorité reste supérieure au backup et aucune bascule ne se produit"
+  ],
+  "quiz": [
+    {
+      "id": "hcip-oe-01-q01",
+      "type": "single",
+      "prompt": "In LVS, which forwarding mode lets a real server send its reply directly to the client without passing through the director?",
+      "options": [
+        "DR (Direct Routing)",
+        "Masquerading",
+        "FULLNAT",
+        "NAT"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "En mode DR, le directeur ne modifie que les adresses MAC et laisse les adresses IP intactes : le serveur réel répond directement au client avec la VIP comme source. NAT et masquerading font traverser le directeur par les paquets de retour, ce qui limite la bande passante. FULLNAT réécrit aussi les deux sens et ne dispense pas du passage par le directeur.",
+      "topic": "LVS forwarding modes"
+    },
+    {
+      "id": "hcip-oe-01-q02",
+      "type": "single",
+      "prompt": "Which protocol does Keepalived use to share a floating VIP between cluster nodes?",
+      "options": [
+        "OSPF",
+        "VRRP",
+        "BGP",
+        "IGMP"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Keepalived s'appuie sur VRRP pour élire un maître et faire basculer la VIP vers un secours. OSPF et BGP sont des protocoles de routage dynamique, sans élection de VIP locale. IGMP gère l'appartenance aux groupes multicast et n'assure pas la redondance d'adresse.",
+      "topic": "Keepalived and VRRP"
+    },
+    {
+      "id": "hcip-oe-01-q03",
+      "type": "single",
+      "prompt": "Which sysctl pair prevents real servers from answering ARP requests for the VIP in DR mode?",
+      "options": [
+        "somaxconn=1024 and tcp_tw_reuse=1",
+        "swappiness=10 and dirty_ratio=20",
+        "arp_ignore=1 and arp_announce=2",
+        "ip_forward=1 and rp_filter=0"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "arp_ignore=1 empêche une interface de répondre à une requête ARP dont l'adresse cible n'est pas configurée localement, et arp_announce=2 limite les annonces à l'interface et au réseau corrects. Ces deux réglages empêchent les RS de se disputer la VIP. ip_forward concerne le routage NAT, les autres paramètres touchent les performances ou la mémoire, pas les ARP.",
+      "topic": "LVS-DR ARP suppression"
+    },
+    {
+      "id": "hcip-oe-01-q04",
+      "type": "single",
+      "prompt": "Which scheduling algorithm is the default for LVS when no algorithm is specified?",
+      "options": [
+        "sh",
+        "rr",
+        "wrr",
+        "wlc"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "WLC, Weighted Least Connections, est l'algorithme par défaut de LVS : il divise la charge observée par le poids du serveur. rr et wrr sont statiques et ignorent les connexions actives. sh hache l'adresse source et n'est pas le comportement par défaut.",
+      "topic": "LVS scheduling algorithms"
+    },
+    {
+      "id": "hcip-oe-01-q05",
+      "type": "single",
+      "prompt": "In LVS-NAT, which address rewriting occurs on the request and then on the reply?",
+      "options": [
+        "Destination is rewritten on the request, source is rewritten on the reply",
+        "Source is rewritten on the request, destination is rewritten on the reply",
+        "Only the MAC addresses change in both directions",
+        "Both addresses are rewritten only on the request"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "À l'aller, le directeur remplace l'IP destination de la VIP par celle du RS. Au retour, il remplace l'IP source du RS par la VIP pour que le client accepte la réponse. Le changement de MAC seul correspond au mode DR. Réécrire les deux adresses uniquement à l'aller ne permettrait pas au client de reconnaître la connexion.",
+      "topic": "LVS-NAT packet flow"
+    },
+    {
+      "id": "hcip-oe-01-q06",
+      "type": "single",
+      "prompt": "What is a mandatory topology requirement for LVS-DR?",
+      "options": [
+        "The real servers must be reached through a router",
+        "The director and real servers must be in the same Layer 2 network",
+        "Every real server must use a different VIP",
+        "The director must perform source NAT"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "En DR, le directeur réécrit l'adresse MAC de destination et doit donc joindre le RS en couche 2 : les deux sont sur le même segment. Chaque RS partage au contraire la même VIP, configurée sur loopback. Aucun NAT source n'est effectué et un routeur intermédiaire casserait le mécanisme, sauf en mode TUN.",
+      "topic": "LVS-DR topology"
+    },
+    {
+      "id": "hcip-oe-01-q07",
+      "type": "single",
+      "prompt": "Which Keepalived check type runs an external script and uses its exit code to decide whether a backend stays in the pool?",
+      "options": [
+        "TCP_CHECK",
+        "HTTP_GET",
+        "MISC_CHECK",
+        "SSL_GET"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "MISC_CHECK exécute un programme externe : un code 0 conserve le serveur, un code 1 le retire, et les codes 2 à 255 ajustent son poids. TCP_CHECK teste seulement l'ouverture d'un port. HTTP_GET et SSL_GET comparent un code ou un digest sur une URL, sans exécuter de script.",
+      "topic": "Keepalived health checks"
+    },
+    {
+      "id": "hcip-oe-01-q08",
+      "type": "single",
+      "prompt": "Which command displays the current IPVS services, real servers and forwarding methods?",
+      "options": [
+        "ipvsadm -C",
+        "ipvsadm -Z",
+        "ipvsadm -S",
+        "ipvsadm -Ln"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "-Ln liste les services et leurs serveurs réels avec le mode de forwarding et les compteurs. -C efface toute la table, -Z remet les compteurs à zéro et -S sauvegarde la configuration. Ces trois dernières commandes ne réalisent pas un affichage de l'état courant.",
+      "topic": "ipvsadm operations"
+    },
+    {
+      "id": "hcip-oe-01-q09",
+      "type": "single",
+      "prompt": "What does the -m option mean when adding a real server with ipvsadm?",
+      "options": [
+        "Masquerading, which is LVS-NAT",
+        "Multicast health checking",
+        "Direct routing",
+        "IP tunneling"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "-m active le masquerading, c'est-à-dire le mode NAT où le directeur réécrit les adresses. -g correspond au direct routing et -i au tunneling IP. Le multicast n'est pas un mode de forwarding LVS.",
+      "topic": "ipvsadm real server options"
+    },
+    {
+      "id": "hcip-oe-01-q10",
+      "type": "single",
+      "prompt": "Why is a TCP_CHECK alone sometimes insufficient for a web application?",
+      "options": [
+        "It cannot detect an open port",
+        "It may succeed while the application returns HTTP 500 errors",
+        "It requires an SSL certificate",
+        "It only works with UDP services"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "TCP_CHECK vérifie uniquement que la connexion TCP aboutit : le port peut être ouvert alors que l'application est en erreur. HTTP_GET ou MISC_CHECK contrôlent le contenu ou la logique métier. TCP_CHECK détecte bien un port ouvert, n'exige pas de certificat et ne concerne pas UDP dans ce contexte.",
+      "topic": "Health check design"
+    },
+    {
+      "id": "hcip-oe-01-q11",
+      "type": "multi",
+      "prompt": "Which components are part of a classic LVS cluster built with Keepalived? (Choose 3)",
+      "options": [
+        "Real servers",
+        "Keepalived VRRP instance",
+        "Windows IIS web server",
+        "Director running IPVS"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Le directeur exécute IPVS et applique les règles, les serveurs réels hébergent l'application, et Keepalived maintient la VIP par VRRP. IIS est un serveur web Windows qui peut être un backend mais ne constitue pas un composant du cluster LVS. Les trois premiers éléments forment le socle demandé.",
+      "topic": "LVS cluster components"
+    },
+    {
+      "id": "hcip-oe-01-q12",
+      "type": "multi",
+      "prompt": "Which commands create a DR service on VIP 10.0.0.200:80 and add real server 10.0.0.11? (Choose 2)",
+      "options": [
+        "ipvsadm -a -t 10.0.0.200:80 -r 10.0.0.11:80 -g",
+        "ipvsadm -d -t 10.0.0.200:80 -r 10.0.0.11:80",
+        "ipvsadm -A -u 10.0.0.200:80 -s rr",
+        "ipvsadm -A -t 10.0.0.200:80 -s wrr"
+      ],
+      "answer": [
+        0,
+        3
+      ],
+      "explanation_fr": "-A crée le service virtuel avec l'algorithme wrr, puis -a -g ajoute le serveur réel en direct routing. -d supprime un serveur au lieu de l'ajouter. -u déclare un service UDP, ce qui ne correspond pas à un service web TCP.",
+      "topic": "ipvsadm DR configuration"
+    },
+    {
+      "id": "hcip-oe-01-q13",
+      "type": "multi",
+      "prompt": "Which mechanisms help prevent VRRP split-brain? (Choose 3)",
+      "options": [
+        "Using a third-party arbitration mechanism",
+        "Increasing the VIP subnet mask",
+        "Using multiple heartbeat links",
+        "Adding VRRP authentication"
+      ],
+      "answer": [
+        0,
+        2,
+        3
+      ],
+      "explanation_fr": "Multiplier les liens de heartbeat évite qu'une panne réseau isolée coupe la communication, l'authentification empêche l'injection d'annonces, et un arbitrage tiers départage les nœuds. Modifier le masque de la VIP ne change pas le nombre de maîtres et peut au contraire élargir le domaine de diffusion.",
+      "topic": "VRRP split-brain prevention"
+    },
+    {
+      "id": "hcip-oe-01-q14",
+      "type": "multi",
+      "prompt": "Which health check types are natively supported by Keepalived? (Choose 3)",
+      "options": [
+        "HTTP_GET",
+        "MISC_CHECK",
+        "SNMP_TRAP_GET",
+        "TCP_CHECK"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Keepalived propose TCP_CHECK en couche 4, HTTP_GET et SSL_GET en couche 5, ainsi que MISC_CHECK pour les scripts. SNMP_TRAP_GET n'existe pas dans cette famille de contrôles. Une supervision SNMP peut exister ailleurs, mais elle n'est pas une sonde Keepalived native.",
+      "topic": "Keepalived health check types"
+    },
+    {
+      "id": "hcip-oe-01-q15",
+      "type": "tf",
+      "prompt": "In LVS-NAT, the director rewrites both source and destination addresses during the full request-reply cycle.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : la destination est réécrite à l'aller vers le RS, puis la source est réécrite au retour vers la VIP. Le client voit donc toujours la VIP comme interlocuteur. En DR, seules les MAC changent et le RS répond directement.",
+      "topic": "LVS-NAT behavior"
+    },
+    {
+      "id": "hcip-oe-01-q16",
+      "type": "tf",
+      "prompt": "In LVS-DR, a real server must have the VIP configured locally and must suppress ARP replies for it.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : le RS doit accepter les paquets destinés à la VIP, généralement sur loopback, tout en empêchant ses interfaces de répondre aux ARP de cette VIP. Sans cette suppression, plusieurs machines annoncent la même adresse et le trafic devient erratique. Ce sont arp_ignore et arp_announce qui réalisent ce filtrage.",
+      "topic": "LVS-DR real server setup"
+    },
+    {
+      "id": "hcip-oe-01-q17",
+      "type": "tf",
+      "prompt": "A Keepalived track_script can lower a node's priority when a local service fails, causing the VIP to move to another node.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : le script est évalué périodiquement et son weight modifie la priorité VRRP. Si la priorité du maître devient inférieure à celle d'un secours, ce dernier prend la VIP. Cela permet de basculer sur une panne applicative et pas seulement sur une panne machine.",
+      "topic": "Keepalived track_script"
+    },
+    {
+      "id": "hcip-oe-01-q18",
+      "type": "text",
+      "prompt": "Give the ipvsadm command that adds real server 10.0.0.12:80 in DR mode to the existing service 10.0.0.200:80.",
+      "accept": [
+        "ipvsadm -a -t 10.0.0.200:80 -r 10.0.0.12:80 -g",
+        "ipvsadm -a -t 10.0.0.200:80 -r 10.0.0.12 -g",
+        "ipvsadm --add-server -t 10.0.0.200:80 -r 10.0.0.12:80 --gatewaying"
+      ],
+      "sample_answer": "ipvsadm -a -t 10.0.0.200:80 -r 10.0.0.12:80 -g",
+      "explanation_fr": "-a ajoute un serveur réel au service existant, -t précise le service TCP, -r donne l'adresse du RS et -g sélectionne le forwarding par passerelle, donc DR. Le service doit déjà avoir été créé avec -A. La forme longue --gatewaying est équivalente à -g.",
+      "topic": "ipvsadm command syntax"
+    },
+    {
+      "id": "hcip-oe-01-q19",
+      "type": "text",
+      "prompt": "Which Keepalived configuration keyword defines a health-check script whose result adjusts VRRP priority? (one word with an underscore)",
+      "accept": [
+        "vrrp_script",
+        "vrrp script",
+        "vrrp_scripts"
+      ],
+      "sample_answer": "vrrp_script",
+      "explanation_fr": "Le bloc vrrp_script déclare script, interval, fall, rise et weight. Il est ensuite appelé dans un vrrp_instance par track_script. Sans ce lien, le script serait défini mais n'influencerait pas la priorité.",
+      "topic": "Keepalived configuration"
+    },
+    {
+      "id": "hcip-oe-01-q20",
+      "type": "text",
+      "prompt": "Which command saves the current IPVS rules to /etc/sysconfig/ipvsadm in a reloadable form?",
+      "accept": [
+        "ipvsadm -Sn > /etc/sysconfig/ipvsadm",
+        "ipvsadm -S -n > /etc/sysconfig/ipvsadm",
+        "ipvsadm --save -n > /etc/sysconfig/ipvsadm"
+      ],
+      "sample_answer": "ipvsadm -Sn > /etc/sysconfig/ipvsadm",
+      "explanation_fr": "-S sauvegarde la table et -n évite la résolution DNS, ce qui produit des adresses numériques rechargeables avec ipvsadm -R. Rediriger la sortie vers /etc/sysconfig/ipvsadm rend la configuration persistante. Sans -n, des noms d'hôtes pourraient être écrits et dépendre du DNS au redémarrage.",
+      "topic": "IPVS persistence"
+    }
+  ]
+}

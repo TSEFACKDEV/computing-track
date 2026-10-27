@@ -1,0 +1,700 @@
+{
+  "id": "hcie-og-01",
+  "phase": "HCIE",
+  "subject": "openGauss",
+  "number": 1,
+  "title_fr": "Transactions, MVCC et gestion des blocages",
+  "title_en": "Transactions, MVCC and Lock Analysis",
+  "minutes": 90,
+  "source": "HCIE-openGauss V1.0 Training Material — Sessions 1-3 «Transaction Management · Storage Engines · WAL/Checkpoint»",
+  "objectives": [
+    "Expliquer ACID et choisir la frontière d'une transaction",
+    "Distinguer les niveaux d'isolement et les anomalies qu'ils autorisent",
+    "Décrire le MVCC openGauss fondé sur le CSN, xmin et xmax",
+    "Diagnostiquer bloat, verrous, deadlocks et sessions idle in transaction",
+    "Concevoir des transactions courtes, idempotentes et reprenables"
+  ],
+  "sections": [
+    {
+      "heading": "ACID et frontière transactionnelle",
+      "body": "Une transaction regroupe plusieurs instructions en une unité indivisible : soit toutes les modifications sont validées ensemble, soit aucune ne l'est. openGauss applique le modèle ACID. L'atomicité protège d'une panne au milieu d'un virement ; la cohérence fait respecter contraintes, clés étrangères et règles métier ; l'isolement empêche les sessions concurrentes de voir des états intermédiaires ; la durabilité garantit qu'un COMMIT confirmé survit à une coupure, car le WAL est écrit et synchronisé avant la réponse au client. En mode autocommit, chaque instruction forme sa propre transaction : deux UPDATE successifs ne constituent donc pas un tout cohérent. Dès qu'une logique métier exige plusieurs écritures solidaires, ouvrez explicitement avec BEGIN et terminez par COMMIT, ou annulez par ROLLBACK. openGauss rend également le DDL transactionnel : un CREATE TABLE peut être annulé. Attention à la durée de vie : une transaction ouverte trop longtemps conserve un snapshot ancien, retarde le nettoyage des versions mortes et multiplie les conflits de verrous. La bonne frontière est l'unité métier, jamais l'écran utilisateur ni un lot de mille lignes.",
+      "bullets": [
+        "Une transaction = une unité métier, pas une unité technique",
+        "COMMIT acquitté signifie WAL synchronisé et données durables",
+        "Le DDL est transactionnel dans openGauss : il peut être annulé",
+        "Toute transaction longue retarde le VACUUM et favorise les conflits"
+      ],
+      "code": [
+        "BEGIN;",
+        "UPDATE accounts SET balance = balance - 100 WHERE id = 1;",
+        "UPDATE accounts SET balance = balance + 100 WHERE id = 2;",
+        "COMMIT;   -- ou ROLLBACK;",
+        "SHOW autocommit;"
+      ],
+      "tip": "Piège d'examen : un COMMIT peut être confirmé au client alors que la réplication vers le standby est encore en cours. Le niveau de durabilité dépend de synchronous_commit, pas seulement de l'existence du WAL."
+    },
+    {
+      "heading": "Niveaux d'isolement et anomalies",
+      "body": "Le niveau d'isolement arbitre entre concurrence et cohérence. openGauss propose READ COMMITTED (défaut), REPEATABLE READ et SERIALIZABLE ; READ UNCOMMITTED est accepté pour compatibilité mais n'est pas recommandé, car il n'offre aucune garantie utile pour les invariants métier. En READ COMMITTED, chaque instruction prend un nouveau snapshot : deux SELECT identiques dans la même transaction peuvent renvoyer des résultats différents si une autre session a validé entre-temps. REPEATABLE READ fixe le snapshot au début de la transaction : les relectures sont stables et les lectures fantômes ne sont plus observables, mais des conflits d'écriture peuvent encore provoquer une erreur de sérialisation. SERIALIZABLE ajoute un contrôle de sérialisation : le résultat doit être équivalent à un ordre série ; en cas de conflit non sérialisable, openGauss annule une transaction avec une erreur qu'il faut rejouer. Le choix se fait par cas d'usage : API courtes en READ COMMITTED, rapports multi-requêtes cohérents en REPEATABLE READ, invariants financiers ou réservations en SERIALIZABLE avec retry applicatif.",
+      "bullets": [
+        "READ COMMITTED : nouveau snapshot à chaque instruction",
+        "REPEATABLE READ : snapshot stable sur toute la transaction",
+        "SERIALIZABLE : équivalent à un ordre série, erreurs à rejouer",
+        "READ UNCOMMITTED est accepté mais déconseillé en production"
+      ],
+      "code": [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;",
+        "BEGIN;",
+        "SELECT count(*) FROM orders;",
+        "SELECT count(*) FROM orders;  -- même résultat dans la transaction",
+        "COMMIT;",
+        "SHOW transaction_isolation;"
+      ],
+      "table": {
+        "headers": [
+          "Niveau",
+          "Lecture sale",
+          "Lecture non répétable",
+          "Lecture fantôme",
+          "Usage typique"
+        ],
+        "rows": [
+          [
+            "READ COMMITTED",
+            "Non",
+            "Oui",
+            "Oui",
+            "OLTP, API courtes"
+          ],
+          [
+            "REPEATABLE READ",
+            "Non",
+            "Non",
+            "Non",
+            "Rapports cohérents"
+          ],
+          [
+            "SERIALIZABLE",
+            "Non",
+            "Non",
+            "Non",
+            "Invariants, réservations"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "La session A exécute BEGIN; SELECT balance FROM accounts WHERE id=1; (solde 1000). La session B met ce solde à 800 et COMMIT. La session A refait le même SELECT, puis tente UPDATE accounts SET balance=balance-100 WHERE id=1. Que renvoie chaque étape en READ COMMITTED, et que se passerait-il en REPEATABLE READ ?",
+          "correction": "En READ COMMITTED, le second SELECT de A renvoie 800, car chaque instruction prend un nouveau snapshot. L'UPDATE de A relit la version validée (800) et écrit 700 : la clause WHERE est réévaluée sur la dernière version visible. En REPEATABLE READ, le second SELECT renvoie encore 1000, car le snapshot est fixé au début de la transaction. L'UPDATE détecte toutefois que la ligne a changé depuis ce snapshot et échoue avec une erreur de sérialisation (could not serialize access due to concurrent update). L'application doit alors annuler puis rejouer toute la transaction. Conclusion : REPEATABLE READ donne des lectures stables mais pas un droit d'écriture aveugle ; tout conflit d'écriture exige un retry."
+        }
+      ],
+      "tip": "Piège d'examen : REPEATABLE READ n'empêche pas les écritures concurrentes sur la même ligne ; il provoque une erreur de sérialisation au moment de l'UPDATE. Ne confondez pas stabilité de lecture et absence de conflit."
+    },
+    {
+      "heading": "MVCC et visibilité fondée sur le CSN",
+      "body": "openGauss utilise un MVCC fondé sur un numéro de séquence de validation, le CSN. Chaque transaction reçoit un CSN au commit ; le CSN log conserve la correspondance XID vers CSN, tandis que le CLOG mémorise l'état de la transaction (en cours, validée, annulée). Le snapshot est créé au début de la transaction ou de l'instruction et contient le CSN de référence. Une version de ligne est visible si sa création est antérieure à ce CSN et si sa suppression ne l'est pas. Chaque tuple porte xmin, la transaction créatrice, et xmax, la transaction qui l'a supprimée ou remplacée. Un UPDATE n'écrase pas la ligne : il écrit une nouvelle version et marque l'ancienne avec xmax ; un DELETE se contente de marquer xmax. Les lecteurs ne prennent donc pas de verrou de ligne et n'attendent pas les écrivains : lecture et écriture ne se bloquent pas mutuellement. Cette élégance a un prix : les anciennes versions restent sur les pages et dans les index tant qu'un snapshot peut les voir, d'où le prune et le VACUUM.",
+      "bullets": [
+        "Le CSN est l'horloge logique de validation, pas un timestamp",
+        "xmin = créateur du tuple, xmax = transaction de suppression",
+        "UPDATE crée une version, DELETE marque xmax",
+        "Les lecteurs MVCC ne bloquent pas les écrivains"
+      ],
+      "code": [
+        "SELECT ctid, xmin, xmax, id, amount FROM orders WHERE id = 42;",
+        "SELECT txid_current(), pg_current_xlog_location();",
+        "SHOW transaction_isolation;"
+      ],
+      "table": {
+        "headers": [
+          "Structure",
+          "Rôle",
+          "Contenu"
+        ],
+        "rows": [
+          [
+            "Tuple header",
+            "Versionnement",
+            "xmin, xmax, ctid, infomask"
+          ],
+          [
+            "CLOG",
+            "État des transactions",
+            "en cours, validée, annulée"
+          ],
+          [
+            "CSNLOG",
+            "Horodatage logique",
+            "XID vers CSN de commit"
+          ],
+          [
+            "Snapshot",
+            "Règle de visibilité",
+            "CSN de référence et XID en cours"
+          ]
+        ]
+      },
+      "diagram": "Ligne logique id=42\n\n ctid 0x1  [xmin=100 xmax=0]   amount=10   <- visible avant\n ctid 0x2  [xmin=105 xmax=0]   amount=20   <- version après UPDATE\n\nSnapshot CSN=103 : voit 0x1 (xmin 100 <= 103)\nSnapshot CSN=110 : voit 0x2 (xmin 105 <= 110)\n\nCLOG  : XID -> committed / aborted\nCSNLOG: XID -> CSN de commit",
+      "tip": "xmin et xmax ne sont pas des dates : ce sont des identifiants de transaction, et l'affichage peut être tronqué sur 32 bits alors que les XID réels sont gérés sur 64 bits. Ne les utilisez jamais comme colonnes temporelles."
+    },
+    {
+      "heading": "UPDATE, bloat et entretien VACUUM / ANALYZE",
+      "body": "Comme les UPDATE et DELETE laissent des versions mortes, l'espace et les index se fragmentent : c'est le bloat. openGauss combine deux mécanismes. Le prune de page intervient à chaud lorsqu'une page dépasse un seuil d'espace libre ; il supprime les tuples morts de la page sans toucher aux index, ce qui suffit souvent aux mises à jour répétées d'une même ligne. Le VACUUM, manuel ou lancé par autovacuum, parcourt la table et les index, marque l'espace réutilisable et met à jour la free space map ; combiné à ANALYZE, il rafraîchit aussi les statistiques. VACUUM ne rend pas le fichier au système d'exploitation : il recycle l'espace à l'intérieur. VACUUM FULL réécrit la table et rend réellement les pages, mais prend un verrou AccessExclusive et double temporairement le stockage : à réserver aux fenêtres de maintenance. ANALYZE, lui, ne nettoie rien : il échantillonne les colonnes pour produire les statistiques du planificateur. Un ratio de tuples morts élevé, des transactions longues ou un autovacuum sous-dimensionné expliquent la plupart des incidents de gonflement.",
+      "bullets": [
+        "Le prune nettoie une page à chaud, sans toucher aux index",
+        "VACUUM recycle l'espace mais ne réduit pas le fichier",
+        "VACUUM FULL réécrit la table et prend un verrou exclusif",
+        "ANALYZE ne nettoie pas : il produit les statistiques"
+      ],
+      "code": [
+        "VACUUM (VERBOSE, ANALYZE) orders;",
+        "SELECT relname, n_live_tup, n_dead_tup, last_autovacuum",
+        "FROM pg_stat_user_tables WHERE relname = 'orders';",
+        "SELECT pg_size_pretty(pg_relation_size('orders'));",
+        "-- VACUUM FULL orders;  -- verrou AccessExclusive, fenêtre de maintenance"
+      ],
+      "table": {
+        "headers": [
+          "Opération",
+          "Verrou",
+          "Rend l'espace à l'OS",
+          "Met à jour les stats"
+        ],
+        "rows": [
+          [
+            "Prune de page",
+            "léger, local",
+            "Non",
+            "Non"
+          ],
+          [
+            "VACUUM",
+            "ShareUpdateExclusive",
+            "Non",
+            "Avec ANALYZE"
+          ],
+          [
+            "VACUUM FULL",
+            "AccessExclusive",
+            "Oui",
+            "Oui"
+          ],
+          [
+            "ANALYZE",
+            "ShareUpdateExclusive",
+            "Non",
+            "Oui"
+          ]
+        ]
+      },
+      "tip": "Sur une table chaude, VACUUM FULL peut être plus dangereux que le bloat : il bloque toutes les lectures pendant la réécriture. Préférez un réglage d'autovacuum et, si nécessaire, une reconstruction en ligne planifiée."
+    },
+    {
+      "heading": "Verrous de table et de ligne",
+      "body": "openGauss combine des verrous de table et de ligne. Les verrous de table protègent la structure et les opérations de masse : SELECT prend AccessShare, INSERT, UPDATE et DELETE prennent RowExclusive, un ALTER TABLE prend AccessExclusive et bloque tout, y compris les lecteurs. Les verrous de ligne n'apparaissent que pour les écritures et pour les clauses SELECT FOR UPDATE ou FOR SHARE. Un UPDATE pose un verrou exclusif sur la ligne touchée ; une autre session qui veut modifier la même ligne attend, puis voit la nouvelle version en READ COMMITTED. FOR UPDATE verrouille les lignes lues pour préparer une mise à jour ; FOR SHARE autorise plusieurs lecteurs verrouillants mais bloque les écrivains. NOWAIT échoue immédiatement au lieu d'attendre ; SKIP LOCKED ignore les lignes déjà verrouillées, brique de base des files de travail distribuées. openGauss n'escalade pas automatiquement les verrous de ligne en verrou de table : un UPDATE de millions de lignes accumule donc des verrous en mémoire. Les verrous sont consultables dans pg_locks et les attentes dans pg_stat_activity.",
+      "bullets": [
+        "AccessShare pour lire, RowExclusive pour écrire, AccessExclusive pour ALTER",
+        "FOR UPDATE verrouille les lignes lues ; FOR SHARE bloque les écrivains",
+        "NOWAIT échoue vite ; SKIP LOCKED ignore les lignes déjà prises",
+        "Pas d'escalade automatique : un gros UPDATE accumule les verrous"
+      ],
+      "code": [
+        "BEGIN;",
+        "SELECT id, status FROM jobs",
+        "WHERE status = 'pending'",
+        "ORDER BY id",
+        "LIMIT 10",
+        "FOR UPDATE SKIP LOCKED;",
+        "UPDATE jobs SET status = 'running' WHERE id = ANY (:ids);",
+        "COMMIT;"
+      ],
+      "table": {
+        "headers": [
+          "Mode de table",
+          "SELECT",
+          "INSERT/UPDATE",
+          "ALTER TABLE"
+        ],
+        "rows": [
+          [
+            "AccessShare",
+            "compatible",
+            "compatible",
+            "bloqué"
+          ],
+          [
+            "RowExclusive",
+            "compatible",
+            "compatible entre écrivains",
+            "bloqué"
+          ],
+          [
+            "AccessExclusive",
+            "bloqué",
+            "bloqué",
+            "bloqué"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Une file de tâches est consommée par vingt workers. Chaque worker fait SELECT ... WHERE status='pending' LIMIT 1, puis UPDATE. Avec un simple FOR UPDATE, les workers se bloquent en série et certains traitent la même tâche. Écrivez la boucle correcte et expliquez le rôle de SKIP LOCKED.",
+          "correction": "La clause correcte est SELECT id FROM jobs WHERE status='pending' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED. SKIP LOCKED demande au moteur d'ignorer les lignes déjà verrouillées par une autre transaction au lieu d'attendre : chaque worker obtient une ligne différente, sans sérialisation. Il faut ensuite UPDATE jobs SET status='running', worker_id=..., started_at=now() WHERE id=:id, puis COMMIT. Le ORDER BY id rend l'ordre déterministe et facilite les tests. Attention : SKIP LOCKED ne garantit pas l'unicité si la transaction qui a verrouillé la ligne l'annule ensuite ; le worker doit donc revérifier le statut dans son UPDATE (WHERE status='pending') et gérer le cas où zéro ligne est mise à jour. Enfin, la transaction doit rester courte : le verrou est tenu jusqu'au COMMIT."
+        }
+      ],
+      "tip": "Piège d'examen : FOR UPDATE verrouille les lignes renvoyées par la requête, pas toutes les lignes parcourues par le plan. Un index sur la colonne de filtre évite de parcourir des lignes inutiles."
+    },
+    {
+      "heading": "Deadlocks : détection et prévention",
+      "body": "Un deadlock naît d'un cycle d'attente : T1 verrouille la ligne A et demande B, T2 verrouille B et demande A. Aucune ne peut avancer. openGauss détecte le cycle après deadlock_timeout (une seconde par défaut) et annule l'une des transactions avec l'erreur 40P01, libérant les autres. Ce n'est pas un plantage : le client doit intercepter l'erreur et rejouer la transaction entière. La prévention est d'abord applicative : accéder toujours aux ressources dans le même ordre, par exemple trier les identifiants avant mise à jour, garder les transactions courtes, ne jamais attendre une saisie utilisateur entre BEGIN et COMMIT, poser les verrous le plus tard possible et utiliser SKIP LOCKED pour les files. Des index adaptés réduisent les verrous pris lors des scans. Surveiller pg_locks avec granted=false et l'état d'attente de pg_stat_activity permet d'identifier la chaîne. Un deadlock récurrent signale souvent un ordre d'accès incohérent ou une transaction trop large, pas un manque de mémoire.",
+      "bullets": [
+        "Un deadlock est un cycle d'attente, pas une corruption",
+        "Le moteur annule une transaction avec SQLSTATE 40P01",
+        "Prévention : ordre d'accès stable, transactions courtes, index adaptés",
+        "Le client doit rejouer la transaction annulée"
+      ],
+      "code": [
+        "SELECT pid, wait_event_type, wait_event, state,",
+        "       pg_blocking_pids(pid) AS blockers, query",
+        "FROM pg_stat_activity",
+        "WHERE cardinality(pg_blocking_pids(pid)) > 0;",
+        "SHOW deadlock_timeout;"
+      ],
+      "diagram": "T1                T2\n |                 |\n |-- lock A ------>|\n |                 |-- lock B ------>|\n |<---- wait B ----|                |\n |                 |<---- wait A ----|\n\nCycle A -> B -> A : deadlock\nopenGauss annule T2 (40P01), T1 continue",
+      "tip": "Un deadlock n'est pas nécessairement dû à un bug : deux transactions légitimes peuvent se croiser. En revanche, un deadlock qui se répète toutes les minutes révèle un ordre d'accès non déterministe ou une transaction trop longue."
+    },
+    {
+      "heading": "Savepoints, erreurs et retries idempotents",
+      "body": "Les savepoints découpent une transaction en sous-étapes. SAVEPOINT sp1 mémorise un point ; ROLLBACK TO sp1 annule uniquement les instructions suivantes et laisse la transaction ouverte ; RELEASE sp1 supprime le point sans valider. C'est utile pour tenter une opération optionnelle sans perdre le travail déjà fait. En revanche, chaque savepoint crée une sous-transaction avec son propre XID : des milliers de savepoints dans une boucle gonflent les structures et retardent le nettoyage. Autre piège : après une erreur SQL, openGauss place la transaction en état aborted ; toute instruction suivante échoue avec 25P02 tant qu'on n'a pas fait ROLLBACK ou ROLLBACK TO. Les retries doivent être idempotents : réutiliser une clé d'idempotence, faire un upsert ON CONFLICT, ou publier un événement via un outbox évite de doubler l'opération si le COMMIT a réussi mais que la réponse réseau s'est perdue. Un bon retry est borné, avec backoff et jitter, et ne rejoue que les erreurs transitoires.",
+      "bullets": [
+        "SAVEPOINT marque, ROLLBACK TO annule partiellement, RELEASE libère",
+        "Après une erreur, la transaction est aborted (SQLSTATE 25P02)",
+        "Chaque savepoint coûte une sous-transaction et un XID",
+        "Retry seulement si l'opération est idempotente et l'erreur transitoire"
+      ],
+      "code": [
+        "BEGIN;",
+        "INSERT INTO orders(id, amount) VALUES (1, 100);",
+        "SAVEPOINT sp1;",
+        "INSERT INTO order_lines(order_id, sku) VALUES (1, 'A');",
+        "ROLLBACK TO sp1;   -- annule uniquement la ligne",
+        "COMMIT;            -- la commande 1 reste validée",
+        "INSERT INTO orders(id, amount) VALUES (1, 100)",
+        "ON CONFLICT (id) DO NOTHING;"
+      ],
+      "table": {
+        "headers": [
+          "SQLSTATE",
+          "Signification",
+          "Action"
+        ],
+        "rows": [
+          [
+            "40001",
+            "serialization_failure",
+            "rollback puis retry complet"
+          ],
+          [
+            "40P01",
+            "deadlock_detected",
+            "rollback puis retry avec backoff"
+          ],
+          [
+            "25P02",
+            "in_failed_sql_transaction",
+            "ROLLBACK ou ROLLBACK TO"
+          ],
+          [
+            "23505",
+            "unique_violation",
+            "corriger ou ON CONFLICT"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un service crée une commande puis publie un événement. Le COMMIT réussit, mais la réponse HTTP se perd et le client retente. Décrivez une conception qui évite le double débit et le double événement.",
+          "correction": "La création doit porter une clé d'idempotence fournie par le client, par exemple idempotency_key, avec une contrainte UNIQUE. Le retry fait INSERT ... ON CONFLICT (idempotency_key) DO NOTHING, puis relit la commande existante et renvoie la même réponse : aucun second débit. Pour l'événement, on utilise un outbox transactionnel : l'événement est inséré dans la même transaction que la commande, avec un identifiant unique. Un publieur lit les lignes non publiées, publie, puis marque published_at ; en cas de crash entre publication et marquage, il republie, et le consommateur déduplique par event_id. On ne peut pas garantir exactement une fois sur un réseau, mais on garantit un effet unique grâce à l'idempotence de bout en bout. Le retry doit être borné (par exemple trois tentatives avec backoff exponentiel et jitter) et ne concerner que les erreurs transitoires."
+        }
+      ],
+      "tip": "Piège d'examen : ROLLBACK TO savepoint ne termine pas la transaction ; un COMMIT reste nécessaire. À l'inverse, ROLLBACK termine tout et libère les verrous."
+    },
+    {
+      "heading": "Diagnostic des sessions et des attentes",
+      "body": "Le diagnostic commence par les sessions. pg_stat_activity expose pid, usename, datname, state, query_start, query, xact_start et les champs d'attente. Une session idle in transaction a ouvert une transaction puis ne fait plus rien : elle conserve un snapshot, bloque le VACUUM et peut tenir des verrous. Une session active avec un query_start ancien exécute une requête longue. Pour les verrous, pg_locks se joint à pg_stat_activity pour distinguer les verrous accordés (granted=true) des demandes en attente. Pour l'historique, statement_history et les rapports WDR donnent les requêtes coûteuses et leur plan. La démarche est toujours la même : constater l'impact, identifier la chaîne d'attente, décider d'attendre ou d'annuler (pg_cancel_backend pour la requête, pg_terminate_backend pour la session), puis corriger la cause. Tuer une session n'est pas une correction : sans analyse, le blocage revient. Les timeouts (statement_timeout, lock_timeout, idle_in_transaction_session_timeout) transforment un blocage infini en erreur gérable.",
+      "bullets": [
+        "pg_stat_activity donne l'état, la requête et l'âge de la transaction",
+        "pg_locks distingue verrous accordés et demandes en attente",
+        "idle in transaction est la cause n°1 des blocages et du bloat",
+        "pg_cancel_backend annule la requête, pg_terminate_backend la session"
+      ],
+      "code": [
+        "SELECT pid, state, now() - xact_start AS xact_age,",
+        "       now() - query_start AS query_age, query",
+        "FROM pg_stat_activity",
+        "WHERE state <> 'idle'",
+        "ORDER BY xact_age DESC NULLS LAST;",
+        "SET idle_in_transaction_session_timeout = '60s';",
+        "SET lock_timeout = '5s';",
+        "SET statement_timeout = '30s';"
+      ],
+      "table": {
+        "headers": [
+          "state",
+          "Signification",
+          "Risque"
+        ],
+        "rows": [
+          [
+            "active",
+            "requête en cours",
+            "requête longue, CPU ou I/O"
+          ],
+          [
+            "idle",
+            "session disponible",
+            "aucun verrou détenu"
+          ],
+          [
+            "idle in transaction",
+            "transaction ouverte sans travail",
+            "snapshot, verrous, bloat"
+          ],
+          [
+            "idle in transaction (aborted)",
+            "erreur non annulée",
+            "verrous conservés"
+          ]
+        ]
+      },
+      "tip": "Un pid peut changer après un redémarrage : corrélez toujours l'heure et le texte de la requête, pas seulement le numéro de processus. En cluster, précisez le nœud concerné."
+    }
+  ],
+  "key_points": [
+    "Une transaction doit correspondre à une unité métier et rester courte",
+    "READ COMMITTED prend un snapshot par instruction, REPEATABLE READ par transaction",
+    "SERIALIZABLE peut annuler une transaction : l'application doit rejouer",
+    "La visibilité MVCC repose sur le CSN, le CLOG et les champs xmin/xmax",
+    "VACUUM recycle l'espace sans réduire le fichier ; VACUUM FULL le réécrit",
+    "FOR UPDATE SKIP LOCKED est la brique des files de travail concurrentes",
+    "Un deadlock est résolu par annulation d'une transaction (40P01) puis retry",
+    "Les timeouts d'inactivité et de verrou transforment les blocages en erreurs"
+  ],
+  "traps": [
+    "READ UNCOMMITTED est accepté mais déconseillé : ne bâtissez pas vos invariants dessus",
+    "Un COMMIT confirmé n'implique pas nécessairement que le standby a reçu le WAL",
+    "xmin et xmax sont des identifiants de transaction, pas des dates",
+    "REPEATABLE READ ne supprime pas les conflits d'écriture : il peut renvoyer 40001",
+    "VACUUM FULL bloque les lectures et double temporairement l'espace disque"
+  ],
+  "quiz": [
+    {
+      "id": "hcie-og-01-q01",
+      "type": "single",
+      "prompt": "Which isolation level detects serialization anomalies and aborts conflicting transactions?",
+      "options": [
+        "SERIALIZABLE",
+        "READ UNCOMMITTED",
+        "READ COMMITTED",
+        "REPEATABLE READ"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "SERIALIZABLE vérifie que le résultat est équivalent à une exécution série et annule une transaction en cas de conflit non sérialisable, avec une erreur à rejouer. READ COMMITTED ne garantit qu'un snapshot par instruction et autorise les lectures non répétables. REPEATABLE READ stabilise les lectures mais peut encore échouer sur un conflit d'écriture sans assurer l'équivalence série. READ UNCOMMITTED est accepté pour compatibilité mais déconseillé et n'assure pas l'équivalence série.",
+      "topic": "isolation levels"
+    },
+    {
+      "id": "hcie-og-01-q02",
+      "type": "single",
+      "prompt": "Which pair of tuple header fields records the creating and deleting transactions in openGauss MVCC?",
+      "options": [
+        "csn and xid",
+        "xmin and xmax",
+        "ctid and oid",
+        "insert_lsn and delete_lsn"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "xmin identifie la transaction qui a créé la version et xmax celle qui l'a supprimée ou remplacée ; leur comparaison avec le snapshot détermine la visibilité. ctid donne la localisation physique du tuple, pas son âge logique, et oid est un identifiant d'objet. insert_lsn et delete_lsn n'existent pas comme champs de versionnement. CSN et XID servent au contrôle de visibilité, mais ne sont pas les deux champs du tuple décrits ici.",
+      "topic": "MVCC tuple header"
+    },
+    {
+      "id": "hcie-og-01-q03",
+      "type": "single",
+      "prompt": "Which clause lets concurrent workers claim different rows of a job queue without waiting on locked rows?",
+      "options": [
+        "LOCK TABLE IN EXCLUSIVE MODE",
+        "SELECT WITHOUT LOCK",
+        "FOR UPDATE SKIP LOCKED",
+        "FOR SHARE NOWAIT"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "FOR UPDATE SKIP LOCKED verrouille les lignes disponibles et ignore celles déjà verrouillées, ce qui répartit le travail entre workers sans sérialisation. FOR SHARE NOWAIT échoue immédiatement au lieu de sauter la ligne et ne convient pas à une file. LOCK TABLE IN EXCLUSIVE MODE bloque toute la table et détruit la concurrence. Une lecture sans verrou ne réserve aucune ligne : plusieurs workers peuvent traiter la même tâche.",
+      "topic": "row locking"
+    },
+    {
+      "id": "hcie-og-01-q04",
+      "type": "multi",
+      "prompt": "Which SQL constructs support a partial rollback inside an open transaction? (Choose 2)",
+      "options": [
+        "SAVEPOINT",
+        "ROLLBACK TO savepoint",
+        "TRUNCATE",
+        "VACUUM"
+      ],
+      "answer": [
+        0,
+        1
+      ],
+      "explanation_fr": "SAVEPOINT crée un point de reprise et ROLLBACK TO annule uniquement les instructions exécutées depuis ce point, en laissant la transaction ouverte. TRUNCATE supprime toutes les lignes d'une table et ne peut pas servir de retour arrière partiel. VACUUM est une opération de maintenance qui ne participe pas à la logique transactionnelle. Un COMMIT ou un ROLLBACK complet reste nécessaire pour terminer la transaction.",
+      "topic": "savepoints"
+    },
+    {
+      "id": "hcie-og-01-q05",
+      "type": "multi",
+      "prompt": "Which mechanisms make a retried transaction idempotent? (Choose 2)",
+      "options": [
+        "A unique idempotency key with ON CONFLICT",
+        "A transactional outbox with deduplication",
+        "A larger work_mem",
+        "CASCADE DELETE"
+      ],
+      "answer": [
+        0,
+        1
+      ],
+      "explanation_fr": "Une clé d'idempotence unique combinée à ON CONFLICT empêche de créer deux fois la même opération lors d'un retry. Un outbox transactionnel avec un identifiant d'événement dédupliqué garantit un effet unique même si la publication est répétée. work_mem ne concerne que la mémoire des tris et jointures, sans lien avec l'idempotence. CASCADE DELETE propage des suppressions et aggraverait au contraire un retry mal maîtrisé.",
+      "topic": "idempotent retries"
+    },
+    {
+      "id": "hcie-og-01-q06",
+      "type": "tf",
+      "prompt": "An idle-in-transaction session can prevent vacuum from removing dead tuples.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Une session idle in transaction conserve un snapshot et un xmin actif : le VACUUM ne peut pas considérer comme mortes les versions qui pourraient encore lui être visibles. Les tuples morts s'accumulent donc et la table gonfle tant que la transaction n'est pas terminée. Le problème n'est pas résolu par un simple VACUUM manuel. La parade est un timeout idle_in_transaction_session_timeout et un pool de connexions correctement configuré.",
+      "topic": "vacuum blocking"
+    },
+    {
+      "id": "hcie-og-01-q07",
+      "type": "tf",
+      "prompt": "When a deadlock is detected, openGauss aborts one transaction in the cycle and lets the others proceed.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le détecteur identifie le cycle d'attente et choisit une victime, souvent la transaction la plus jeune ou la moins coûteuse à annuler. La victime reçoit SQLSTATE 40P01 et les autres transactions peuvent continuer. Ce n'est pas un arrêt de l'instance ni une corruption : c'est un mécanisme de résolution. Le client doit annuler puis rejouer la transaction victime.",
+      "topic": "deadlock handling"
+    },
+    {
+      "id": "hcie-og-01-q08",
+      "type": "text",
+      "prompt": "Write the two SQL statements that create a savepoint named sp1 and then roll back to it, separated by a space.",
+      "accept": [
+        "SAVEPOINT sp1; ROLLBACK TO sp1;",
+        "savepoint sp1 rollback to sp1",
+        "SAVEPOINT sp1; ROLLBACK TO SAVEPOINT sp1;"
+      ],
+      "sample_answer": "SAVEPOINT sp1; ROLLBACK TO sp1;",
+      "explanation_fr": "SAVEPOINT sp1; crée le point de reprise, puis ROLLBACK TO sp1; annule les instructions exécutées après lui sans terminer la transaction. La variante ROLLBACK TO SAVEPOINT sp1; est également valide. Un COMMIT ou un ROLLBACK complet reste nécessaire pour clore la transaction. Attention : un savepoint ne libère pas les verrous pris avant lui.",
+      "topic": "savepoint syntax"
+    },
+    {
+      "id": "hcie-og-01-q09",
+      "type": "text",
+      "prompt": "Which two-word clause of INSERT ... ON CONFLICT ignores an existing row instead of raising a unique violation?",
+      "accept": [
+        "DO NOTHING",
+        "on conflict do nothing"
+      ],
+      "sample_answer": "DO NOTHING",
+      "explanation_fr": "ON CONFLICT (colonne) DO NOTHING ignore silencieusement l'insertion lorsqu'une contrainte d'unicité est violée. C'est la base d'un upsert idempotent : un retry ne crée pas de doublon. DO UPDATE est l'autre option, qui met à jour la ligne existante. DO NOTHING ne renvoie pas la ligne existante : il faut souvent un SELECT séparé pour récupérer l'identifiant.",
+      "topic": "upsert"
+    },
+    {
+      "id": "hcie-og-01-q10",
+      "type": "single",
+      "prompt": "Which table-level lock mode does a normal UPDATE acquire?",
+      "options": [
+        "AccessExclusiveLock",
+        "ShareLock",
+        "AccessShareLock",
+        "RowExclusiveLock"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Un UPDATE prend RowExclusiveLock sur la table, compatible avec les autres écrivains, puis des verrous de ligne sur les tuples modifiés. AccessShareLock est le verrou des SELECT et n'empêche pas les écritures. AccessExclusiveLock est réservé aux opérations comme ALTER TABLE ou VACUUM FULL et bloque tout. ShareLock bloque les écritures et ne correspond pas à un UPDATE ordinaire.",
+      "topic": "lock modes"
+    },
+    {
+      "id": "hcie-og-01-q11",
+      "type": "single",
+      "prompt": "In pg_locks, what does a row with granted = false represent?",
+      "options": [
+        "A lock request still waiting to be granted",
+        "A lock held by a prepared transaction",
+        "A lock released at commit",
+        "A lock on a temporary table"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "granted = false signifie que la session a demandé le verrou mais qu'il est en conflit avec un verrou existant : elle attend. Un verrou accordé porte granted = true. Les transactions préparées et les tables temporaires peuvent apparaître dans pg_locks, mais ce n'est pas ce que distingue ce champ. La libération au commit se traduit par la disparition de la ligne, pas par granted = false.",
+      "topic": "pg_locks"
+    },
+    {
+      "id": "hcie-og-01-q12",
+      "type": "single",
+      "prompt": "Which statement about VACUUM FULL is correct?",
+      "options": [
+        "It removes WAL files from pg_xlog",
+        "It rewrites the table and returns space to the operating system",
+        "It only updates optimizer statistics",
+        "It runs online without blocking readers"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "VACUUM FULL réécrit la table dans un nouveau fichier, ce qui rend réellement les pages au système, mais il prend un verrou AccessExclusive et bloque les lecteurs pendant l'opération. Il met aussi à jour les statistiques, mais ce n'est pas sa fonction principale. Il n'est donc pas en ligne. Il ne supprime jamais les WAL : le recyclage de pg_xlog dépend des checkpoints et de l'archivage.",
+      "topic": "vacuum full"
+    },
+    {
+      "id": "hcie-og-01-q13",
+      "type": "single",
+      "prompt": "What is the role of the commit sequence number (CSN) in openGauss MVCC?",
+      "options": [
+        "It is the size of the WAL segment",
+        "It is the number of rows estimated by the planner",
+        "It is the logical timestamp used to decide tuple visibility",
+        "It is the physical address of the tuple on disk"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Chaque transaction reçoit un CSN à la validation ; le snapshot compare le CSN de création et de suppression d'une version à son CSN de référence pour décider de la visibilité. L'adresse physique d'un tuple est le ctid. La taille des segments WAL est un paramètre de configuration, pas un CSN. Le nombre de lignes estimé relève des statistiques du planificateur.",
+      "topic": "CSN"
+    },
+    {
+      "id": "hcie-og-01-q14",
+      "type": "single",
+      "prompt": "Under READ COMMITTED, when is a new snapshot taken?",
+      "options": [
+        "Only at the start of the transaction",
+        "Only at COMMIT",
+        "Only when a lock is acquired",
+        "At the start of every SQL statement"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "En READ COMMITTED, chaque instruction voit les données validées avant son début : deux SELECT successifs peuvent donc différer. Un snapshot unique au début de la transaction caractérise REPEATABLE READ et SERIALIZABLE. Le COMMIT ne prend pas de snapshot de lecture. L'acquisition d'un verrou ne déclenche pas de snapshot : elle attend la fin de la transaction concurrente puis réévalue la ligne.",
+      "topic": "read committed"
+    },
+    {
+      "id": "hcie-og-01-q15",
+      "type": "single",
+      "prompt": "After a SQL error inside an explicit transaction, what must the application do before issuing another statement?",
+      "options": [
+        "Issue ROLLBACK or ROLLBACK TO a savepoint",
+        "Nothing, the transaction continues normally",
+        "Issue COMMIT to clear the error",
+        "Restart the database instance"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Une erreur place la transaction en état aborted : toute instruction suivante échoue avec SQLSTATE 25P02. Il faut annuler toute la transaction avec ROLLBACK, ou revenir à un savepoint avec ROLLBACK TO si l'on veut conserver le travail antérieur. Un COMMIT dans cet état ne valide rien : il se comporte comme un rollback. Redémarrer l'instance est inutile et disproportionné.",
+      "topic": "aborted transaction"
+    },
+    {
+      "id": "hcie-og-01-q16",
+      "type": "multi",
+      "prompt": "Which practices reduce the risk of deadlocks? (Choose 3)",
+      "options": [
+        "Access rows in a consistent order",
+        "Keep transactions short",
+        "Use SKIP LOCKED for queue consumption",
+        "Hold a transaction open during user input"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Un ordre d'accès identique dans toutes les transactions empêche les cycles d'attente. Des transactions courtes réduisent la fenêtre de conflit et la durée de détention des verrous. SKIP LOCKED évite l'attente sur les lignes d'une file déjà réservées. Attendre une saisie utilisateur entre BEGIN et COMMIT allonge la transaction et augmente au contraire fortement le risque de deadlock et de bloat.",
+      "topic": "deadlock prevention"
+    },
+    {
+      "id": "hcie-og-01-q17",
+      "type": "multi",
+      "prompt": "Which statements about routine VACUUM are correct? (Choose 3)",
+      "options": [
+        "It marks space as reusable inside the table",
+        "It can run while the table remains available",
+        "It updates the free space map",
+        "It always shrinks the physical file on disk"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "VACUUM marque l'espace des tuples morts comme réutilisable, met à jour la free space map et peut s'exécuter sans bloquer les lectures et écritures normales. En revanche, il ne réduit pas le fichier : seules des opérations comme VACUUM FULL réécrivent la table et rendent les pages au système. Confondre recyclage interne et réduction physique est un piège classique.",
+      "topic": "vacuum"
+    },
+    {
+      "id": "hcie-og-01-q18",
+      "type": "tf",
+      "prompt": "In openGauss MVCC, a plain SELECT blocks concurrent UPDATEs on the same row.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un SELECT ordinaire lit une version visible sans prendre de verrou de ligne : les écrivains peuvent créer une nouvelle version en parallèle. C'est précisément l'intérêt du MVCC, où lecture et écriture ne se bloquent pas. Seules des clauses explicites comme FOR UPDATE ou FOR SHARE posent des verrous de ligne. Le blocage peut toutefois apparaître au niveau des verrous de table pris par certaines opérations DDL.",
+      "topic": "MVCC concurrency"
+    },
+    {
+      "id": "hcie-og-01-q19",
+      "type": "text",
+      "prompt": "Name the system view that lists both granted and pending locks in an openGauss database (one word).",
+      "accept": [
+        "pg_locks",
+        "PG_LOCKS"
+      ],
+      "sample_answer": "pg_locks",
+      "explanation_fr": "pg_locks contient une ligne par verrou détenu ou demandé, avec les champs locktype, relation, mode, granted et pid. Une jointure avec pg_stat_activity permet d'identifier la requête et l'utilisateur derrière chaque verrou. granted = false signale une demande en attente. pg_stat_activity montre les sessions mais pas le détail des modes de verrou ; pg_locks est donc la vue spécialisée.",
+      "topic": "lock diagnosis"
+    },
+    {
+      "id": "hcie-og-01-q20",
+      "type": "single",
+      "prompt": "Which SQLSTATE indicates a serialization failure that an application should retry?",
+      "options": [
+        "53300",
+        "40001",
+        "23505",
+        "42P01"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "40001 correspond à serialization_failure : la transaction a été annulée pour préserver la sérialisation et peut être rejouée. 23505 est une violation d'unicité, qui ne disparaît pas en rejouant la même requête. 42P01 signale une table inexistante, erreur de programmation. 53300 indique trop de connexions, problème de capacité et non de concurrence transactionnelle.",
+      "topic": "serialization failure"
+    }
+  ]
+}

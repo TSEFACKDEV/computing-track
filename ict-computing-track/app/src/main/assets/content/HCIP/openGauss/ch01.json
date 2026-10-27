@@ -1,0 +1,577 @@
+{
+  "id": "hcip-og-01",
+  "phase": "HCIP",
+  "subject": "openGauss",
+  "number": 1,
+  "title_fr": "Haute disponibilité et réplication openGauss",
+  "title_en": "High Availability and Replication",
+  "minutes": 60,
+  "source": "HCIP-openGauss V1.0 Training Material — Sessions 1 «System Architecture» + 3 «Routine Checks · Backup/Restoration · HA and DR»",
+  "objectives": [
+    "Décrire le pipeline WAL entre primaire, WalSender, WalReceiver et standby",
+    "Choisir entre réplication synchrone et asynchrone selon le RPO et la latence",
+    "Expliquer le rôle du Cluster Manager et l'arbitrage par quorum",
+    "Distinguer switchover planifié et failover d'urgence, et mesurer leurs impacts",
+    "Exploiter les standbys en lecture seule et diagnostiquer le lag de réplication",
+    "Concevoir une reprise après sinistre à distance avec gs_sdr"
+  ],
+  "sections": [
+    {
+      "heading": "Architecture primaire/standby et circulation du WAL",
+      "body": "openGauss organise la haute disponibilité autour d'un nœud primaire qui accepte les écritures et d'un ou plusieurs standbys qui rejouent en continu le journal WAL. Chaque modification est d'abord écrite dans le WAL buffer, puis vidée sur disque par le thread WalWriter avant l'acquittement du commit. Le primaire transmet ensuite ces enregistrements via le thread WalSender ; le standby les reçoit par WalReceiver, les écrit dans pg_xlog, puis les rejoue sur les pages de données. Cette séparation entre écriture du journal et application des pages explique pourquoi un standby peut être en avance sur le disque mais en retard sur le rejeu.\n\nLe rôle de chaque instance est enregistré dans gaussdb.state et se vérifie avec gs_ctl query ou cm_ctl query. Le standby reste en mode recovery : il répond aux SELECT mais refuse toute écriture. Comprendre ce pipeline est essentiel, car les indicateurs de lag (write, flush, replay) correspondent précisément à ces étapes. Un lag de rejeu élevé signale souvent un disque standby saturé, tandis qu'un lag d'écriture pointe plutôt vers le réseau ou la charge du primaire.",
+      "bullets": [
+        "Le primaire écrit le WAL avant de valider le commit, puis le transmet aux standbys",
+        "WalSender émet le journal, WalReceiver le reçoit et le stocke dans pg_xlog",
+        "Le standby applique le WAL en mode recovery et reste strictement en lecture seule",
+        "Les trois lag (write, flush, replay) isolent réseau, disque et rejeu"
+      ],
+      "code": [
+        "SELECT pg_is_in_recovery();",
+        "SELECT * FROM pg_stat_replication;",
+        "gs_ctl query -D /data/openGauss/db1"
+      ],
+      "diagram": "Application\n     |\n     v\n[ Primaire ] ---- WAL ----> [ Standby 1 ]\n  WalWriter                 WalReceiver\n  WalSender                 pg_xlog\n  Shared buffers            replay\n     |\n     +--------- WAL ----> [ Standby 2 ]\n                           (read-only)",
+      "tip": "Un standby n'est pas un simple miroir de fichiers : il rejoue le WAL. Un lag de rejeu peut donc exister alors que le réseau et l'écriture du journal sont parfaits."
+    },
+    {
+      "heading": "Réplication synchrone, asynchrone et quorum",
+      "body": "Le mode de réplication se choisit selon le compromis entre perte de données et latence. En asynchrone, le primaire valide le commit dès que son WAL local est sur disque ; le standby suit avec un retard variable. Les performances sont meilleures, mais une panne brutale du primaire peut perdre les transactions non encore transmises : le RPO devient positif. En synchrone, le primaire attend qu'au moins un standby ait écrit ou rejoué le WAL avant de rendre le commit visible ; le RPO vaut alors zéro, au prix d'un aller-retour réseau sur chaque commit.\n\nLe paramètre synchronous_standby_names désigne les standbys attendus. La forme ANY 1 (standby1, standby2) impose au moins un acquittement parmi deux, ce qui tolère la panne d'un réplica sans bloquer les écritures ; FIRST 1 privilégie le premier standby de la liste. synchronous_commit permet un réglage plus fin : on peut garder le commit local et attendre le flush distant, ou relâcher la garantie pour certaines transactions. Un cluster équilibré combine souvent un standby synchrone local et un standby asynchrone distant pour le DR.",
+      "bullets": [
+        "Asynchrone : commit local immédiat, RPO positif, débit maximal",
+        "Synchrone : commit après acquittement du standby, RPO nul, latence supérieure",
+        "ANY 1 accepte n'importe quel standby de la liste ; FIRST 1 impose le premier",
+        "Seuls les standbys nommés participent au quorum synchrone"
+      ],
+      "code": [
+        "ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (standby1, standby2)';",
+        "ALTER SYSTEM SET synchronous_commit = on;",
+        "SELECT pg_reload_conf();",
+        "SHOW synchronous_standby_names;"
+      ],
+      "table": {
+        "headers": [
+          "Critère",
+          "Synchrone",
+          "Asynchrone"
+        ],
+        "rows": [
+          [
+            "RPO",
+            "0 (aucune perte acquittée)",
+            "> 0 (fenêtre de perte)"
+          ],
+          [
+            "Latence de commit",
+            "Aller-retour vers le standby",
+            "Locale au primaire"
+          ],
+          [
+            "Débit d'écriture",
+            "Limité par le standby le plus lent",
+            "Proche du maximum local"
+          ],
+          [
+            "Usage typique",
+            "Données critiques, transactions financières",
+            "Rapports, DR distant, tolérance à la perte"
+          ]
+        ]
+      },
+      "tip": "L'examen oppose souvent RPO et RTO : le mode synchrone garantit le RPO, pas le RTO. La reprise reste dépendante de la détection et de la promotion."
+    },
+    {
+      "heading": "Cluster Manager : cm_agent, cm_server et arbitrage",
+      "body": "Le Cluster Manager assure la surveillance et la reprise automatique du cluster. Trois briques coopèrent : le CMM surveille localement le cm_agent, le cm_agent surveille le nœud de données et le cm_server, et le cm_server arbitre les rôles. Le cm_agent vérifie toutes les secondes l'état du processus de données, la connectivité vers les autres nœuds et l'espace disque. S'il constate la disparition du processus primaire, il alerte le cm_server, qui lance une élection et promeut le standby le plus à jour.\n\nLe cm_server s'appuie sur le protocole Quorum : la décision de promotion requiert l'accord de la majorité des serveurs de management. Ce mécanisme évite le split-brain, situation où deux nœuds se croient primaires après une partition réseau. En cas de double primaire potentiel, le nœud isolé est déclassé ou arrêté pour préserver l'intégrité. Un déploiement sérieux utilise deux réseaux d'interconnexion distincts et un quorum impair. Le CM peut aussi pousser l'information de bascule vers les applications via HTTP/HTTPS.",
+      "bullets": [
+        "cm_agent : sonde locale du processus, du réseau et du disque",
+        "cm_server : élection du primaire et auto-arbitrage par Quorum",
+        "CMM : surveillance du cm_agent sur chaque nœud",
+        "Le quorum et un réseau redondant préviennent le split-brain"
+      ],
+      "code": [
+        "cm_ctl query -v",
+        "cm_ctl start",
+        "cm_ctl stop",
+        "ps -ef | grep -E 'cm_agent|cm_server'"
+      ],
+      "diagram": "        +-----------+\n        | cm_server |  (Quorum, élection)\n        +-----+-----+\n              |\n   +----------+----------+\n   |          |          |\n[cm_agent] [cm_agent] [cm_agent]\n   |          |          |\n[ DN 1 ]   [ DN 2 ]   [ DN 3 ]\n primary    standby    standby",
+      "exercises": [
+        {
+          "prompt": "Après une coupure du lien réseau entre le primaire et les deux standbys, le primaire continue à recevoir des écritures. Que doit faire le Cluster Manager et pourquoi ?",
+          "correction": "Le primaire isolé ne voit plus la majorité du cluster. Le cm_server constate la perte de quorum et applique la politique de split-brain : le nœud minoritaire est déclassé ou arrêté, afin qu'il ne puisse plus accepter d'écritures. Les standbys, qui disposent du quorum, élisent un nouveau primaire parmi les plus à jour. On évite ainsi deux historiques divergents impossibles à fusionner simplement."
+        }
+      ],
+      "tip": "Le split-brain n'est pas détecté par le WAL mais par le quorum du CM. Sans majorité, un nœud ne doit jamais rester primaire."
+    },
+    {
+      "heading": "Switchover planifié et failover d'urgence",
+      "body": "Un switchover est une bascule planifiée : le standby est synchronisé, on vérifie l'absence de transaction longue, puis on inverse proprement les rôles. L'ancien primaire devient standby et se réaligne sans perte. La commande cm_ctl switchover -n <nodeid> est privilégiée lorsque le CM est actif, car elle coordonne le CM et les nœuds ; gs_ctl switchover reste utilisable en mode autonome. Un switchover sert aux maintenances, aux montées de version et aux exercices de reprise.\n\nLe failover, lui, est subi : le primaire est déjà indisponible. Le CM choisit le standby dont le WAL rejoué est le plus avancé, le promeut, puis les autres standbys se raccrochent. La différence fondamentale tient au RPO : un switchover ne perd rien, un failover en mode asynchrone peut perdre les dernières transactions. Après promotion, il faut rediriger les clients (VIP flottante avec keepalived, ou découverte via le CM), puis reconstruire l'ancien primaire s'il a divergé. Le RTO cumule détection, élection, rejeu restant et reconnexion applicative.",
+      "bullets": [
+        "Switchover : planifié, sans perte, avec vérification préalable",
+        "Failover : automatique sur panne, RPO dépendant du mode de réplication",
+        "cm_ctl switchover -n coordonne la bascule quand le CM est déployé",
+        "La VIP ou la découverte CM évite de modifier la chaîne de connexion"
+      ],
+      "code": [
+        "cm_ctl switchover -n 2",
+        "gs_ctl switchover -D /data/openGauss/db1 -m fast",
+        "gs_ctl build -D /data/openGauss/db1",
+        "cm_ctl query -v"
+      ],
+      "table": {
+        "headers": [
+          "Critère",
+          "Switchover",
+          "Failover"
+        ],
+        "rows": [
+          [
+            "Déclencheur",
+            "Opération planifiée",
+            "Panne ou perte du primaire"
+          ],
+          [
+            "Perte de données",
+            "Aucune (RPO = 0)",
+            "Possible en asynchrone"
+          ],
+          [
+            "État du primaire",
+            "Sain et synchronisé",
+            "Indisponible"
+          ],
+          [
+            "Retour arrière",
+            "Switchover inverse",
+            "Reconstruction du nœud"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Vous devez appliquer un correctif sur le nœud primaire sans interruption de service. Décrivez la séquence d'opérations.",
+          "correction": "1) Vérifier que le standby est à jour avec cm_ctl query -v et pg_stat_replication. 2) Exécuter cm_ctl switchover -n <id du standby> pour promouvoir le standby et rétrograder l'ancien primaire. 3) Vérifier la connexion des applications et la nouvelle topologie. 4) Arrêter l'ancien primaire, appliquer le correctif, le redémarrer. 5) Le reconstruire ou le laisser se réaligner comme standby, puis effectuer un switchover inverse si l'on veut revenir à la disposition initiale."
+        }
+      ],
+      "tip": "Ne confondez pas promotion et reconstruction : promouvoir un standby est immédiat, réintégrer un ancien primaire divergent exige souvent un gs_ctl build complet."
+    },
+    {
+      "heading": "Standbys en lecture seule et répartition de charge",
+      "body": "Un standby openGauss accepte les requêtes SELECT : c'est un bénéfice de capacité, pas seulement une assurance. L'application route les écritures vers le primaire et les lectures vers un ou plusieurs standbys, via un load balancer, un pool de connexions ou une logique applicative. Cette séparation augmente le débit global et protège le primaire des rapports volumineux. Elle impose cependant de tolérer un léger retard : une lecture immédiatement après une écriture peut ne pas voir la nouvelle ligne si elle est servie par un standby en retard.\n\nDeux garde-fous sont indispensables. D'abord vérifier le rôle avec pg_is_in_recovery() : la fonction renvoie vrai sur un standby, et toute tentative d'écriture y échoue. Ensuite surveiller replay_lag avant d'envoyer des lectures sensibles à la cohérence. Pour les rapports analytiques lourds, on peut créer un standby dédié afin de ne pas perturber le standby de haute disponibilité. Enfin, les requêtes read-only peuvent être forcées par default_transaction_read_only, ce qui protège aussi d'une erreur de routage.",
+      "bullets": [
+        "Le standby sert les SELECT mais refuse INSERT, UPDATE, DELETE et DDL",
+        "pg_is_in_recovery() confirme le rôle lecture seule",
+        "Router les lectures réduit la charge du primaire mais expose au lag",
+        "Un standby dédié isole les rapports du standby de secours"
+      ],
+      "code": [
+        "SELECT pg_is_in_recovery();",
+        "SELECT application_name, state, replay_lag FROM pg_stat_replication;",
+        "SET default_transaction_read_only = on;",
+        "SELECT count(*) FROM pg_stat_activity WHERE state = 'active';"
+      ],
+      "tip": "Une lecture servie par un standby peut être obsolète. Pour le pattern « lire sa propre écriture », forcez la lecture sur le primaire ou attendez la confirmation du LSN."
+    },
+    {
+      "heading": "Supervision, lag et diagnostic des incidents",
+      "body": "La supervision d'un cluster repose sur trois sources complémentaires. La vue pg_stat_replication, interrogée sur le primaire, décrit chaque WalSender : état (streaming, catchup, backup), LSN émis, LSN reçu, et les trois retards write_lag, flush_lag et replay_lag. Le fichier gaussdb.state et gs_ctl query donnent le rôle et l'état local. Enfin cm_ctl query -v offre la vue consolidée du cluster, y compris l'état des cm_server et des nœuds.\n\nL'interprétation du lag évite les fausses pistes. Un write_lag élevé oriente vers le réseau ou la saturation d'écriture du standby ; un flush_lag élevé vers le disque ; un replay_lag élevé vers le rejeu, souvent un disque lent ou une requête de récupération conflictuelle. Un standby qui n'apparaît plus dans la vue a probablement perdu sa connexion WalReceiver : consultez les journaux du primaire et du standby. Les bascules intempestives viennent souvent d'un réseau instable ou d'un seuil de détection trop agressif. On corrige en dédiant un réseau à la réplication, en supervisant les heartbeats et en testant les bascules en staging.",
+      "bullets": [
+        "pg_stat_replication : état du flux et trois lag par standby",
+        "gs_ctl query : rôle et état de l'instance locale",
+        "cm_ctl query -v : vue consolidée du cluster et du CM",
+        "Un lag de rejeu élevé accuse le disque, pas forcément le réseau"
+      ],
+      "code": [
+        "SELECT pid, application_name, state, sent_lsn, replay_lsn,",
+        "       write_lag, flush_lag, replay_lag",
+        "FROM pg_stat_replication;",
+        "gs_check -U omm -i CheckClusterState",
+        "gs_collector --begin-time='2026-10-27 08:00' --end-time='2026-10-27 09:00'"
+      ],
+      "table": {
+        "headers": [
+          "Indicateur",
+          "Signification",
+          "Piste principale"
+        ],
+        "rows": [
+          [
+            "write_lag",
+            "Délai avant écriture du WAL reçu",
+            "Réseau, charge du standby"
+          ],
+          [
+            "flush_lag",
+            "Délai avant flush sur disque",
+            "Performance disque du standby"
+          ],
+          [
+            "replay_lag",
+            "Délai avant application des pages",
+            "Rejeu, I/O, conflits de requêtes"
+          ],
+          [
+            "state = catchup",
+            "Standby en rattrapage",
+            "Volume de WAL ou redémarrage"
+          ]
+        ]
+      },
+      "tip": "Un standby absent de pg_stat_replication n'est pas forcément arrêté : sa connexion de réplication a pu tomber. Vérifiez toujours les deux côtés avant de conclure."
+    },
+    {
+      "heading": "Reprise après sinistre : deux villes, trois centres",
+      "body": "La haute disponibilité locale ne protège pas d'une catastrophe qui détruit le centre de production. openGauss répond avec le DR à distance, typiquement en deux villes et trois centres : production, secours intra-ville et secours distant. Le cluster de secours est complet, avec ses propres nœuds de données et son Cluster Manager ; après promotion, il devient un cluster autonome. La réplication entre clusters utilise gs_sdr et le streaming WAL.\n\nLes objectifs doivent être explicites. Un failover DR accepte une perte limitée, souvent RPO inférieur ou égal à dix secondes, avec un RTO de l'ordre de dix minutes. Un switchover DR planifié vise au contraire un RPO nul. Les paramètres hadr_recovery_time_target et hadr_recovery_point_target pilotent le rythme d'écriture et de rejeu du standby distant pour tenir ces objectifs, tandis que enable_wal_shipping_compression économise la bande passante. Avant toute promotion, vérifiez la cohérence et l'état du cluster distant : promouvoir un standby très en retard revient à accepter une perte silencieuse.",
+      "bullets": [
+        "DR distant : cluster complet et autonome après promotion",
+        "Failover DR : RPO ≤ 10 s et RTO ≤ 10 min dans le modèle Huawei",
+        "Switchover DR planifié : aucune perte de données",
+        "gs_sdr gère la relation DR, la requête d'état et la promotion"
+      ],
+      "code": [
+        "gs_sdr -t start -m primary -X /opt/install/cluster.xml",
+        "gs_sdr -t start -m disaster_standby -X /opt/install/cluster.xml",
+        "gs_sdr -t query",
+        "gs_sdr -t switchover -m primary",
+        "gs_sdr -t failover"
+      ],
+      "diagram": "Ville A                      Ville B\n+-------------+   +-------------+   +-------------+\n| Production  |-->| DR intra    |-->| DR distant  |\n| primaire    |   | standby     |   | standby     |\n+-------------+   +-------------+   +-------------+\n   RPO 0 local      RPO faible        RPO <= 10 s\n                    RTO minutes       RTO <= 10 min",
+      "exercises": [
+        {
+          "prompt": "Le centre de production est détruit. Le cluster DR distant affiche un retard de rejeu de 45 secondes. Le directeur exige un RPO de 10 secondes. Que faites-vous ?",
+          "correction": "On ne promeut pas immédiatement : le retard observé contredit l'objectif. On vérifie d'abord si le lag est transitoire (réseau, saturation) et on attend le rattrapage si le temps le permet. Si la promotion est inévitable, on documente formellement la perte potentielle de 45 secondes et on informe la direction. Ensuite, on promeut avec gs_sdr -t failover, on contrôle la cohérence applicative et on reconstitue le cluster de production. L'incident doit déclencher un ajustement des paramètres hadr et de la bande passante."
+        }
+      ],
+      "tip": "Un RTO annoncé ne vaut que si la VIP, les DNS et les chaînes de connexion basculent aussi. Le temps de reprise est souvent passé côté application, pas côté base."
+    }
+  ],
+  "key_points": [
+    "Le WAL est écrit avant le commit, puis transmis par WalSender et rejoué par WalReceiver",
+    "La réplication synchrone garantit un RPO nul au prix de la latence de commit",
+    "ANY 1 impose un acquittement parmi plusieurs standbys et tolère une panne",
+    "Le CM (cm_agent, cm_server, CMM) surveille, arbitre par quorum et déclenche le failover",
+    "Un switchover est planifié et sans perte ; un failover subi peut perdre des transactions",
+    "Les standbys servent les lectures mais restent strictement read-only",
+    "pg_stat_replication expose les trois lag et permet d'isoler réseau, disque et rejeu",
+    "Le DR distant s'appuie sur gs_sdr avec des objectifs RPO et RTO contractuels"
+  ],
+  "traps": [
+    "Le mode synchrone garantit le RPO mais pas le RTO : la promotion et la reconnexion prennent du temps",
+    "Un standby en lag reste utilisable en lecture : le risque est l'obsolescence des résultats, pas l'indisponibilité",
+    "Le split-brain se traite par le quorum du CM, jamais par une commande SQL sur le primaire",
+    "ANY 1 n'attend pas tous les standbys : un seul acquittement suffit, les autres peuvent être en retard",
+    "Un switchover exige un standby synchronisé ; le lancer trop tôt peut provoquer une perte ou un échec"
+  ],
+  "quiz": [
+    {
+      "id": "hcip-og-01-q01",
+      "type": "single",
+      "prompt": "Which replication mode guarantees zero data loss (RPO = 0) when the primary fails?",
+      "options": [
+        "Synchronous replication",
+        "Logical decoding",
+        "Snapshot export",
+        "Asynchronous replication"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "En réplication synchrone, le primaire n'acquitte le commit qu'après confirmation du standby : aucune transaction validée n'est perdue. L'asynchrone valide localement et laisse une fenêtre de perte. Le décodage logique sert à publier des changements, pas à garantir la durabilité. L'export de snapshot est une technique de sauvegarde logique sans lien avec le RPO.",
+      "topic": "Modes de réplication"
+    },
+    {
+      "id": "hcip-og-01-q02",
+      "type": "single",
+      "prompt": "On the primary, which view reports the state and lag of each connected standby?",
+      "options": [
+        "pg_stat_activity",
+        "pg_stat_replication",
+        "pg_locks",
+        "pg_stat_user_indexes"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "pg_stat_replication décrit chaque WalSender : état, LSN émis et reçu, write_lag, flush_lag et replay_lag. pg_stat_activity liste les sessions clientes et ne montre pas le flux WAL. pg_locks expose les verrous et pg_stat_user_indexes les statistiques d'index. Aucune de ces vues ne permet de mesurer le retard de réplication.",
+      "topic": "Supervision de la réplication"
+    },
+    {
+      "id": "hcip-og-01-q03",
+      "type": "single",
+      "prompt": "Which command performs a planned role reversal between primary and standby when CM is deployed?",
+      "options": [
+        "gs_ctl build",
+        "gs_probackup restore",
+        "cm_ctl switchover -n <node_id>",
+        "cm_ctl stop"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "cm_ctl switchover -n coordonne une bascule planifiée avec le Cluster Manager : le standby est promu et l'ancien primaire rétrogradé. cm_ctl stop arrête le cluster sans inverser les rôles. gs_ctl build reconstruit un standby divergent et gs_probackup restore restaure une sauvegarde physique. Aucune de ces commandes ne réalise un switchover.",
+      "topic": "Switchover"
+    },
+    {
+      "id": "hcip-og-01-q04",
+      "type": "single",
+      "prompt": "What is the main responsibility of cm_agent on each node?",
+      "options": [
+        "Encrypting data files with TDE",
+        "Archiving WAL segments to remote storage",
+        "Parsing SQL statements for the optimizer",
+        "Monitoring the local DN and CM Server and reporting status"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "cm_agent sonde localement le processus de données, le cm_server, le réseau et le disque, puis rapporte au cm_server principal. L'analyse SQL relève du moteur de requêtes, le chiffrement TDE du stockage, et l'archivage du WAL de l'archiveur. cm_agent ne prend pas les décisions d'élection : c'est le rôle du cm_server.",
+      "topic": "Cluster Manager"
+    },
+    {
+      "id": "hcip-og-01-q05",
+      "type": "single",
+      "prompt": "What does synchronous_standby_names = 'ANY 1 (s1, s2)' require before a commit is acknowledged?",
+      "options": [
+        "At least one of s1 or s2 must acknowledge",
+        "The standby with the lowest LSN must acknowledge",
+        "No standby acknowledgement is required",
+        "Both s1 and s2 must acknowledge"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "ANY 1 signifie qu'un seul standby parmi la liste doit confirmer pour que le commit soit acquitté. Exiger les deux correspondrait à FIRST 2 ou ANY 2. Le standby le plus en retard n'est pas privilégié : le primaire attend un acquittement quelconque. Sans acquittement, on serait en mode asynchrone, pas en synchrone avec quorum.",
+      "topic": "Quorum synchrone"
+    },
+    {
+      "id": "hcip-og-01-q06",
+      "type": "single",
+      "prompt": "Which statement about a standby node in normal streaming replication is correct?",
+      "options": [
+        "It accepts all DML but not DDL",
+        "It accepts SELECT and rejects writes until promotion",
+        "It accepts writes when synchronous_commit is off",
+        "It accepts INSERT but rejects UPDATE"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un standby est en mode recovery : il applique le WAL et sert les lectures, mais toute écriture ou DDL est refusée. Le mode de commit synchrone ou asynchrone ne change rien à cette restriction. Seule une promotion, planifiée ou non, lui permet de devenir primaire et d'accepter des écritures.",
+      "topic": "Standby read-only"
+    },
+    {
+      "id": "hcip-og-01-q07",
+      "type": "single",
+      "prompt": "Which metric measures the time needed to restore service after a failure?",
+      "options": [
+        "CSN",
+        "RPO",
+        "RTO",
+        "LSN"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Le RTO (Recovery Time Objective) est la durée maximale acceptable pour rétablir le service. Le RPO mesure la quantité de données qu'on accepte de perdre, pas la durée. Le LSN est une position dans le journal WAL et le CSN un horodatage logique de transaction. Ces deux derniers sont des mécanismes internes, pas des objectifs de continuité.",
+      "topic": "Objectifs de continuité"
+    },
+    {
+      "id": "hcip-og-01-q08",
+      "type": "single",
+      "prompt": "How does openGauss prevent two nodes from both acting as primary after a network partition?",
+      "options": [
+        "By forcing all standbys to read-only mode",
+        "By increasing work_mem on the primary",
+        "By disabling WAL archiving on the minority side",
+        "By using CM quorum arbitration and fencing the isolated node"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Le cm_server s'appuie sur le quorum : seul le côté majoritaire peut élire un primaire, et le nœud isolé est déclassé ou arrêté. Couper l'archivage WAL ne résout pas la divergence et peut aggraver la perte. Le read-only des standbys est normal et permanent. work_mem concerne la mémoire des tris et n'a aucun effet sur le split-brain.",
+      "topic": "Split-brain"
+    },
+    {
+      "id": "hcip-og-01-q09",
+      "type": "single",
+      "prompt": "In the two-city three-DC DR model, what are the typical objectives of a DR failover?",
+      "options": [
+        "RPO <= 10 s and RTO <= 10 min",
+        "RPO <= 1 h and RTO <= 24 h",
+        "RPO and RTO are undefined for DR",
+        "RPO = 0 and RTO = 0"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le failover DR accepte une perte limitée, couramment RPO inférieur ou égal à dix secondes, avec un RTO de l'ordre de dix minutes. Un RPO et un RTO nuls correspondent à une bascule parfaite qui n'est pas garantie en cas de sinistre. Les valeurs d'une heure et vingt-quatre heures sont trop laxistes pour ce modèle. Le DR définit toujours des objectifs contractuels mesurables.",
+      "topic": "DR distant"
+    },
+    {
+      "id": "hcip-og-01-q10",
+      "type": "single",
+      "prompt": "When disk usage crosses the CM read-only threshold, what happens to the cluster?",
+      "options": [
+        "Only the affected node becomes read-only",
+        "The whole cluster is set to read-only and writes fail",
+        "The standby is promoted automatically",
+        "WAL archiving is disabled"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le statut read-only est appliqué au niveau du cluster : si un nœud dépasse le seuil, le CM envoie l'ordre à tous les nœuds et les écritures échouent. Il ne s'agit pas d'une mesure locale au nœud concerné. Aucune promotion n'est déclenchée par un manque d'espace, et l'archivage WAL n'est pas désactivé. L'administrateur doit libérer de l'espace puis lever l'état read-only.",
+      "topic": "Seuils disque et CM"
+    },
+    {
+      "id": "hcip-og-01-q11",
+      "type": "multi",
+      "prompt": "Which factors can increase replication lag on a standby? (Choose 3)",
+      "options": [
+        "Slow network between primary and standby",
+        "Saturated I/O on the standby",
+        "A large volume of WAL to replay",
+        "A slow client application on a third host"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Le réseau ralentit la transmission, l'I/O saturée retarde l'écriture ou le rejeu, et un gros volume de WAL allonge le rattrapage. Ces trois facteurs agissent directement sur le pipeline de réplication. La lenteur d'un client applicatif sur un autre hôte n'affecte pas le flux WAL entre primaire et standby ; elle peut seulement retarder ses propres requêtes.",
+      "topic": "Causes du lag"
+    },
+    {
+      "id": "hcip-og-01-q12",
+      "type": "multi",
+      "prompt": "Which functions belong to the openGauss Cluster Manager? (Choose 3)",
+      "options": [
+        "Detecting DN process failure",
+        "Electing a new primary by quorum",
+        "Monitoring CM Server health",
+        "Rewriting SQL queries for the optimizer"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Le CM détecte les pannes de processus, arbitre l'élection du primaire et surveille la santé des cm_server. Ces fonctions sont réparties entre cm_agent, cm_server et CMM. La réécriture SQL est assurée par le moteur de requêtes, en amont de l'optimiseur, et n'a aucun rapport avec la gestion de cluster.",
+      "topic": "Cluster Manager"
+    },
+    {
+      "id": "hcip-og-01-q13",
+      "type": "multi",
+      "prompt": "Which statements about openGauss HA and DR are correct? (Choose 3)",
+      "options": [
+        "A standby can serve read-only queries",
+        "A planned switchover should not lose committed data",
+        "A DR standby cluster includes its own cluster management components",
+        "Asynchronous replication always provides RPO = 0"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Les standbys servent les lectures, un switchover planifié préserve les données, et le cluster DR est complet avec son propre management. En revanche, la réplication asynchrone ne garantit jamais un RPO nul : c'est précisément sa limite. Cette dernière proposition est donc fausse et doit être écartée.",
+      "topic": "HA et DR"
+    },
+    {
+      "id": "hcip-og-01-q14",
+      "type": "tf",
+      "prompt": "A standby node in openGauss accepts write statements while it is replaying WAL.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : un standby est en mode recovery et n'accepte que les lectures. Les écritures et les DDL y sont refusés jusqu'à la promotion. Même avec synchronous_commit désactivé, le rôle reste read-only. Cette restriction garantit qu'un seul nœud produit l'historique des modifications.",
+      "topic": "Standby read-only"
+    },
+    {
+      "id": "hcip-og-01-q15",
+      "type": "tf",
+      "prompt": "A failover on an asynchronously replicated cluster can lose the most recent committed transactions.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : en asynchrone, le primaire acquitte le commit sans attendre le standby. Si le primaire tombe avant la transmission, les dernières transactions validées n'existent que sur son disque détruit ou indisponible. Le RPO est donc positif. Pour supprimer ce risque, il faut passer en réplication synchrone.",
+      "topic": "RPO et failover"
+    },
+    {
+      "id": "hcip-og-01-q16",
+      "type": "tf",
+      "prompt": "A planned switchover with a fully synchronized standby is expected to lose no committed data.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : le switchover vérifie que le standby a rejoué tout le WAL nécessaire avant d'inverser les rôles. Aucune transaction acquittée n'est perdue, le RPO est nul. Cela ne dispense pas de contrôler l'état du standby et l'absence de transaction longue. Un failover non planifié, lui, peut perdre des données en asynchrone.",
+      "topic": "Switchover"
+    },
+    {
+      "id": "hcip-og-01-q17",
+      "type": "text",
+      "prompt": "Which SQL function returns true when the current node is a standby in recovery? (function name only)",
+      "accept": [
+        "pg_is_in_recovery",
+        "pg_is_in_recovery()",
+        "select pg_is_in_recovery()",
+        "SELECT pg_is_in_recovery();"
+      ],
+      "sample_answer": "pg_is_in_recovery",
+      "explanation_fr": "pg_is_in_recovery() renvoie vrai sur un standby qui rejoue le WAL et faux sur le primaire. C'est le test de rôle le plus fiable avant de router une lecture ou de tenter une écriture. La fonction ne renseigne pas sur le retard de réplication : pour cela, il faut consulter pg_stat_replication.",
+      "topic": "Standby read-only"
+    },
+    {
+      "id": "hcip-og-01-q18",
+      "type": "text",
+      "prompt": "Which CM command displays the consolidated status of all cluster nodes? (command only)",
+      "accept": [
+        "cm_ctl query",
+        "cm_ctl query -v",
+        "cm_ctl query -v -C",
+        "cm_ctl query -Cv"
+      ],
+      "sample_answer": "cm_ctl query -v",
+      "explanation_fr": "cm_ctl query affiche l'état consolidé du cluster : cm_server, nœuds, instances et rôles. L'option -v ajoute le détail des chemins de données et des états. gs_ctl query ne voit qu'une instance locale, et pg_stat_replication seulement le flux vu du primaire. Pour un diagnostic de bascule, cm_ctl query est donc l'outil de référence.",
+      "topic": "Supervision du cluster"
+    },
+    {
+      "id": "hcip-og-01-q19",
+      "type": "text",
+      "prompt": "Which configuration parameter lists the standbys that must acknowledge commits in synchronous replication?",
+      "accept": [
+        "synchronous_standby_names",
+        "Synchronous_Standby_Names"
+      ],
+      "sample_answer": "synchronous_standby_names",
+      "explanation_fr": "synchronous_standby_names contient la liste et la politique d'acquittement, par exemple ANY 1 (s1, s2). Sans cette liste, synchronous_commit n'a aucun standby à attendre et le comportement reste local. Le paramètre se recharge à chaud avec pg_reload_conf. Il ne faut pas le confondre avec synchronous_commit, qui règle le niveau de garantie.",
+      "topic": "Configuration synchrone"
+    },
+    {
+      "id": "hcip-og-01-q20",
+      "type": "text",
+      "prompt": "Which background thread on the primary sends WAL records to standby nodes? (thread name only)",
+      "accept": [
+        "walsender",
+        "wal sender",
+        "WalSender",
+        "wal_sender"
+      ],
+      "sample_answer": "WalSender",
+      "explanation_fr": "Le thread WalSender s'exécute sur le primaire et transmet les enregistrements WAL aux standbys. En face, WalReceiver reçoit et stocke ces enregistrements avant le rejeu. WalWriter, lui, écrit le WAL local sur disque et ne communique pas avec les standbys. Cette distinction est fréquente dans les questions d'architecture.",
+      "topic": "Architecture de réplication"
+    }
+  ]
+}

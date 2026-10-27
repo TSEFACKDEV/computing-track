@@ -1,0 +1,746 @@
+{
+  "id": "hcie-oe-03",
+  "phase": "HCIE",
+  "subject": "openEuler",
+  "number": 3,
+  "title_fr": "Ops expert : observabilité et débogage système",
+  "title_en": "Expert Operations: Observability and System Debug",
+  "minutes": 90,
+  "source": "HCIE-openEuler V1.0 Training Material — Sessions 13-14 et 16-22 «Kernel live upgrade, Rubik, CI/CD (Git/GitLab/Jenkins), Ansible, Kolla/OpenStack, EFK, sysmonitor, A-Ops»",
+  "objectives": [
+    "Construire une pile d'observabilité fiable : métriques, logs et traces",
+    "Centraliser les logs avec EFK ou Loki et définir une rétention",
+    "Analyser une latence avec perf, les flamegraphs et eBPF",
+    "Diagnostiquer un boot, un panic noyau et une pression mémoire",
+    "Exploiter sysmonitor et les événements RAS sur openEuler ARM",
+    "Planifier une maintenance sans interruption avec la live upgrade"
+  ],
+  "sections": [
+    {
+      "heading": "Les trois signaux : métriques, logs et traces",
+      "body": "L'observabilité ne se résume pas à un tableau de bord : elle repose sur trois signaux complémentaires. Les métriques sont des séries temporelles numériques, peu coûteuses et parfaites pour les alertes ; Prometheus les collecte en mode pull depuis node_exporter et les exporters applicatifs, les stocke dans sa TSDB et les expose à Grafana. Les logs racontent l'événement unitaire avec son contexte ; les traces suivent une requête à travers plusieurs services et attribuent le temps à chaque étape. Une bonne conception part des questions opérationnelles : le service est-il disponible, lent, ou en erreur ? La méthode USE (utilisation, saturation, erreurs) convient aux ressources, tandis que RED (rate, errors, duration) convient aux services. Les SLI mesurent l'expérience réelle, le SLO fixe l'objectif et le budget d'erreur autorise l'innovation sans masquer la dette de fiabilité. Attention à la cardinalité : une métrique étiquetée par identifiant de requête ou par utilisateur peut faire exploser la TSDB et le coût. Enfin, une alerte doit être actionnable et reliée à un runbook ; sinon elle consomme l'attention sans réduire le risque.",
+      "bullets": [
+        "Métriques pour les tendances et alertes, logs pour le contexte, traces pour la causalité",
+        "Prometheus collecte en pull ; node_exporter expose les métriques système",
+        "USE pour les ressources, RED pour les services, SLI/SLO pour la promesse",
+        "La cardinalité des labels est le principal piège de coût",
+        "Une alerte sans runbook est du bruit opérationnel"
+      ],
+      "code": [
+        "systemctl status node_exporter",
+        "curl -s localhost:9100/metrics | grep node_cpu_seconds_total",
+        "promtool check rules /etc/prometheus/rules/*.yml",
+        "up{job=\"node\"} == 0",
+        "histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))"
+      ],
+      "table": {
+        "headers": [
+          "Signal",
+          "Question",
+          "Outil typique",
+          "Coût"
+        ],
+        "rows": [
+          [
+            "Métrique",
+            "Combien, à quelle vitesse ?",
+            "Prometheus, Grafana",
+            "Faible à modéré"
+          ],
+          [
+            "Log",
+            "Que s'est-il passé exactement ?",
+            "EFK, Loki, journald",
+            "Élevé selon le volume"
+          ],
+          [
+            "Trace",
+            "Où le temps est-il passé ?",
+            "Jaeger, Tempo, OTel",
+            "Élevé selon l'échantillonnage"
+          ]
+        ]
+      },
+      "diagram": "  hosts/apps                collecte              stockage/visualisation\n  ----------                --------              ----------------------\n  node_exporter --pull-->  Prometheus  ----------> Grafana\n  app /metrics   --pull-->     |\n                               v\n                          Alertmanager --> mail / chat / pager\n\n  journald/fluent-bit --push--> Loki ou Elasticsearch --> Kibana/Grafana\n  app OTel SDK --push--> Collector --> Jaeger/Tempo (traces)",
+      "tip": "Ne confondez pas disponibilité et santé : up{job=\"node\"} == 0 indique une cible injoignable, pas nécessairement un hôte en panne. Un exporter qui répond alors que le service applicatif est mort laisse le dashboard au vert."
+    },
+    {
+      "heading": "Logs centralisés : journald, EFK et Loki",
+      "body": "Sur openEuler, journald collecte les logs du noyau, de systemd et des services, consultables avec journalctl. Pour un parc, il faut centraliser : rsyslog ou Fluent Bit pousse les journaux vers un stockage partagé. La pile EFK associe Fluentd (ou Fluent Bit) à Elasticsearch et Kibana ; Elasticsearch construit un index inversé qui rend la recherche plein texte très rapide, au prix d'un stockage et d'une maintenance importants. Loki adopte l'approche inverse : il n'indexe que les labels (job, namespace, pod, niveau) et stocke le contenu compressé en chunks, ce qui réduit le coût mais impose des requêtes par labels puis filtrage. Choisir EFK ou Loki dépend donc de la nécessité de rechercher dans le texte : audit réglementaire et analyse fine pour EFK, diagnostic rapide et économie pour Loki. Les applications doivent journaliser en JSON structuré, avec un identifiant de corrélation repris dans les traces. La rétention se définit par niveau : audit plusieurs mois, debug quelques jours. Enfin, le transport Syslog en UDP peut perdre des messages ; pour les logs critiques, utilisez TCP ou un agent avec tampon local.",
+      "bullets": [
+        "journald pour l'hôte, EFK ou Loki pour le parc",
+        "EFK indexe le texte, Loki n'indexe que les labels",
+        "JSON structuré + correlation id = logs exploitables",
+        "Rétention différenciée par niveau et par obligation légale",
+        "Syslog UDP peut perdre des messages : préférer TCP pour l'audit"
+      ],
+      "code": [
+        "journalctl -u haproxy --since '1 hour ago'",
+        "journalctl -k -p warning -b",
+        "logcli query '{namespace=\"app\"} |= \"timeout\"' --since=1h",
+        "curl -s localhost:3100/ready",
+        "kubectl logs -n logging -l app=fluent-bit --tail=50"
+      ],
+      "table": {
+        "headers": [
+          "Solution",
+          "Indexation",
+          "Force",
+          "Limite"
+        ],
+        "rows": [
+          [
+            "EFK",
+            "Plein texte (index inversé)",
+            "Recherche complexe, audit",
+            "Coût stockage et CPU"
+          ],
+          [
+            "Loki",
+            "Labels uniquement",
+            "Léger, corrélé à Grafana",
+            "Filtrage moins riche"
+          ],
+          [
+            "journald local",
+            "Binaire local",
+            "Zéro infrastructure",
+            "Pas de vue parc"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Une application produit 40 Go de logs par jour, dont 90 % de debug. Le budget de stockage autorise 7 jours. Proposez une politique de rétention et les réglages côté collecteur, en justifiant les choix.",
+          "correction": "On conserve les logs d'audit et d'erreur plus longtemps (par exemple 90 jours pour l'audit, 30 jours pour les erreurs) et on limite le debug à 24 ou 48 heures. Côté collecteur, on filtre dès l'agent pour ne pas envoyer 90 % de bruit : Fluent Bit ou Fluentd applique un filtre sur le niveau, puis un buffer local et une rotation pour absorber les pics. Côté stockage, on définit une politique de cycle de vie : suppression ou passage en stockage froid après la période chaude. Il faut vérifier que la réduction du debug ne supprime pas l'identifiant de corrélation nécessaire au diagnostic ; on peut conserver les champs structurés et supprimer le message verbeux."
+        }
+      ],
+      "tip": "Une requête Loki trop large (tous les labels, 30 jours) peut saturer le querier et donner l'impression que Loki est lent. Filtrez d'abord par namespace et par pod, puis par motif ; la conception des labels est plus importante que la puissance du serveur."
+    },
+    {
+      "heading": "Traces distribuées et OpenTelemetry",
+      "body": "Une trace représente le parcours complet d'une requête, de l'interface utilisateur jusqu'à la base de données. Elle est composée de spans : chaque span décrit une opération, sa durée, son statut et ses attributs, et pointe vers son parent. Le contexte se propage entre services via un en-tête standard, souvent traceparent au format W3C, ce qui permet de relier des logs et des métriques à la même trace. OpenTelemetry fournit une API, des SDK et un Collector ; le Collector reçoit, transforme et exporte les données vers Jaeger, Tempo ou un backend commercial, ce qui découple l'instrumentation du fournisseur. Pourquoi échantillonner ? Une trace complète sur chaque requête coûte cher en stockage et en réseau. L'échantillonnage en tête décide au départ, l'échantillonnage en queue décide après avoir vu la trace et permet de conserver toutes les erreurs. Le piège classique est de tracer sans propager le contexte : les spans apparaissent isolés et la causalité disparaît. Un autre est de mettre des attributs à forte cardinalité, comme l'identifiant de commande, qui gonflent l'index. Enfin, les exemplars relient une métrique agrégée à une trace précise, ce qui accélère le passage du symptôme à la cause.",
+      "bullets": [
+        "Trace = arbre de spans ; chaque span a un parent et une durée",
+        "La propagation de contexte (traceparent) relie les services",
+        "OpenTelemetry Collector découple instrumentation et backend",
+        "Échantillonnage en tête ou en queue selon le besoin",
+        "Les attributs à forte cardinalité coûtent cher : à limiter"
+      ],
+      "code": [
+        "otelcol --config /etc/otel/config.yaml",
+        "otelcol-contrib validate --config /etc/otel/config.yaml",
+        "kubectl get pods -n observability -l app=jaeger",
+        "curl -s localhost:16686/api/services",
+        "kubectl logs -n app deploy/api | grep trace_id"
+      ],
+      "diagram": "  client --> service A --> service B --> base\n                |             |            |\n             span A        span B       span C\n                \\____________|____________/\n                         trace unique\n                contexte propage: traceparent\n\n  SDK --> OTel Collector --> Jaeger/Tempo\n                     |\n                     +--> echantillonnage, filtrage, export",
+      "tip": "Si un span enfant n'a pas de parent, vérifiez la propagation avant de blâmer le backend : un proxy qui supprime l'en-tête traceparent casse la chaîne. Testez avec un appel direct entre deux services instrumentés."
+    },
+    {
+      "heading": "Latence CPU : perf et flamegraphs",
+      "body": "perf s'appuie sur les compteurs matériels et les échantillonnages du noyau pour répondre à la question « où le CPU passe-t-il son temps ? ». La commande perf record -F 99 -a -g -- sleep 30 échantillonne tous les processeurs à 99 Hz et capture les piles d'appels ; perf report permet ensuite une exploration interactive. Pour comparer plusieurs hot paths, on agrège les piles avec stackcollapse-perf.pl puis on génère un flamegraph SVG avec flamegraph.pl. La largeur d'une fonction représente sa fréquence d'apparition dans les échantillons, pas une latence absolue : un flamegraph large peut correspondre à beaucoup d'appels courts. Les frames sont empilées du bas (racine) vers le haut (feuille), et les couleurs n'ont pas de signification fonctionnelle. Un profil pris à vide ne prouve rien : mesurez sous charge représentative, avant et après un changement, avec la même fréquence et le même périmètre. Pensez aux symboles de debug : sans debuginfo, les fonctions apparaissent comme des adresses illisibles. Enfin, distinguez le temps on-CPU, visible dans perf, du temps off-CPU (attente d'I/O ou de verrou), qui exige des outils complémentaires comme offcputime.",
+      "bullets": [
+        "perf record -F 99 -a -g échantillonne tous les CPU avec les piles",
+        "La largeur d'un flamegraph = fréquence, pas latence",
+        "Profiler sous charge réelle, avant et après, avec le même réglage",
+        "Sans debuginfo, les symboles sont inexploitables",
+        "On-CPU avec perf, off-CPU avec offcputime ou des traces"
+      ],
+      "code": [
+        "perf record -F 99 -a -g -- sleep 30",
+        "perf report --stdio --sort comm,dso,symbol | head -40",
+        "perf script | stackcollapse-perf.pl | flamegraph.pl > /tmp/cpu.svg",
+        "perf stat -e cycles,instructions,cache-misses -p $(pidof app) sleep 10",
+        "perf top -g -p $(pidof app)"
+      ],
+      "table": {
+        "headers": [
+          "Outil",
+          "Question",
+          "Limite"
+        ],
+        "rows": [
+          [
+            "perf top",
+            "Qui consomme maintenant ?",
+            "Vision instantanée, bruit"
+          ],
+          [
+            "perf record/report",
+            "Où le temps CPU est-il passé ?",
+            "Ne voit pas les attentes"
+          ],
+          [
+            "flamegraph",
+            "Quel chemin domine ?",
+            "Agrégation, pas chronologie"
+          ],
+          [
+            "offcputime",
+            "Pourquoi un thread dort-il ?",
+            "Nécessite eBPF et privilèges"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un flamegraph montre une large frame dans la fonction de compression, mais seulement 3 % du temps total en attente d'I/O. Le service est pourtant lent. Comment interprétez-vous le graphique et que mesurez-vous ensuite ?",
+          "correction": "La frame de compression domine le temps on-CPU, donc le CPU travaille surtout à compresser. Mais si le service est lent et que 3 % seulement du temps est en attente d'I/O, la latence vient peut-être d'un verrou, d'une file d'attente ou d'un appel réseau bloquant non visible dans perf. On complète avec offcputime pour visualiser le temps off-CPU et sa pile, runqlat pour la latence de file d'attente du scheduler, et des traces applicatives pour situer l'attente dans la requête. On vérifie aussi que l'échantillonnage a bien couvert la période de lenteur et que les symboles sont résolus. Le flamegraph ne prouve pas à lui seul la cause : il oriente l'enquête."
+        }
+      ],
+      "tip": "Un flamegraph ne montre que les échantillons où le CPU exécute du code. Une application qui attend la base de données 90 % du temps produit un graphique trompeur, car les attentes n'apparaissent pas : complétez toujours par l'analyse off-CPU et les traces."
+    },
+    {
+      "heading": "eBPF, bcc et outils système : biolatency, runqlat, strace",
+      "body": "eBPF permet d'exécuter des programmes vérifiés dans le noyau, sans module ni redémarrage, pour observer des événements à faible coût. La collection bcc fournit des outils prêts à l'emploi : biolatency trace l'histogramme de latence des I/O bloc, runqlat mesure le temps d'attente des threads dans la file du scheduler, execsnoop affiche les nouveaux processus, opensnoop les fichiers ouverts et tcplife les connexions TCP. Ces outils répondent à des questions que les métriques agrégées ne tranchent pas : quel disque est lent, quel processus ouvre un fichier de configuration, quel thread attend le CPU. strace -c résume les appels système et leur coût, mais ralentit fortement le processus cible ; à réserver à un diagnostic court. Les outils classiques sysstat complètent le tableau : sar pour l'historique, iostat pour les disques, pidstat pour les processus, mpstat pour les CPU. La méthode USE guide la lecture : utilisation, saturation, erreurs pour chaque ressource. Attention aux privilèges : eBPF et perf nécessitent souvent root ou des capabilities, et leur usage doit être encadré par une politique de sécurité.",
+      "bullets": [
+        "eBPF observe le noyau sans module ni redémarrage",
+        "biolatency pour les disques, runqlat pour l'attente CPU",
+        "opensnoop et execsnoop tracent fichiers et processus",
+        "strace -c ralentit la cible : diagnostic court uniquement",
+        "sar, iostat, pidstat et mpstat complètent l'analyse historique"
+      ],
+      "code": [
+        "biolatency -d /dev/sdb 10 1",
+        "runqlat -P 10 1",
+        "opensnoop -p $(pidof nginx)",
+        "execsnoop -t",
+        "strace -c -p $(pidof app) -f",
+        "sar -u 1 5",
+        "iostat -xz 1 5"
+      ],
+      "table": {
+        "headers": [
+          "Question",
+          "Outil",
+          "Indice observé"
+        ],
+        "rows": [
+          [
+            "Le disque est-il lent ?",
+            "biolatency",
+            "Histogramme de latence bloc"
+          ],
+          [
+            "Les threads attendent-ils le CPU ?",
+            "runqlat",
+            "Temps en file du scheduler"
+          ],
+          [
+            "Qui ouvre ce fichier ?",
+            "opensnoop",
+            "PID, chemin, appel système"
+          ],
+          [
+            "Quels processus démarrent ?",
+            "execsnoop",
+            "Nouveaux exec, arguments"
+          ],
+          [
+            "Quel appel système coûte cher ?",
+            "strace -c",
+            "Temps cumulé par syscall"
+          ]
+        ]
+      },
+      "tip": "runqlat élevé avec un CPU peu utilisé signale souvent un throttling cgroup ou une limite de quota, pas un manque de cœurs physiques. Vérifiez cpu.stat et les limites du conteneur avant d'ajouter du CPU."
+    },
+    {
+      "heading": "Boot, kernel panic et analyse kdump",
+      "body": "Le diagnostic de boot commence par journalctl -b pour le boot courant et journalctl -b -1 pour le précédent, avec -p err pour filtrer les erreurs et -k pour le noyau. systemd-analyze blame et critical-chain identifient les services qui retardent le démarrage. Une initramfs incomplète se répare avec dracut -f, et les paramètres noyau se modifient avec grubby avant redémarrage. Lorsqu'un noyau panique, kdump prend le relais : une petite mémoire est réservée au crashkernel, kexec charge un noyau de secours, et le vmcore est écrit dans /var/crash avant le redémarrage. Sans cette réservation, il n'y a aucun post-mortem possible. L'analyse se fait avec crash /boot/vmlinuz /var/crash/.../vmcore, puis les commandes bt (backtrace), ps (processus), log (messages noyau) et vmcoreinfo. Le OOM killer laisse aussi des traces dans dmesg : un processus tué pour mémoire insuffisante n'est pas un bug applicatif mais une conséquence de la pression mémoire. Enfin, les soft lockups et hard lockups indiquent un CPU bloqué trop longtemps ; ils peuvent venir d'un pilote, d'une IRQ ou d'un verrou noyau.",
+      "bullets": [
+        "journalctl -b et -b -1 pour comparer deux démarrages",
+        "dracut -f reconstruit une initramfs suspecte",
+        "kdump réserve un crashkernel et écrit le vmcore via kexec",
+        "crash fournit bt, ps et log pour l'analyse post-mortem",
+        "OOM killer, soft lockup et hard lockup se lisent dans le noyau"
+      ],
+      "code": [
+        "journalctl -b -p err",
+        "journalctl -b -1 -k",
+        "systemd-analyze blame | head -20",
+        "dracut -f --kver $(uname -r)",
+        "kdumpctl status",
+        "crash /boot/vmlinuz /var/crash/127.0.0.1-2026-10-27/vmcore",
+        "dmesg -T | grep -i -E 'oom|lockup|panic'"
+      ],
+      "table": {
+        "headers": [
+          "Option",
+          "Portée",
+          "Usage"
+        ],
+        "rows": [
+          [
+            "-b",
+            "Boot courant",
+            "Diagnostic immédiat"
+          ],
+          [
+            "-b -1",
+            "Boot précédent",
+            "Comparer après un redémarrage"
+          ],
+          [
+            "-k",
+            "Messages noyau",
+            "Pilotes, OOM, lockups"
+          ],
+          [
+            "-p err",
+            "Priorité error et au-dessus",
+            "Réduire le bruit"
+          ],
+          [
+            "-u service",
+            "Une unité systemd",
+            "Isoler un service"
+          ]
+        ]
+      },
+      "diagram": "  systeme en production\n        |\n     panic\n        |\n  kexec charge le noyau de secours (crashkernel reserve)\n        |\n  copie de la memoire -> /var/crash/<host>-<date>/vmcore\n        |\n  redemarrage automatique\n        |\n  crash vmlinuz vmcore -> bt, ps, log, vmcoreinfo\n\n  Sans crashkernel reserve, aucun vmcore n'est produit.",
+      "exercises": [
+        {
+          "prompt": "Un serveur a redémarré seul cette nuit. kdump est actif et un fichier vmcore existe. Décrivez les premières commandes d'analyse et les informations à extraire avant d'ouvrir un incident.",
+          "correction": "On confirme d'abord la présence du vmcore et l'heure du redémarrage avec journalctl --list-boots puis journalctl -b -1 -k. On lance crash /boot/vmlinuz /var/crash/.../vmcore, puis bt pour obtenir la pile du CPU fautif, ps pour l'état des processus et log pour les derniers messages noyau. On note la version du noyau, les modules chargés et la fonction en tête de pile, car ces éléments orientent vers un pilote ou un bug connu. On vérifie aussi dmesg pour un OOM ou un lockup antérieur. Enfin, on conserve le vmcore et les logs avant toute mise à jour, car un redémarrage ou une purge peut détruire la preuve."
+        }
+      ],
+      "tip": "kdump ne se configure pas le jour de la panne : vérifiez régulièrement kdumpctl status et l'espace dans /var/crash. Un crashkernel trop petit ou un disque plein produit un échec silencieux au moment où l'on en a le plus besoin."
+    },
+    {
+      "heading": "sysmonitor : surveillance native openEuler",
+      "body": "sysmonitor est un service openEuler qui détecte les anomalies du système et les consigne dans /var/log/sysmonitor.log. Il surveille l'état des cartes réseau et les changements d'adresse IP, l'utilisation CPU, mémoire et disque, le nombre de descripteurs de fichiers, les partitions, les fichiers critiques et les processus clés. Son intérêt est de fournir une preuve horodatée avec le processus et le parent à l'origine du changement, ce qui manque souvent aux métriques agrégées. Il s'installe avec le paquet sysmonitor-kmod, s'active avec systemctl start sysmonitor et se recharge avec systemctl reload après modification. Les seuils se configurent dans /etc/sysmonitor : disk, cpu, memory, network, process, et file.d pour les fichiers. Les fichiers de configuration doivent être en 600, car ils peuvent contenir des commandes de récupération exécutées automatiquement. Un monitor de processus peut redémarrer un service défaillant, mais cette automatisation doit être testée pour éviter une boucle de redémarrage. Enfin, l'installation ajoute une configuration rsyslog : un redémarrage de rsyslog est nécessaire pour que les logs arrivent au bon endroit.",
+      "bullets": [
+        "Journal dédié : /var/log/sysmonitor.log",
+        "Surveille réseau, CPU, mémoire, disque, fichiers et processus",
+        "Configuration dans /etc/sysmonitor, permissions 600",
+        "Un monitor de processus peut redémarrer un service automatiquement",
+        "Reload après modification ; rsyslog redémarré après installation"
+      ],
+      "code": [
+        "yum install -y sysmonitor-kmod",
+        "systemctl restart rsyslog",
+        "systemctl enable --now sysmonitor",
+        "tail -f /var/log/sysmonitor.log",
+        "systemctl reload sysmonitor",
+        "cat /etc/sysmonitor/disk",
+        "chmod 600 /etc/sysmonitor/process/nginx"
+      ],
+      "table": {
+        "headers": [
+          "Fichier",
+          "Surveillance",
+          "Exemple de seuil"
+        ],
+        "rows": [
+          [
+            "/etc/sysmonitor/disk",
+            "Occupation des partitions",
+            "Alerte à 90 %, retour à 10 %"
+          ],
+          [
+            "/etc/sysmonitor/cpu",
+            "Usage CPU global ou par domaine",
+            "Alerte à 80 %"
+          ],
+          [
+            "/etc/sysmonitor/memory",
+            "Mémoire utilisée",
+            "Alerte à 85 %"
+          ],
+          [
+            "/etc/sysmonitor/process",
+            "Processus clé et redémarrage",
+            "nginx, irqbalance"
+          ],
+          [
+            "/etc/sysmonitor/network",
+            "Interfaces et adresses IP",
+            "Changement d'adresse"
+          ]
+        ]
+      },
+      "tip": "sysmonitor n'est pas un remplaçant de Prometheus : il voit l'hôte, pas la latence applicative. Utilisez-le pour la preuve locale et l'autoréparation simple, et corrélez ses événements avec les métriques centrales et les traces."
+    },
+    {
+      "heading": "RAS ARM, matériel et live upgrade sans interruption",
+      "body": "Sur un serveur ARM comme les TaiShan à processeur Kunpeng, la fiabilité matérielle se surveille avec rasdaemon, qui collecte les événements EDAC mémoire, les erreurs PCIe AER et les signaux CPU. Une erreur corrigée isolée est normale ; des erreurs corrigées qui s'accumulent sur le même DIMM annoncent souvent une défaillance imminente, et un remplacement proactif coûte moins cher qu'une panne. Les commandes ras-mc-ctl --summary et journalctl -k | grep -i edac donnent une vue des compteurs. Le BMC, interrogé par ipmitool ou Redfish, expose températures, tensions, ventilateurs, alimentations et journal matériel (SEL). La redondance N+1 sur les alimentations et les ventilateurs, le bonding réseau, le RAID et le multipath complètent la protection. Pour éviter un redémarrage complet lors d'une mise à jour de noyau, openEuler propose la live upgrade via nvwa : kexec démarre rapidement le nouveau noyau, CRIU sauvegarde et restaure l'état des processus, et l'état matériel est préservé. La configuration se trouve dans /etc/nvwa/nvwa-restore.yaml. Enfin, Rubik facilite la colocation de services en ligne et hors ligne dans Kubernetes en ajustant les priorités et les ressources, sans sacrifier la QoS des services critiques.",
+      "bullets": [
+        "rasdaemon et EDAC : erreurs mémoire, PCIe et CPU",
+        "Des erreurs corrigées répétées sur un DIMM justifient un remplacement",
+        "iBMC/Redfish et ipmitool SEL pour l'inventaire matériel",
+        "Live upgrade : kexec + CRIU + préservation de l'état matériel",
+        "Rubik arbitre les ressources entre services en ligne et hors ligne"
+      ],
+      "code": [
+        "systemctl status rasdaemon",
+        "ras-mc-ctl --summary",
+        "journalctl -k | grep -i -E 'edac|corrected error'",
+        "ipmitool sel list",
+        "cat /etc/nvwa/nvwa-restore.yaml",
+        "kubectl get pods -A -l app=rubik"
+      ],
+      "table": {
+        "headers": [
+          "Couche",
+          "Outil",
+          "Signal"
+        ],
+        "rows": [
+          [
+            "Mémoire",
+            "rasdaemon, EDAC",
+            "Erreurs corrigées ou non corrigées"
+          ],
+          [
+            "Matériel",
+            "iBMC, Redfish, ipmitool",
+            "Température, PSU, ventilateur, SEL"
+          ],
+          [
+            "Réseau",
+            "bonding, switch",
+            "Perte de lien, bascule"
+          ],
+          [
+            "Stockage",
+            "RAID, multipath",
+            "Chemin défaillant, disque dégradé"
+          ],
+          [
+            "Logiciel",
+            "nvwa, kexec, CRIU",
+            "Live upgrade, restauration d'état"
+          ]
+        ]
+      },
+      "tip": "Une erreur mémoire non corrigée peut tuer un processus ou corrompre des données sans panne visible. Corrélez les événements EDAC avec l'heure des incidents applicatifs avant de conclure à un bug logiciel."
+    }
+  ],
+  "key_points": [
+    "Trois signaux complémentaires : métriques pour alerter, logs pour comprendre, traces pour localiser",
+    "Prometheus collecte en pull ; la cardinalité des labels est un risque de coût majeur",
+    "EFK indexe le texte, Loki indexe les labels : le choix dépend de la recherche attendue",
+    "OpenTelemetry standardise traces et métriques ; la propagation de contexte fait la causalité",
+    "perf et les flamegraphs révèlent le temps on-CPU, pas les attentes off-CPU",
+    "eBPF/bcc répond aux questions ciblées : biolatency, runqlat, opensnoop, execsnoop",
+    "kdump, crash et journalctl -b forment la chaîne de post-mortem du noyau",
+    "rasdaemon, le BMC et la live upgrade nvwa sécurisent le matériel et les maintenances"
+  ],
+  "traps": [
+    "Un flamegraph large mesure une fréquence d'échantillonnage, pas une latence",
+    "Un OOM kill est une conséquence de la pression mémoire, pas nécessairement un bug applicatif",
+    "Sans crashkernel réservé, kdump ne produit aucun vmcore",
+    "Loki n'indexe pas le contenu des logs : une recherche plein texte non filtrée est inefficace",
+    "Une erreur EDAC corrigée isolée n'est pas une panne, mais son accumulation est un signal"
+  ],
+  "quiz": [
+    {
+      "id": "hcie-oe-03-q01",
+      "type": "single",
+      "topic": "RAS",
+      "prompt": "Which daemon collects Linux RAS events such as EDAC memory errors and PCIe AER reports?",
+      "options": [
+        "rasdaemon",
+        "auditd",
+        "chronyd",
+        "sysstat"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "rasdaemon collecte les événements RAS du noyau, notamment les erreurs mémoire EDAC, PCIe AER et certains signaux CPU. auditd journalise les appels système et les actions de sécurité, chronyd synchronise l'horloge et sysstat produit des statistiques de performance. ras-mc-ctl permet ensuite de résumer les compteurs d'erreurs."
+    },
+    {
+      "id": "hcie-oe-03-q02",
+      "type": "single",
+      "topic": "Kdump",
+      "prompt": "Which tool analyzes a kdump vmcore after a kernel panic?",
+      "options": [
+        "gdb alone",
+        "crash",
+        "perf report -i vmcore",
+        "dmesg --vmcore"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "crash charge le noyau (vmlinuz ou vmlinux) et le fichier vmcore pour inspecter la pile, les processus et les messages au moment de la panne. perf analyse des échantillons de performance, pas un vidage mémoire complet, et dmesg ne lit pas un vmcore. gdb peut ouvrir un core utilisateur, mais crash connaît les structures du noyau et fournit les commandes bt, ps et log."
+    },
+    {
+      "id": "hcie-oe-03-q03",
+      "type": "single",
+      "topic": "perf",
+      "prompt": "Which pipeline turns perf samples into an interactive flamegraph?",
+      "options": [
+        "strace -c | flamegraph.pl",
+        "journalctl -k | perf report",
+        "perf script | stackcollapse-perf.pl | flamegraph.pl",
+        "perf top | iostat | gnuplot"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "perf script exporte les échantillons, stackcollapse-perf.pl agrège les piles d'appels et flamegraph.pl génère le SVG. strace ne produit pas de piles d'appels exploitables par flamegraph, et iostat ou journalctl ne sont pas des sources perf. La qualité du graphique dépend de la résolution des symboles et de la représentativité de la charge."
+    },
+    {
+      "id": "hcie-oe-03-q04",
+      "type": "single",
+      "topic": "eBPF",
+      "prompt": "Which bcc tool shows which process opens which files in real time?",
+      "options": [
+        "tcplife",
+        "biolatency",
+        "runqlat",
+        "opensnoop"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "opensnoop trace les appels d'ouverture de fichiers et affiche le PID, le chemin et le résultat. biolatency mesure la latence des I/O bloc, runqlat la file d'attente du scheduler et tcplife les connexions TCP. opensnoop est donc l'outil adapté pour identifier quel processus lit ou modifie un fichier de configuration."
+    },
+    {
+      "id": "hcie-oe-03-q05",
+      "type": "single",
+      "topic": "EFK",
+      "prompt": "Which components form the EFK logging stack?",
+      "options": [
+        "Elasticsearch, Fluentd, Kibana",
+        "Prometheus, Grafana, Alertmanager",
+        "Jaeger, Tempo, OpenTelemetry",
+        "etcd, Flannel, kube-proxy"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "EFK associe Elasticsearch pour le stockage et l'indexation, Fluentd (ou Fluent Bit) pour la collecte et Kibana pour la visualisation. Prometheus/Grafana/Alertmanager constituent une pile de métriques, et Jaeger/Tempo/OTel une pile de traces. La confusion entre logs et métriques est fréquente dans les questions d'architecture."
+    },
+    {
+      "id": "hcie-oe-03-q06",
+      "type": "single",
+      "topic": "Loki",
+      "prompt": "What does Loki index by design?",
+      "options": [
+        "Every word of the log message",
+        "Only labels such as job, namespace and pod",
+        "The binary content of each container image",
+        "The full trace of each request"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Loki indexe uniquement les labels et stocke les messages compressés en chunks, ce qui réduit fortement le coût par rapport à un index plein texte. Il faut donc filtrer par labels avant de rechercher un motif dans le contenu. Elasticsearch, à l'inverse, construit un index inversé des mots et permet une recherche plein texte plus riche mais plus coûteuse."
+    },
+    {
+      "id": "hcie-oe-03-q07",
+      "type": "single",
+      "topic": "journalctl",
+      "prompt": "Which journalctl option displays messages from the previous boot?",
+      "options": [
+        "--since yesterday",
+        "-k -p err",
+        "-b -1",
+        "-b 0"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "-b -1 cible le démarrage précédent, tandis que -b seul cible le boot courant. --since yesterday filtre par date mais peut mélanger plusieurs démarrages, et -k -p err filtre le noyau et la priorité sans changer de boot. Utilisez journalctl --list-boots pour identifier les identifiants disponibles."
+    },
+    {
+      "id": "hcie-oe-03-q08",
+      "type": "single",
+      "topic": "Kdump",
+      "prompt": "What must be reserved in memory for kdump to capture a vmcore after a panic?",
+      "options": [
+        "A swap partition",
+        "A dedicated GPU",
+        "A second root filesystem",
+        "A crashkernel region"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "kdump réserve une région crashkernel au démarrage pour y charger un noyau de secours via kexec. Sans cette réservation, le noyau de secours ne peut pas démarrer et aucun vmcore n'est écrit. Le swap et un second système de fichiers ne remplacent pas cette réservation, même s'ils peuvent stocker le fichier de sortie."
+    },
+    {
+      "id": "hcie-oe-03-q09",
+      "type": "single",
+      "topic": "sysmonitor",
+      "prompt": "Where does sysmonitor write its monitoring events by default?",
+      "options": [
+        "/var/log/sysmonitor.log",
+        "/var/log/messages",
+        "/var/log/kdump.log",
+        "/etc/sysmonitor/events"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "sysmonitor consigne ses événements dans /var/log/sysmonitor.log, avec horodatage, processus et parent à l'origine du changement. /var/log/messages peut recevoir d'autres journaux système mais n'est pas le fichier dédié. /etc/sysmonitor contient la configuration, pas le journal."
+    },
+    {
+      "id": "hcie-oe-03-q10",
+      "type": "single",
+      "topic": "Live upgrade",
+      "prompt": "Which mechanisms underpin openEuler kernel live upgrade with nvwa?",
+      "options": [
+        "LVM snapshots and rsync",
+        "kexec for fast kernel switch and CRIU for process checkpoint/restore",
+        "Docker and Kubernetes only",
+        "GRUB and a full reboot"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "nvwa combine kexec, qui démarre rapidement le nouveau noyau, et CRIU, qui sauvegarde puis restaure l'état des processus. La préservation de l'état matériel permet aux mécanismes comme DMA de continuer pendant la bascule. Un redémarrage complet et LVM/rsync ne répondent pas à l'objectif de continuité de service."
+    },
+    {
+      "id": "hcie-oe-03-q11",
+      "type": "multi",
+      "topic": "Traces",
+      "prompt": "Which elements are essential to a distributed trace? (Choose 3)",
+      "options": [
+        "Parent-child relationships between spans",
+        "Context propagation between services",
+        "A separate Prometheus instance per service",
+        "A trace identifier shared by all spans"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Une trace est un arbre de spans reliés par un identifiant commun et des relations parent-enfant ; la propagation de contexte permet de conserver ces liens entre services. Sans identifiant partagé ou sans propagation, les spans restent isolés et la causalité disparaît. Un Prometheus par service n'est pas une condition de la trace distribuée."
+    },
+    {
+      "id": "hcie-oe-03-q12",
+      "type": "multi",
+      "topic": "Méthode USE",
+      "prompt": "Which metrics match the USE method for a disk? (Choose 3)",
+      "options": [
+        "Saturation: queue length or wait time",
+        "Errors: failed I/O or media errors",
+        "Number of Kubernetes Deployments",
+        "Utilization: percentage of time the device is busy"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "USE signifie utilisation, saturation et erreurs : pour un disque, on mesure le temps d'occupation, la profondeur de file ou l'attente, et les erreurs d'I/O. Le nombre de Deployments n'a aucun rapport avec l'état de la ressource disque. La méthode s'applique à chaque ressource : CPU, mémoire, réseau, stockage."
+    },
+    {
+      "id": "hcie-oe-03-q13",
+      "type": "multi",
+      "topic": "Logs",
+      "prompt": "Which practices make a centralized logging pipeline reliable and affordable? (Choose 3)",
+      "options": [
+        "Sending every debug line over UDP without buffering",
+        "Structured JSON logs with a correlation id",
+        "Retention policies differentiated by log level",
+        "Filtering verbose debug logs at the collector"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "Des logs JSON avec un identifiant de corrélation, une rétention adaptée au niveau et un filtrage dès le collecteur réduisent le volume tout en préservant l'utilité. Envoyer tout le debug en UDP sans tampon expose à des pertes et à une explosion des coûts. Le filtrage doit toutefois conserver les champs nécessaires au diagnostic."
+    },
+    {
+      "id": "hcie-oe-03-q14",
+      "type": "tf",
+      "topic": "Alerting",
+      "prompt": "An alert without a documented runbook still justifies pager escalation.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Une alerte sans action documentée ne permet pas à l'astreinte de progresser et finit par être ignorée. Elle doit être reliée à un runbook ou supprimée. L'objectif d'une alerte est de déclencher une décision, pas seulement de signaler un chiffre."
+    },
+    {
+      "id": "hcie-oe-03-q15",
+      "type": "tf",
+      "topic": "Kdump",
+      "prompt": "kdump uses a pre-reserved crash kernel to capture memory after the main kernel panics.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le noyau de secours est chargé par kexec dans une région crashkernel réservée à l'avance. Après la panne, il écrit le vmcore puis redémarre le système. Sans réservation ni espace disque, la capture échoue même si kdump est installé."
+    },
+    {
+      "id": "hcie-oe-03-q16",
+      "type": "tf",
+      "topic": "perf",
+      "prompt": "perf can only profile user-space processes and cannot sample kernel code.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "perf échantillonne aussi le code noyau et peut capturer les piles d'appels complètes, y compris les fonctions des modules et du noyau. La visibilité dépend toutefois des privilèges et de la présence des symboles de debug. C'est précisément ce qui en fait un outil précieux pour distinguer temps utilisateur et temps noyau."
+    },
+    {
+      "id": "hcie-oe-03-q17",
+      "type": "text",
+      "topic": "journalctl",
+      "prompt": "Which journalctl command shows only error-priority messages from the current boot?",
+      "accept": [
+        "journalctl -b -p err",
+        "journalctl -b --priority=err",
+        "journalctl --boot -p err"
+      ],
+      "sample_answer": "journalctl -b -p err",
+      "explanation_fr": "-b limite la sortie au démarrage courant et -p err sélectionne la priorité error et au-dessus. C'est la première commande de triage après un boot suspect. Pour le démarrage précédent, remplacez -b par -b -1."
+    },
+    {
+      "id": "hcie-oe-03-q18",
+      "type": "text",
+      "topic": "perf",
+      "prompt": "Give the perf command that samples all CPUs at 99 Hz with call graphs for 30 seconds.",
+      "accept": [
+        "perf record -F 99 -a -g -- sleep 30",
+        "perf record -F 99 -a -g sleep 30"
+      ],
+      "sample_answer": "perf record -F 99 -a -g -- sleep 30",
+      "explanation_fr": "-F 99 fixe la fréquence d'échantillonnage à 99 Hz, -a couvre tous les CPU et -g capture les piles d'appels. La commande sleep 30 borne l'enregistrement pour éviter un fichier trop volumineux. On analyse ensuite avec perf report ou un flamegraph."
+    },
+    {
+      "id": "hcie-oe-03-q19",
+      "type": "text",
+      "topic": "sysmonitor",
+      "prompt": "What is the default log file path of sysmonitor?",
+      "accept": [
+        "/var/log/sysmonitor.log",
+        "var/log/sysmonitor.log"
+      ],
+      "sample_answer": "/var/log/sysmonitor.log",
+      "explanation_fr": "sysmonitor écrit ses événements dans /var/log/sysmonitor.log. On y trouve les changements de réseau, les dépassements de seuil disque ou mémoire et les redémarrages de processus. La rotation est configurée via rsyslog pour éviter la croissance illimitée."
+    },
+    {
+      "id": "hcie-oe-03-q20",
+      "type": "text",
+      "topic": "Kdump",
+      "prompt": "Give the crash command that opens the kernel image /boot/vmlinuz with the vmcore stored in /var/crash/vmcore.",
+      "accept": [
+        "crash /boot/vmlinuz /var/crash/vmcore",
+        "crash /boot/vmlinuz /var/crash/vmcore/",
+        "crash vmlinuz vmcore"
+      ],
+      "sample_answer": "crash /boot/vmlinuz /var/crash/vmcore",
+      "explanation_fr": "crash prend en premier le noyau et en second le fichier vmcore. Une fois dans l'invite crash>, bt affiche la pile, ps les processus et log les messages noyau. Les symboles doivent correspondre à la version exacte du noyau qui a paniqué."
+    }
+  ]
+}

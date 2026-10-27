@@ -1,0 +1,704 @@
+{
+  "id": "hcip-kp-02",
+  "phase": "HCIP",
+  "subject": "Kunpeng",
+  "number": 2,
+  "title_fr": "Conteneurs et microservices sur ARM64",
+  "title_en": "Containers and Microservices on ARM64",
+  "minutes": 85,
+  "source": "Pas de Training Material Kunpeng dans les ressources (la gamme Computing Track ne couvre Kunpeng qu'en HCIA) — contenu aligné sur la documentation publique Huawei : iSula, Kubernetes multi-architecture, Harbor et écosystème openEuler ARM64.",
+  "objectives": [
+    "Expliquer le rôle d'un index d'images et construire des images multi-architectures",
+    "Écrire un Dockerfile multi-étapes réellement portable sur ARM64",
+    "Utiliser iSula sur openEuler et comprendre sa relation avec Docker et Kubernetes",
+    "Déployer et contraindre le placement des charges sur un cluster Kubernetes ARM64",
+    "Sécuriser le réseau, les images et les identités dans un cluster",
+    "Construire une chaîne CI/CD native ARM et une observabilité utile"
+  ],
+  "sections": [
+    {
+      "heading": "Images, manifestes et index multi-architectures",
+      "body": "Une image conteneur n'est pas seulement un système de fichiers : c'est un ensemble de couches décrites par un manifeste, et ce manifeste déclare une plateforme, c'est-à-dire une architecture et un système d'exploitation. Publier une image ARM64 signifie donc produire un manifeste dont l'architecture vaut arm64, avec des couches compilées pour cette architecture.\n\nPour servir à la fois x86 et Kunpeng sous une même référence, on publie un index d'images, aussi appelé manifest list. Le client qui exécute docker pull interroge cet index, compare la plateforme demandée à celles qui sont disponibles, et télécharge uniquement le manifeste et les couches correspondantes. Rien n'est converti à la volée : l'émulation, quand elle existe, intervient plus tard, à l'exécution, et coûte cher.\n\nCette indirection explique la plupart des erreurs observées en production. Un nœud ARM qui tente de démarrer une image dont l'index ne contient pas d'entrée arm64 échoue avant même de lancer un processus. Lire le manifeste, et pas seulement le tag, fait partie du diagnostic.",
+      "bullets": [
+        "Un manifeste décrit les couches et déclare une plateforme précise",
+        "Un index d'images regroupe plusieurs manifestes sous une même référence",
+        "Le runtime sélectionne la variante correspondant au nœud, sans conversion",
+        "Un tag peut pointer vers un index incomplet : vérifiez les plateformes publiées"
+      ],
+      "code": [
+        "docker buildx imagetools inspect registry.example.com/team/app:1.4",
+        "docker manifest inspect registry.example.com/team/app:1.4 | grep architecture"
+      ],
+      "table": {
+        "headers": [
+          "Objet",
+          "Contenu",
+          "Rôle au téléchargement"
+        ],
+        "rows": [
+          [
+            "Manifeste",
+            "Couches + config + plateforme",
+            "Décrit une image pour une architecture"
+          ],
+          [
+            "Index",
+            "Liste de manifestes",
+            "Choisit la variante selon le nœud"
+          ],
+          [
+            "Digest",
+            "Empreinte du contenu",
+            "Identifie une version immuable"
+          ],
+          [
+            "Tag",
+            "Étiquette mobile",
+            "Pratique pour l'humain, instable pour la production"
+          ]
+        ]
+      },
+      "diagram": "docker pull team/app:1.4\n        |\n        v\n  Index (manifest list)\n  +--------+--------+\n  | amd64  | arm64  |\n  +---+----+----+---+\n      |         |\n      v         v\n  manifeste  manifeste\n  + couches  + couches",
+      "exercises": [],
+      "tip": "En production, référencez l'image par digest et non par tag : un tag peut être republié vers un index différent du jour au lendemain."
+    },
+    {
+      "heading": "Construire pour ARM64 : buildx, QEMU et builders natifs",
+      "body": "docker buildx s'appuie sur BuildKit et sur des pilotes de construction. Pour produire une image arm64 depuis une machine x86, on crée un builder dédié avec le pilote docker-container, puis on déclare la plateforme cible. BuildKit installe automatiquement les émulateurs QEMU nécessaires via binfmt_misc.\n\nL'émulation est pratique pour valider qu'un build passe, mais elle est lente et ne reflète pas les performances réelles. Un runner ARM natif reste la référence pour les tests de charge et pour les builds de production. Beaucoup d'équipes combinent les deux : build multi-arch en intégration continue pour la publication, tests de performance sur du matériel ARM réel.\n\nL'argument TARGETARCH, fourni automatiquement par BuildKit, permet d'écrire un seul Dockerfile qui télécharge le bon binaire ou le bon paquet. C'est plus robuste que de dupliquer les fichiers et cela garde une seule source de vérité pour les dépendances. Attention toutefois : TARGETARCH vaut arm64, tandis que certaines conventions de nommage utilisent aarch64 ; la conversion doit être explicite.",
+      "bullets": [
+        "buildx avec le pilote docker-container permet de cibler linux/arm64 depuis x86",
+        "QEMU sert à construire et à vérifier, pas à mesurer la performance",
+        "TARGETARCH distingue arm64 de amd64 dans un Dockerfile unique",
+        "Un builder natif ARM reste nécessaire pour les tests de charge crédibles"
+      ],
+      "code": [
+        "docker buildx create --name builder-arm --driver docker-container --use",
+        "docker buildx build --platform linux/arm64 -t team/app:1.4-arm64 --push .",
+        "docker buildx build --platform linux/amd64,linux/arm64 -t team/app:1.4 --push ."
+      ],
+      "table": {
+        "headers": [
+          "Méthode",
+          "Avantage",
+          "Limite"
+        ],
+        "rows": [
+          [
+            "buildx + QEMU",
+            "Aucun matériel ARM requis",
+            "Lent, performance non représentative"
+          ],
+          [
+            "Runner ARM natif",
+            "Rapide et fidèle",
+            "Coût d'infrastructure"
+          ],
+          [
+            "Cross-compilation",
+            "Build très rapide",
+            "Dépendances natives parfois difficiles"
+          ]
+        ]
+      },
+      "exercises": [],
+      "tip": "Ne concluez jamais sur la performance d'une application ARM depuis un build ou un test exécuté sous QEMU : l'émulation multiplie les coûts et fausse les comparaisons."
+    },
+    {
+      "heading": "Un Dockerfile multi-étapes portable",
+      "body": "Un Dockerfile multi-étapes sépare l'environnement de compilation de l'image finale. Le premier étage embarque le compilateur, les en-têtes et les outils ; le second ne reçoit que le binaire et ses bibliothèques d'exécution. Sur ARM64, cela évite d'embarquer une chaîne de build complète, souvent plusieurs centaines de mégaoctets.\n\nTrois règles font la différence en production. D'abord, épingler l'image de base par digest plutôt que par tag mouvant, pour que la reconstruction six mois plus tard produise la même chose. Ensuite, exécuter le processus avec un utilisateur non privilégié et un système de fichiers racine en lecture seule. Enfin, déclarer un HEALTHCHECK qui reflète la disponibilité réelle du service, pas seulement l'existence du processus.\n\nAttention aux dépendances natives : un module Python compilé, un paquet npm avec binding C++ ou une bibliothèque Go utilisant cgo doivent être construits dans l'étage ARM64. Un wheel x86 copié dans une image arm64 échoue au chargement, souvent avec un message peu explicite.",
+      "bullets": [
+        "Séparer build et exécution réduit la surface d'attaque et la taille d'image",
+        "Épingler la base par digest garantit la reproductibilité",
+        "Utilisateur non privilégié et racine en lecture seule par défaut",
+        "Toute dépendance native doit être compilée dans l'étage ARM64"
+      ],
+      "code": [
+        "FROM --platform=$BUILDPLATFORM golang:1.22 AS build",
+        "ARG TARGETARCH",
+        "RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -o /out/app ./cmd/app",
+        "FROM gcr.io/distroless/static-debian12:nonroot",
+        "COPY --from=build /out/app /app",
+        "USER nonroot:nonroot",
+        "ENTRYPOINT [\"/app\"]"
+      ],
+      "exercises": [
+        {
+          "prompt": "Ce Dockerfile échoue sur ARM64 : « FROM python:3.11-slim AS build », puis « COPY wheels/ /wheels », « RUN pip install --no-index --find-links=/wheels -r requirements.txt ». Les wheels ont été produits sur un poste x86. Proposez une correction.",
+          "correction": "Les wheels contiennent des extensions natives compilées pour x86_64 : pip les installe sans erreur de build, mais l'import échoue à l'exécution sur ARM64. Il faut reconstruire les wheels pour la plateforme cible, par exemple dans un étage exécuté sous --platform=linux/arm64 avec un compilateur présent, ou télécharger les wheels manylinux aarch64. Une variante robuste consiste à installer les dépendances dans l'étage de build avec pip install, puis à copier uniquement le virtualenv ou les paquets dans l'image finale. Vérifiez ensuite avec python -c \"import module\" dans un conteneur arm64, et non seulement avec la réussite du build."
+        }
+      ],
+      "tip": "Un build réussi ne prouve pas qu'une image ARM64 fonctionne : testez toujours le démarrage et les imports natifs sur un nœud ARM réel."
+    },
+    {
+      "heading": "iSula sur openEuler : le moteur natif",
+      "body": "iSula est le moteur de conteneurs développé par Huawei et intégré à openEuler. Son démon, isulad, est écrit en C++ et vise une empreinte mémoire réduite ainsi qu'un démarrage rapide, ce qui compte sur les nœuds de calcul où chaque mégaoctet est disputé. Il implémente les spécifications OCI et expose une interface CRI, ce qui lui permet de servir de runtime à Kubernetes.\n\nLa ligne de commande reprend volontairement les habitudes de Docker : isula pull, isula run, isula ps, isula exec. Les images sont les mêmes, puisque le format OCI est commun. Une équipe peut donc conserver ses registres et ses pipelines en changeant seulement le moteur.\n\nLes différences se logent dans les détails : emplacements de configuration, options réseau, gestion des volumes et journaux. Avant de basculer un nœud de production, vérifiez la version du runtime, la compatibilité avec le CNI et la présence des plugins de stockage. Un runtime se choisit aussi en fonction de ce que l'équipe sait exploiter, pas seulement de ses performances annoncées.",
+      "bullets": [
+        "isulad implémente OCI et CRI, donc compatible avec Kubernetes",
+        "La CLI imite Docker : pull, run, ps, exec, rm",
+        "Les images OCI sont partagées entre iSula et Docker",
+        "Vérifier CNI, stockage et version avant de basculer un nœud"
+      ],
+      "code": [
+        "sudo systemctl enable --now isulad",
+        "sudo isula pull openeuler/openeuler:24.03-lts",
+        "sudo isula run -d --name web -p 8080:80 nginx",
+        "sudo isula ps -a"
+      ],
+      "table": {
+        "headers": [
+          "Docker",
+          "iSula",
+          "Remarque"
+        ],
+        "rows": [
+          [
+            "docker pull",
+            "isula pull",
+            "Même registre OCI"
+          ],
+          [
+            "docker run",
+            "isula run",
+            "Options proches, quelques différences"
+          ],
+          [
+            "docker ps",
+            "isula ps",
+            "Affichage comparable"
+          ],
+          [
+            "docker exec",
+            "isula exec",
+            "Comportement équivalent"
+          ]
+        ]
+      },
+      "exercises": [],
+      "tip": "Sur openEuler, le runtime du cluster est souvent containerd ou iSula selon l'installation : vérifiez le CRI configuré avant tout kubeadm init, sinon les nœuds ne rejoindront pas le cluster."
+    },
+    {
+      "heading": "Kubernetes sur ARM64 et placement des charges",
+      "body": "Un cluster Kubernetes sur Kunpeng ne diffère pas conceptuellement d'un cluster x86. kubeadm prépare le plan de contrôle, le kubelet dialogue avec le runtime via CRI, et les objets habituels — Deployments, Services, ConfigMaps — fonctionnent à l'identique. La différence tient aux images : chaque conteneur doit disposer d'un manifeste arm64.\n\nLes images officielles du plan de contrôle sont publiées en index multi-arch couvrant plusieurs architectures. Le nœud porte un label standard, kubernetes.io/arch, qui vaut arm64 sur Kunpeng. Ce label permet d'exprimer des contraintes de placement : nodeSelector pour un déploiement strictement ARM, ou affinity plus souple dans un cluster mixte.\n\nSur un cluster hétérogène, le risque est qu'un pod atterrisse sur une architecture pour laquelle son image n'existe pas. La parade consiste à combiner taints sur les nœuds spécialisés, nodeAffinity dans les déploiements et une politique de ressources explicite. Les accélérateurs, comme les NPU Ascend, sont exposés par un device plugin qui publie une ressource personnalisée consommable dans les requests et limits.",
+      "bullets": [
+        "kubeadm, kubelet et les objets standard fonctionnent sans patch sur ARM64",
+        "Le label kubernetes.io/arch=arm64 guide le placement",
+        "Un cluster mixte exige taints, affinity et images arm64 disponibles",
+        "Les NPU Ascend sont exposées via un device plugin et une ressource étendue"
+      ],
+      "code": [
+        "kubeadm init --pod-network-cidr=10.200.0.0/16",
+        "kubectl get nodes -L kubernetes.io/arch",
+        "kubectl label node kunpeng-01 kubernetes.io/arch=arm64 --overwrite",
+        "kubectl get node -o jsonpath='{.items[*].status.nodeInfo.architecture}{\"\\n\"}'"
+      ],
+      "table": {
+        "headers": [
+          "Besoin",
+          "Mécanisme",
+          "Effet"
+        ],
+        "rows": [
+          [
+            "Forcer ARM",
+            "nodeSelector kubernetes.io/arch=arm64",
+            "Pod uniquement sur nœuds ARM"
+          ],
+          [
+            "Préférer ARM",
+            "nodeAffinity preferred",
+            "Souplesse en cluster mixte"
+          ],
+          [
+            "Réserver un nœud",
+            "taint + toleration",
+            "Isole les charges spécialisées"
+          ],
+          [
+            "Accélérateur",
+            "ressource huawei.com/Ascend910",
+            "Expose la NPU au pod"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un déploiement tourne sur un cluster mixte amd64/arm64. Certains pods tombent en CrashLoopBackOff avec « exec format error » après une augmentation du nombre de réplicas. Diagnostiquez et proposez une correction durable.",
+          "correction": "Le scheduler a placé des pods sur des nœuds arm64 alors que l'image du déploiement n'a pas de variante arm64, ou l'inverse. « exec format error » signifie que le noyau tente d'exécuter un binaire d'une autre architecture. Le diagnostic consiste à lire kubectl describe pod pour connaître le nœud, puis kubectl get node -L kubernetes.io/arch, et enfin docker manifest inspect sur l'image pour vérifier les plateformes publiées. La correction durable combine deux mesures : publier un index multi-arch complet, et ajouter une nodeAffinity ou un nodeSelector explicite sur le déploiement tant que ce n'est pas fait. Un simple redémarrage ne corrige rien, car le scheduler peut replacer le pod sur le même type de nœud."
+        }
+      ],
+      "tip": "« exec format error » ne vient presque jamais de l'application : c'est un binaire ou une image d'une autre architecture, à confirmer avec le manifeste et le label du nœud."
+    },
+    {
+      "heading": "Réseau, stockage et sécurité du cluster",
+      "body": "Le réseau d'un cluster ARM64 utilise les mêmes briques que sur x86 : un CNI pour l'attribution des adresses et le routage, kube-proxy ou un remplacement eBPF pour la répartition de charge. Calico, Flannel et Cilium publient des images multi-arch. Le point d'attention est le MTU : l'encapsulation IPIP ou Geneve ajoute un en-tête, et une valeur mal alignée avec le réseau sous-jacent provoque des paquets perdus difficiles à diagnostiquer.\n\nCôté sécurité, la politique par défaut de Kubernetes est permissive : sans NetworkPolicy, tout pod parle à tout pod. Une posture saine commence par un refus global, puis des autorisations explicites par flux. Les Pod Security Standards remplacent les anciens PSP et imposent des profils restreints : pas de privilèges, pas de montage de l'hôte, racine en lecture seule.\n\nComplétez par la signature des images et le scan de vulnérabilités dans le registre, des profils seccomp et AppArmor, et des secrets montés plutôt que stockés en variables d'environnement. Ces contrôles ne dépendent pas de l'architecture, mais ils conditionnent la mise en production.",
+      "bullets": [
+        "CNI multi-arch : Calico, Flannel, Cilium ; surveiller le MTU avec encapsulation",
+        "Sans NetworkPolicy, tout le trafic pod à pod est autorisé",
+        "Pod Security Standards : profil restreint, non-root, racine en lecture seule",
+        "Signature d'image, scan CVE, seccomp et secrets montés"
+      ],
+      "code": [
+        "kubectl create namespace prod",
+        "kubectl label namespace prod pod-security.kubernetes.io/enforce=restricted",
+        "kubectl apply -f networkpolicy-deny-all.yaml",
+        "kubectl get networkpolicy -n prod"
+      ],
+      "table": {
+        "headers": [
+          "Couche",
+          "Contrôle",
+          "Objectif"
+        ],
+        "rows": [
+          [
+            "Réseau",
+            "NetworkPolicy deny-all puis allow",
+            "Limiter les flux au strict nécessaire"
+          ],
+          [
+            "Image",
+            "Signature et scan CVE",
+            "Empêcher les artefacts altérés"
+          ],
+          [
+            "Pod",
+            "Profil restreint, non-root",
+            "Réduire l'impact d'une compromission"
+          ],
+          [
+            "Données",
+            "Secrets montés, chiffrement",
+            "Éviter les fuites par variables d'environnement"
+          ]
+        ]
+      },
+      "exercises": [],
+      "tip": "Une NetworkPolicy s'applique au namespace et aux pods qu'elle sélectionne : vérifiez toujours les labels, sinon la règle existe sans produire d'effet."
+    },
+    {
+      "heading": "CI/CD native ARM et GitOps",
+      "body": "Un pipeline qui produit des images ARM64 doit être lui-même exécuté sur ARM64, ou au minimum disposer d'un étage natif pour les tests. Les runners émulés par QEMU conviennent à un build de vérification, pas à une suite de tests de performance ni à un benchmark de latence.\n\nLe pipeline typique enchaîne : récupération des dépendances avec cache, compilation, tests unitaires, construction de l'image pour chaque architecture, génération du manifeste, scan de vulnérabilités, puis publication. Helm reste l'outil naturel pour décrire le déploiement : un chart versionné, des values par environnement, et l'image référencée par digest plutôt que par tag flottant.\n\nGitOps ajoute la traçabilité : l'état désiré vit dans un dépôt, chaque modification est revue, et la réconciliation est continue. Pour les clusters mixtes, le chart doit exposer l'architecture comme paramètre, afin d'éviter qu'une value oubliée ne place un pod ARM sur un nœud incompatible.",
+      "bullets": [
+        "Runner ARM natif pour les tests, QEMU seulement pour le build de contrôle",
+        "Un seul pipeline produit les images par architecture puis l'index",
+        "Helm versionné avec values par environnement et image par digest",
+        "GitOps : état désiré versionné et réconciliation continue"
+      ],
+      "code": [
+        "helm upgrade --install web ./chart -f values-prod.yaml --set image.digest=sha256:abc",
+        "kubectl rollout status deploy/web -n prod",
+        "kubectl rollout undo deploy/web -n prod"
+      ],
+      "table": {
+        "headers": [
+          "Étape",
+          "Outil typique",
+          "Contrôle"
+        ],
+        "rows": [
+          [
+            "Build",
+            "buildx / runner ARM",
+            "Compilation et tests unitaires"
+          ],
+          [
+            "Publication",
+            "Registre OCI",
+            "Scan CVE et signature"
+          ],
+          [
+            "Déploiement",
+            "Helm / Argo CD",
+            "Diff et revue"
+          ],
+          [
+            "Vérification",
+            "kubectl rollout status",
+            "Disponibilité des réplicas"
+          ]
+        ]
+      },
+      "exercises": [],
+      "tip": "Un tag flottant comme latest rend le retour arrière ambigu : déployez par digest pour savoir exactement ce qui tourne et ce que vous restaurez."
+    },
+    {
+      "heading": "Observabilité et performance des microservices",
+      "body": "Observabilité ne signifie pas empiler des outils, mais répondre à trois questions : que se passe-t-il, depuis quand, et pourquoi. Prometheus collecte les métriques et évalue des règles d'alerte ; Grafana les met en forme ; Loki agrège les journaux ; Jaeger ou OpenTelemetry reconstituent les traces distribuées. Sur ARM64, toutes ces briques disposent d'images multi-arch.\n\nLes métriques qui comptent pour un service conteneurisé sont souvent les mêmes : latence aux percentiles élevés, taux d'erreur, saturation, et redémarrages. Ajoutez les métriques de throttling CPU. Un pod dont la limite est trop basse passe son temps à être suspendu : la latence augmente alors que le CPU moyen paraît faible, ce qui égare le diagnostic.\n\nPour la JVM, surveillez le tas, la pression du GC et le nombre de threads. Dimensionner la mémoire du conteneur sans marge pour le metaspace, les threads et les buffers directs provoque des évictions par le noyau, un symptôme qui ressemble à une fuite applicative mais n'en est pas une.",
+      "bullets": [
+        "Prometheus pour les métriques, Loki pour les journaux, Jaeger pour les traces",
+        "Surveiller p95 et p99, pas seulement la moyenne",
+        "Le throttling CPU explique bien des latences sans saturation apparente",
+        "Laisser de la marge mémoire hors tas JVM pour éviter les évictions"
+      ],
+      "code": [
+        "kubectl top pods -n prod",
+        "kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes",
+        "kubectl describe pod web-0 -n prod | grep -i -E 'limit|throttl'"
+      ],
+      "table": {
+        "headers": [
+          "Signal",
+          "Source",
+          "Question à laquelle il répond"
+        ],
+        "rows": [
+          [
+            "Latence p99",
+            "Métriques applicatives",
+            "Le service tient-il sa promesse ?"
+          ],
+          [
+            "Taux d'erreur",
+            "Métriques et journaux",
+            "Les utilisateurs échouent-ils ?"
+          ],
+          [
+            "Throttling CPU",
+            "cgroup / kubelet",
+            "Le pod est-il bridé ?"
+          ],
+          [
+            "Pauses GC",
+            "JFR / métriques JVM",
+            "La mémoire provoque-t-elle des à-coups ?"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un service affiche un CPU moyen de 35 pour cent, une limite de 500 millicores et une latence p99 qui double aux heures de pointe. Les métriques cgroup montrent un throttling élevé. Expliquez et proposez des actions.",
+          "correction": "Le CPU moyen est trompeur : sur des intervalles courts, un service peut consommer peu en moyenne tout en dépassant sa limite par rafales. Chaque dépassement déclenche une suspension du pod jusqu'à la période suivante, ce qui ajoute des latences de plusieurs dizaines de millisecondes. Il faut d'abord confirmer avec le compteur de throttling, puis augmenter la limite ou réduire la consommation réelle. Réduire la consommation passe par le profilage : pools de threads surdimensionnés, sérialisation coûteuse, requêtes base non optimisées. En parallèle, vérifier que la JVM ne voit pas trop de CPU et que les requests sont cohérentes avec les limits. Enfin, mesurer p99 après ajustement sur la même charge."
+        }
+      ],
+      "tip": "Une limite CPU trop basse produit des à-coups de latence alors que la moyenne paraît confortable : regardez toujours le throttling avant de conclure à un problème applicatif."
+    }
+  ],
+  "key_points": [
+    "Un index d'images regroupe les manifestes par plateforme et le runtime sélectionne arm64",
+    "buildx cible linux/arm64, mais QEMU ne mesure pas la performance réelle",
+    "Un Dockerfile multi-étapes épinglé par digest et non-root est la base d'une image saine",
+    "iSula est le moteur natif d'openEuler, compatible OCI et CRI",
+    "Sur Kubernetes, le label kubernetes.io/arch guide le placement en cluster mixte",
+    "NetworkPolicy par défaut permissive : commencer par un refus global",
+    "CI/CD : runner ARM natif, manifeste multi-arch, Helm versionné et digest",
+    "Observabilité : p99, taux d'erreur, throttling CPU et pauses GC"
+  ],
+  "traps": [
+    "Un tag peut pointer vers un index sans entrée arm64 : le pod échoue avec « exec format error », pas au build",
+    "QEMU permet de construire et de tester fonctionnellement, jamais de conclure sur la performance",
+    "Une NetworkPolicy sans labels correspondants existe mais ne bloque rien",
+    "Les Pod Security Standards remplacent les PodSecurityPolicy supprimées : ne cherchez pas l'ancien objet",
+    "Une limite CPU basse provoque du throttling invisible dans le CPU moyen mais visible dans p99"
+  ],
+  "quiz": [
+    {
+      "id": "hcip-kp-02-q01",
+      "type": "single",
+      "prompt": "Which command builds an image for linux/arm64 from an x86 build machine?",
+      "options": [
+        "docker buildx build --platform linux/arm64",
+        "docker build --arch=arm",
+        "docker image rebuild arm64",
+        "docker pull --platform arm64"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "docker buildx s'appuie sur BuildKit et accepte --platform pour produire une image destinée à une autre architecture, avec QEMU si nécessaire. docker build ne connaît pas d'option --arch fiable pour ce cas et produit l'architecture de l'hôte. docker pull ne construit rien : il télécharge une image existante.",
+      "topic": "Images multi-arch"
+    },
+    {
+      "id": "hcip-kp-02-q02",
+      "type": "single",
+      "prompt": "What is an OCI image index (manifest list)?",
+      "options": [
+        "A registry access control list",
+        "A collection of manifests for different platforms under one reference",
+        "A compressed layer containing the kernel",
+        "A Kubernetes object that stores image pull secrets"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un index associe une référence, par exemple team/app:1.4, à plusieurs manifestes décrits par leur plateforme. Le runtime lit cet index et télécharge le manifeste correspondant à l'architecture du nœud. Ce n'est ni une couche, ni un objet Kubernetes, ni une liste de contrôle d'accès.",
+      "topic": "Images multi-arch"
+    },
+    {
+      "id": "hcip-kp-02-q03",
+      "type": "single",
+      "prompt": "Which container engine is natively integrated with openEuler?",
+      "options": [
+        "rkt",
+        "CRI-O only",
+        "iSula",
+        "Windows containers"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "iSula, avec son démon isulad, est le moteur de conteneurs développé par Huawei et intégré à openEuler. Il implémente OCI et expose une interface CRI, ce qui lui permet d'être utilisé par Kubernetes. Windows containers et rkt ne sont pas les moteurs natifs d'openEuler.",
+      "topic": "iSula"
+    },
+    {
+      "id": "hcip-kp-02-q04",
+      "type": "single",
+      "prompt": "In a BuildKit Dockerfile, what does the automatic TARGETARCH argument contain?",
+      "options": [
+        "The host kernel version",
+        "The registry hostname",
+        "The number of CPUs available to the builder",
+        "The target architecture, for example arm64 or amd64"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "TARGETARCH est renseigné par BuildKit avec l'architecture demandée via --platform, par exemple arm64. Il permet d'écrire un Dockerfile unique qui télécharge le bon binaire. Il ne contient ni la version du noyau, ni l'adresse du registre, ni le nombre de CPU.",
+      "topic": "Images multi-arch"
+    },
+    {
+      "id": "hcip-kp-02-q05",
+      "type": "single",
+      "prompt": "Which nodeSelector pins a Deployment to ARM64 nodes?",
+      "options": [
+        "kubernetes.io/arch: arm64",
+        "kubernetes.io/os: arm64",
+        "beta.kubernetes.io/arch: aarch64",
+        "node-role.kubernetes.io/arm: true"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le label standard kubernetes.io/arch porte la valeur arm64 sur un nœud Kunpeng. kubernetes.io/os désigne le système d'exploitation, pas l'architecture, et la clé beta n'est plus la référence. Le label de rôle ne correspond pas à une architecture et n'existe pas par défaut.",
+      "topic": "Kubernetes ARM64"
+    },
+    {
+      "id": "hcip-kp-02-q06",
+      "type": "single",
+      "prompt": "Why should performance tests not rely on an image executed under QEMU emulation?",
+      "options": [
+        "Emulation disables the network stack",
+        "Emulation distorts timing and does not reflect native ARM64 behaviour",
+        "QEMU cannot start any ARM container",
+        "QEMU only supports amd64 images"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "QEMU traduit les instructions à la volée, ce qui ajoute un coût variable et masque les effets réels du pipeline et des caches. Les mesures obtenues ne peuvent donc pas être comparées à celles d'un serveur ARM natif. QEMU sait démarrer des conteneurs ARM et ne désactive pas le réseau : il fausse seulement les performances.",
+      "topic": "CI/CD"
+    },
+    {
+      "id": "hcip-kp-02-q07",
+      "type": "single",
+      "prompt": "Which component on a node actually pulls the container image through the CRI?",
+      "options": [
+        "etcd",
+        "CoreDNS",
+        "kubelet",
+        "kube-apiserver"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Le kubelet reçoit la spécification du pod et demande au runtime CRI, par exemple containerd ou isulad, de télécharger l'image et de démarrer le conteneur. kube-apiserver expose l'API, etcd stocke l'état et CoreDNS résout les noms de services. Aucun de ces trois composants ne télécharge d'image sur le nœud.",
+      "topic": "Kubernetes ARM64"
+    },
+    {
+      "id": "hcip-kp-02-q08",
+      "type": "single",
+      "prompt": "What happens by default to pod-to-pod traffic when no NetworkPolicy selects a pod?",
+      "options": [
+        "All traffic is denied",
+        "Only traffic on port 443 is allowed",
+        "Traffic is allowed only within the same namespace",
+        "All traffic is allowed"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Kubernetes applique une politique permissive par défaut : sans NetworkPolicy, un pod accepte tout trafic. C'est pourquoi une posture sécurisée commence par une règle de refus global, puis des autorisations explicites. Le refus par défaut et la restriction au namespace sont des choix que l'administrateur doit écrire.",
+      "topic": "Sécurité"
+    },
+    {
+      "id": "hcip-kp-02-q09",
+      "type": "single",
+      "prompt": "What is the purpose of Helm values files?",
+      "options": [
+        "Override chart parameters per environment without editing templates",
+        "Store container images inside the chart",
+        "Replace Kubernetes RBAC",
+        "Compile Go templates into binaries"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Les values alimentent les templates du chart et permettent de varier les paramètres selon l'environnement sans dupliquer les manifestes. Elles ne stockent pas les images, ne remplacent pas RBAC et ne compilent rien. Un chart versionné avec des values explicites rend les déploiements reproductibles.",
+      "topic": "CI/CD"
+    },
+    {
+      "id": "hcip-kp-02-q10",
+      "type": "single",
+      "prompt": "A pod fails with 'exec format error' on an ARM64 node. What is the most likely cause?",
+      "options": [
+        "The namespace is missing a label",
+        "The image contains binaries built for another architecture",
+        "The pod has no resource limits",
+        "The Service type is ClusterIP"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le noyau tente d'exécuter un binaire dont l'en-tête ELF ne correspond pas à l'architecture de la machine, ce qui produit exactement cette erreur. Cela arrive quand l'image n'a pas de variante arm64 ou qu'un binaire x86 a été copié dans l'image. Les limites de ressources, le type de Service et les labels de namespace n'ont pas d'effet sur le format exécutable.",
+      "topic": "Kubernetes ARM64"
+    },
+    {
+      "id": "hcip-kp-02-q11",
+      "type": "single",
+      "prompt": "Which JVM behaviour must be checked when a Java pod has a low CPU limit but many host cores?",
+      "options": [
+        "ZGC is disabled automatically",
+        "The heap is always set to 75 percent of host memory",
+        "The number of processors detected drives thread pool sizing",
+        "The JVM ignores cgroup limits entirely"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "La JVM dimensionne certains pools de threads et heuristiques sur le nombre de processeurs détectés. Si elle voit tous les cœurs de l'hôte alors que le pod est limité, elle crée trop de threads et provoque contentions et throttling. -XX:ActiveProcessorCount permet d'aligner la JVM sur la limite réelle.",
+      "topic": "Performance"
+    },
+    {
+      "id": "hcip-kp-02-q12",
+      "type": "multi",
+      "prompt": "Which measures harden a Kubernetes cluster on Kunpeng? (Choose 3)",
+      "options": [
+        "Image signing and CVE scanning",
+        "Resource requests and limits on every workload",
+        "Running all containers as privileged root",
+        "Network policies that deny by default then allow explicit flows"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Le refus réseau par défaut, la signature avec scan des vulnérabilités et des ressources encadrées réduisent respectivement la surface réseau, la chaîne d'approvisionnement et l'impact d'une surcharge. Exécuter tous les conteneurs en root privilégié annule ces protections. Ces mesures sont indépendantes de l'architecture mais indispensables en production.",
+      "topic": "Sécurité"
+    },
+    {
+      "id": "hcip-kp-02-q13",
+      "type": "multi",
+      "prompt": "Which tools are commonly combined for Kubernetes observability? (Choose 3)",
+      "options": [
+        "Prometheus",
+        "Grafana",
+        "Jaeger",
+        "vim"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Prometheus collecte les métriques, Grafana les visualise et Jaeger reconstitue les traces distribuées. Loki complète souvent l'ensemble pour les journaux. vim est un éditeur de texte et n'a aucun rôle dans l'observabilité.",
+      "topic": "Observabilité"
+    },
+    {
+      "id": "hcip-kp-02-q14",
+      "type": "multi",
+      "prompt": "Which practices support reliable multi-architecture delivery? (Choose 3)",
+      "options": [
+        "Publishing an index that contains both amd64 and arm64 manifests",
+        "Pinning base images by digest",
+        "Testing only the amd64 variant and assuming parity",
+        "Building on a native ARM runner for performance validation"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Un runner natif donne des mesures crédibles, un index complet garantit que chaque nœud trouve sa variante, et l'épinglage par digest rend les builds reproductibles. Tester uniquement amd64 suppose une parité que les dépendances natives démentent souvent. Une image ARM64 doit être démarrée et testée sur ARM64.",
+      "topic": "CI/CD"
+    },
+    {
+      "id": "hcip-kp-02-q15",
+      "type": "tf",
+      "prompt": "Harbor provides image vulnerability scanning and replication between registries.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Harbor est un registre OCI qui ajoute l'authentification, le contrôle d'accès, le scan des vulnérabilités et la réplication entre instances. Ces fonctions en font un choix courant pour une plateforme interne. Il ne remplace pas un moteur de conteneurs ni un orchestrateur.",
+      "topic": "Registre"
+    },
+    {
+      "id": "hcip-kp-02-q16",
+      "type": "tf",
+      "prompt": "An x86-only image started on an ARM node typically fails before the application process begins.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le runtime ne trouve pas de manifeste correspondant à la plateforme du nœud, ou bien le noyau refuse le binaire avec une erreur de format. L'échec survient donc avant l'exécution du code applicatif. C'est un problème de plateforme et non un bug métier.",
+      "topic": "Images multi-arch"
+    },
+    {
+      "id": "hcip-kp-02-q17",
+      "type": "tf",
+      "prompt": "A container built under QEMU emulation delivers the same performance as the same container running natively on ARM64.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "L'émulation traduit chaque instruction et ajoute un surcoût qui varie selon le code exécuté. Les temps mesurés sous QEMU ne représentent donc pas ceux d'un processeur ARM64 natif. Il faut un runner ou un serveur ARM réel pour valider la performance.",
+      "topic": "CI/CD"
+    },
+    {
+      "id": "hcip-kp-02-q18",
+      "type": "text",
+      "prompt": "Which command creates a combined multi-arch manifest for team/app:1.4 from team/app:1.4-amd64 and team/app:1.4-arm64?",
+      "accept": [
+        "docker manifest create team/app:1.4 team/app:1.4-amd64 team/app:1.4-arm64",
+        "docker manifest create team/app:1.4 team/app:1.4-arm64 team/app:1.4-amd64"
+      ],
+      "sample_answer": "docker manifest create team/app:1.4 team/app:1.4-amd64 team/app:1.4-arm64",
+      "explanation_fr": "docker manifest create associe plusieurs images spécifiques à une même référence multi-arch. Les arguments suivants la référence cible sont les images sources. Il faut ensuite docker manifest push pour publier l'index dans le registre.",
+      "topic": "Images multi-arch"
+    },
+    {
+      "id": "hcip-kp-02-q19",
+      "type": "text",
+      "prompt": "Which kubeadm command initializes a control plane with pod CIDR 10.200.0.0/16?",
+      "accept": [
+        "kubeadm init --pod-network-cidr=10.200.0.0/16",
+        "kubeadm init --pod-network-cidr 10.200.0.0/16"
+      ],
+      "sample_answer": "kubeadm init --pod-network-cidr=10.200.0.0/16",
+      "explanation_fr": "kubeadm init --pod-network-cidr déclare le bloc d'adresses que le CNI utilisera pour les pods. Le CNI installé ensuite doit être configuré avec le même CIDR, sinon les pods ne pourront pas se joindre. L'option doit être fournie dès l'initialisation du plan de contrôle.",
+      "topic": "Kubernetes ARM64"
+    },
+    {
+      "id": "hcip-kp-02-q20",
+      "type": "text",
+      "prompt": "Which kubectl command prints the architecture reported by each node? (jsonpath answer)",
+      "accept": [
+        "kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.architecture}'",
+        "kubectl get nodes -o jsonpath={.items[*].status.nodeInfo.architecture}",
+        "kubectl get node -o jsonpath='{.items[*].status.nodeInfo.architecture}'"
+      ],
+      "sample_answer": "kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.architecture}'",
+      "explanation_fr": "Le champ status.nodeInfo.architecture de chaque nœud contient la valeur rapportée par le kubelet, par exemple arm64 ou amd64. L'expression jsonpath parcourt tous les nœuds et affiche ces valeurs. kubectl get nodes -o wide n'affiche pas cette information, contrairement à une idée répandue.",
+      "topic": "Kubernetes ARM64"
+    }
+  ]
+}

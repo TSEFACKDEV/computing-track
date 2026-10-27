@@ -1,0 +1,576 @@
+{
+  "id": "hcia-og-02",
+  "phase": "HCIA",
+  "subject": "openGauss",
+  "number": 2,
+  "title_fr": "Installation openGauss et outils de base",
+  "title_en": "openGauss Installation and Base Tools",
+  "minutes": 40,
+  "source": "HCIA-openGauss V2.0 Training Material — Session 2 «openGauss Installation · Connection and Authentication · openGauss Tools» · Lab Guide (installation)",
+  "objectives": [
+    "Préparer un serveur openEuler et le compte système omm pour openGauss",
+    "Réaliser une installation single node avec gs_preinstall, gs_install ou gs_initdb",
+    "Démarrer, arrêter et contrôler une instance avec gs_ctl et gs_om",
+    "Se connecter avec gsql et maîtriser les méta-commandes essentielles",
+    "Configurer pg_hba.conf et distinguer reload et restart"
+  ],
+  "sections": [
+    {
+      "heading": "1. Préparer le système d'exploitation",
+      "body": "Une installation openGauss réussie commence avant le premier paquet : elle dépend de l'OS, du matériel et des limites système. Huawei recommande openEuler ou CentOS sur architecture x86 ou ARM/Kunpeng, avec au moins 4 Go de RAM pour un laboratoire et davantage en production, plus un espace disque suffisant pour les données, le WAL et les sauvegardes. Le port 15400 doit être libre.\n\nopenGauss refuse de tourner sous root. On crée donc un compte système dédié, traditionnellement nommé omm, propriétaire des répertoires d'installation et de données. Ce compte doit pouvoir ouvrir beaucoup de fichiers et de processus : on ajuste ulimit -n et ulimit -u, ainsi que les paramètres noyau de mémoire partagée. Un serveur de temps (chrony ou NTP) est indispensable pour la cohérence des horodatages et la réplication.\n\nLe réseau mérite aussi attention : résolution des noms dans /etc/hosts, nom d'hôte stable, pare-feu ouvert sur le port 15400 entre les clients et le serveur. Pour un laboratoire isolé, on désactive SELinux et firewalld afin d'éviter les faux diagnostics ; en production, on préfère ouvrir uniquement les flux nécessaires.",
+      "bullets": [
+        "openEuler/CentOS, x86 ou ARM, 4 Go de RAM minimum pour un lab",
+        "Compte dédié omm : jamais de démarrage en root",
+        "ulimit -n et ulimit -u relevés, mémoire partagée ajustée",
+        "NTP/chrony, /etc/hosts, port 15400 ouvert"
+      ],
+      "code": [
+        "useradd -m omm",
+        "passwd omm",
+        "mkdir -p /opt/openGauss /data/openGauss && chown -R omm:omm /opt/openGauss /data/openGauss",
+        "ulimit -n 65536",
+        "systemctl disable --now firewalld"
+      ],
+      "table": {
+        "headers": [
+          "Élément",
+          "Valeur usuelle",
+          "Pourquoi"
+        ],
+        "rows": [
+          [
+            "Utilisateur système",
+            "omm",
+            "Propriétaire des fichiers, jamais root"
+          ],
+          [
+            "Répertoire applicatif",
+            "/opt/openGauss",
+            "Binaires et bibliothèques"
+          ],
+          [
+            "Répertoire de données",
+            "/data/openGauss",
+            "Fichiers de base, WAL, logs"
+          ],
+          [
+            "Port",
+            "15400",
+            "Écoute des clients"
+          ],
+          [
+            "Synchronisation",
+            "chrony / NTP",
+            "Horodatage et réplication cohérents"
+          ]
+        ]
+      },
+      "tip": "Une question du type « quel compte faut-il utiliser pour démarrer openGauss ? » a pour réponse le compte dédié omm, jamais root. Le serveur refuse explicitement de démarrer en root."
+    },
+    {
+      "heading": "2. Installation entreprise avec XML et gs_install",
+      "body": "La méthode recommandée en entreprise s'appuie sur un fichier XML décrivant le cluster : nom, nœuds, chemins d'installation et de données, port, répertoire des journaux et répertoire des outils. Ce fichier rend l'installation reproductible et permet de préparer plusieurs nœuds de la même façon.\n\nLe processus se déroule en deux temps. D'abord gs_preinstall, lancé en root, vérifie le système, crée l'utilisateur et les répertoires, ajuste les paramètres noyau et copie les binaires. Ensuite gs_install, lancé avec le compte omm, initialise l'instance, crée le catalogue, configure la réplication éventuelle et démarre le service. Les options --gsinit-parameter permettent de préciser l'encodage ou la locale.\n\nPourquoi cette séparation ? Les opérations privilégiées (création d'utilisateur, modification de limites noyau) exigent root, tandis que l'initialisation de la base doit rester sous le compte applicatif pour respecter le principe du moindre privilège. Mélanger les deux étapes produit des fichiers appartenant à root et une instance incapable de démarrer.",
+      "bullets": [
+        "Fichier XML : cluster, nœuds, chemins, port, logs",
+        "gs_preinstall en root : contrôles système et préparation",
+        "gs_install en omm : initialisation et démarrage",
+        "Installation reproductible et adaptée aux clusters"
+      ],
+      "code": [
+        "gs_preinstall -U omm -G dbgrp -X /opt/openGauss/cluster_config.xml",
+        "gs_install -X /opt/openGauss/cluster_config.xml --gsinit-parameter=\"--locale=en_US.UTF-8\" -p 15400",
+        "gs_om -t status --detail"
+      ],
+      "diagram": " root                omm\n  |                   |\n  v                   v\n+-------------+   +-------------+\n|gs_preinstall|   | gs_install  |\n| verif OS    |   | initdb      |\n| user omm    |   | catalogue   |\n| repertoires |   | demarrage   |\n| limites     |   | instance    |\n+-------------+   +-------------+\n       \\               /\n        +----- XML ----+\n        cluster_config.xml",
+      "tip": "gs_preinstall se lance en root, gs_install avec l'utilisateur omm. Inverser les deux comptes est l'erreur la plus fréquente en laboratoire et provoque des refus de permission au démarrage."
+    },
+    {
+      "heading": "3. Installation minimale single node",
+      "body": "Pour un laboratoire ou une machine de développement, l'installation minimale est plus légère. On décompresse l'archive fournie par Huawei dans un répertoire applicatif, on s'assure que les binaires et bibliothèques appartiennent à omm, puis on initialise un répertoire de données avec gs_initdb. Cette commande crée le catalogue système, les bases postgres et template1, et définit le mot de passe du premier utilisateur administrateur.\n\nUne fois gs_initdb terminé, le démarrage se fait avec gs_ctl start, en indiquant le répertoire de données et éventuellement un fichier de log. L'instance est alors accessible avec gsql. Cette méthode ne configure pas de cluster ni de réplication : elle convient à l'apprentissage, aux tests de compatibilité et aux développements applicatifs.\n\nLa différence avec l'installation entreprise ne porte pas sur le moteur, mais sur l'orchestration. En single node, l'administrateur enchaîne lui-même les étapes et doit penser aux variables d'environnement PATH, PGDATA et GAUSSHOME. En cluster, gs_om centralise ces actions et connaît la topologie. Un même binaire gaussdb sert dans les deux cas.",
+      "bullets": [
+        "Archive décompressée + gs_initdb, sans XML ni cluster",
+        "gs_initdb crée le catalogue et le mot de passe initial",
+        "Démarrage par gs_ctl start -D <datadir>",
+        "Idéal pour les labs, pas pour une production HA"
+      ],
+      "code": [
+        "tar -zxvf openGauss-5.0.0-openEuler-aarch64.tar.gz -C /opt/openGauss",
+        "gs_initdb -D /data/openGauss/db1 -w 'Gauss@123' --nodename=single_node",
+        "gs_ctl start -D /data/openGauss/db1 -l /data/openGauss/db1/logfile",
+        "gsql -d postgres -p 15400 -r"
+      ],
+      "exercises": [
+        {
+          "prompt": "Tu disposes d'une archive openGauss et d'un serveur vierge. Décris la séquence minimale pour obtenir une instance interrogeable avec gsql.",
+          "correction": "Créer le compte omm et les répertoires, puis décompresser l'archive dans le répertoire applicatif en conservant les droits de omm. Initialiser les données avec gs_initdb -D /data/openGauss/db1 -w suivi du mot de passe. Démarrer avec gs_ctl start -D /data/openGauss/db1 -l logfile. Enfin se connecter avec gsql -d postgres -p 15400 -r. Il faut auparavant s'assurer que le port est libre et que les limites système sont suffisantes."
+        }
+      ],
+      "tip": "gs_initdb initialise un répertoire de données ; gs_install installe et orchestre une instance à partir d'un XML. Ce ne sont pas des synonymes, et l'examen peut opposer les deux."
+    },
+    {
+      "heading": "4. Démarrer, arrêter et surveiller l'instance",
+      "body": "Deux outils se partagent le contrôle. gs_ctl agit au niveau d'un répertoire de données : start, stop, restart, status, reload, switchover, build. Il convient à une instance isolée et permet de redémarrer un nœud précis. gs_om agit au niveau du cluster : start, stop, restart, status, et fournit une vue d'ensemble des nœuds et de leurs rôles.\n\nLa commande gs_om -t status --detail est le premier réflexe en cas d'incident : elle indique si le cluster est normal, quels nœuds sont primaires ou standby, et le chemin des répertoires. gs_ctl status -D datadir confirme l'état local et le PID. Un démarrage échoué se diagnostique dans le journal du répertoire de données ou dans $GAUSSLOG/pg_log.\n\nDeux pièges classiques : un arrêt brutal avec kill -9 laisse des fichiers de verrou et impose parfois un nettoyage ; et un arrêt sans mode fast attend la fin des transactions. gs_ctl stop -m fast est le compromis recommandé pour une maintenance : il refuse les nouvelles connexions, termine les transactions en cours puis s'arrête proprement.",
+      "bullets": [
+        "gs_ctl : niveau instance (start, stop, reload, build)",
+        "gs_om : niveau cluster (status --detail, start, stop)",
+        "gs_ctl stop -m fast : arrêt propre sans attendre indéfiniment",
+        "Journaux dans le datadir et dans $GAUSSLOG/pg_log"
+      ],
+      "code": [
+        "gs_ctl status -D /data/openGauss/db1",
+        "gs_ctl restart -D /data/openGauss/db1 -m fast",
+        "gs_om -t status --detail",
+        "gs_om -t stop && gs_om -t start"
+      ],
+      "tip": "Après un kill -9, ne relance pas immédiatement : lis le log, vérifie les verrous et utilise gs_ctl start pour laisser le serveur effectuer sa récupération WAL."
+    },
+    {
+      "heading": "5. Se connecter avec gsql",
+      "body": "gsql est le client interactif fourni avec openGauss. Sa syntaxe est proche de psql : gsql -d base -U utilisateur -h hôte -p port, avec -W pour fournir le mot de passe et -r pour activer l'historique et l'édition de ligne. On peut exécuter un script avec -f ou une commande unique avec -c, ce qui est pratique dans les scripts d'exploitation.\n\nLes méta-commandes commencent par un antislash et ne sont pas du SQL. \\l liste les bases, \\c bascule de base, \\dt liste les tables du schéma courant, \\d table décrit les colonnes et les index, \\dn liste les schémas, \\du liste les rôles, \\db liste les tablespaces, \\x bascule l'affichage en mode étendu et \\q quitte. \\timing affiche la durée de chaque requête, précieux pour un premier diagnostic de performance.\n\nLa connexion n'est acceptée que si trois conditions sont réunies : le serveur écoute sur l'adresse demandée (listen_addresses), le pare-feu laisse passer le port, et pg_hba.conf autorise le couple base/utilisateur depuis l'adresse source avec la bonne méthode. Un « connection refused » et un « no pg_hba.conf entry » n'ont donc pas la même cause.",
+      "bullets": [
+        "gsql -d -U -h -p -W -r ; -f script, -c commande",
+        "Méta-commandes : \\l, \\c, \\dt, \\d, \\dn, \\du, \\db, \\x, \\q",
+        "\\timing mesure la durée des requêtes",
+        "Trois filtres : listen_addresses, pare-feu, pg_hba.conf"
+      ],
+      "code": [
+        "gsql -d postgres -U omm -h 192.168.1.10 -p 15400 -W -r",
+        "\\l",
+        "\\c sales",
+        "\\dt",
+        "\\d+ app.orders",
+        "\\x"
+      ],
+      "table": {
+        "headers": [
+          "Méta-commande",
+          "Effet"
+        ],
+        "rows": [
+          [
+            "\\l",
+            "Lister les bases de données"
+          ],
+          [
+            "\\c base",
+            "Se connecter à une autre base"
+          ],
+          [
+            "\\dt",
+            "Lister les tables du schéma courant"
+          ],
+          [
+            "\\d table",
+            "Décrire la structure d'une table"
+          ],
+          [
+            "\\dn",
+            "Lister les schémas"
+          ],
+          [
+            "\\du",
+            "Lister les rôles"
+          ]
+        ]
+      },
+      "tip": "\\dt ne liste que les tables visibles dans le search_path. Pour voir celles d'un autre schéma, utilise \\dt app.* ou qualifie le nom."
+    },
+    {
+      "heading": "6. Authentification et pg_hba.conf",
+      "body": "pg_hba.conf est le pare-feu d'authentification d'openGauss. Chaque ligne décrit une règle : type de connexion (local, host, hostssl), base concernée, utilisateur, adresse source et méthode. Les règles sont lues de haut en bas et la première qui correspond s'applique : l'ordre est donc décisif.\n\nLes méthodes usuelles sont trust (aucun mot de passe, à réserver au laboratoire), md5 (condensat hérité), sha256 (méthode par défaut moderne), sm3 (algorithme national chinois), cert (certificat client) et ldap ou radius pour l'authentification centralisée. Une règle host sales app 192.168.1.0/24 sha256 autorise les utilisateurs du rôle app à se connecter à sales depuis ce sous-réseau, à condition de fournir un mot de passe vérifié en sha256.\n\nPourquoi ne pas tout mettre en trust ? Parce que toute personne atteignant le port pourrait lire et modifier les données. En production, on combine une méthode forte, une restriction d'adresse et, si le réseau est non fiable, hostssl pour imposer le chiffrement TLS. Après modification, un reload suffit : pg_hba.conf est relu sans redémarrage.",
+      "bullets": [
+        "Première règle correspondante appliquée : l'ordre compte",
+        "sha256 par défaut, sm3 disponible, md5 hérité, trust réservé au lab",
+        "hostssl impose une connexion chiffrée",
+        "Un reload suffit après modification"
+      ],
+      "code": [
+        "# pg_hba.conf\nlocal   all     all                     trust\nhost    all     all     127.0.0.1/32    sha256\nhost    sales   app     192.168.1.0/24  sha256\nhostssl sales   app     10.0.0.0/8      cert",
+        "gs_ctl reload -D /data/openGauss/db1"
+      ],
+      "exercises": [
+        {
+          "prompt": "Un utilisateur app se connecte depuis 192.168.1.25 à la base sales, mais reçoit « no pg_hba.conf entry ». La ligne host all all 192.168.1.0/24 trust existe pourtant en fin de fichier. Explique.",
+          "correction": "Une règle placée plus haut correspond probablement avant, par exemple une ligne host all all 0.0.0.0/0 sha256 ou une règle reject. Comme pg_hba.conf applique la première correspondance, la ligne générale masque la ligne spécifique. Il faut placer la règle la plus précise avant les règles générales, puis recharger avec gs_ctl reload. Vérifier aussi que le serveur écoute bien sur l'interface concernée."
+        }
+      ],
+      "tip": "Un « no pg_hba.conf entry » signifie que la connexion a atteint le serveur mais a été refusée par les règles. Si le serveur ne répond pas du tout, le problème est plutôt réseau, listen_addresses ou pare-feu."
+    },
+    {
+      "heading": "7. Paramètres, rechargement et outils graphiques",
+      "body": "Les paramètres du serveur se trouvent dans postgresql.conf. Les plus importants pour démarrer sont listen_addresses, port, max_connections, shared_buffers et max_process_memory. shared_buffers dimensionne le cache de pages partagé ; max_process_memory plafonne la mémoire du processus gaussdb ; work_mem limite la mémoire de travail d'une opération de tri ou de hachage.\n\nDeux méthodes permettent de modifier un paramètre. ALTER SYSTEM SET, exécuté en SQL, enregistre la valeur dans la configuration persistante ; gs_guc set fait la même chose depuis le shell et gs_guc reload applique un changement sans redémarrage. Tous les paramètres ne sont pas rechargeables : un changement de shared_buffers ou de listen_addresses exige un restart, alors que work_mem ou statement_timeout s'appliquent aux sessions suivantes. La vue pg_settings indique la valeur courante et le contexte requis.\n\nCôté outils, Data Studio offre une interface graphique : exploration des objets, éditeur SQL avec complétion, affichage des plans d'exécution et export des résultats. Les applications Java utilisent le pilote JDBC fourni, généralement gsjdbc4.jar, et les outils de BI passent par ODBC. Ces pilotes ne remplacent pas gsql : ils exposent les mêmes objets à des programmes.",
+      "bullets": [
+        "Paramètres clés : listen_addresses, port, max_connections, shared_buffers, work_mem",
+        "ALTER SYSTEM / gs_guc set pour persister, gs_guc reload pour appliquer",
+        "Reloadable (work_mem) vs restart requis (shared_buffers, listen_addresses)",
+        "pg_settings pour vérifier valeur et contexte",
+        "Data Studio, JDBC gsjdbc4.jar et ODBC pour les applications"
+      ],
+      "code": [
+        "ALTER SYSTEM SET max_connections TO 300;",
+        "gs_guc reload -D /data/openGauss/db1 -c \"max_connections = 300\"",
+        "SELECT name, setting, source, context FROM pg_settings WHERE name = 'max_connections';",
+        "SHOW shared_buffers;"
+      ],
+      "table": {
+        "headers": [
+          "Paramètre",
+          "Effet",
+          "Application"
+        ],
+        "rows": [
+          [
+            "listen_addresses",
+            "Interfaces d'écoute",
+            "Restart"
+          ],
+          [
+            "port",
+            "Port TCP",
+            "Restart"
+          ],
+          [
+            "shared_buffers",
+            "Cache de pages partagé",
+            "Restart"
+          ],
+          [
+            "work_mem",
+            "Mémoire par tri/hachage",
+            "Session suivante"
+          ],
+          [
+            "statement_timeout",
+            "Durée maximale d'une requête",
+            "Session suivante"
+          ]
+        ]
+      },
+      "tip": "Reload ne veut pas dire restart. Si un QCM demande comment appliquer un changement de shared_buffers, la réponse est un redémarrage, pas un simple reload."
+    }
+  ],
+  "key_points": [
+    "openGauss s'installe sur openEuler ou CentOS, avec un compte dédié omm et jamais root.",
+    "gs_preinstall prépare le système en root ; gs_install initialise l'instance avec omm à partir d'un XML.",
+    "L'installation minimale enchaîne décompression, gs_initdb, puis gs_ctl start.",
+    "gs_ctl pilote une instance ; gs_om pilote le cluster et affiche la topologie.",
+    "gsql se connecte avec -d, -U, -h, -p et propose les méta-commandes \\l, \\c, \\dt, \\d, \\dn, \\du.",
+    "pg_hba.conf applique la première règle correspondante ; sha256 est la méthode moderne par défaut.",
+    "Un paramètre est reloadable ou nécessite un restart : pg_settings indique le contexte."
+  ],
+  "traps": [
+    "Le serveur refuse de démarrer en root : utiliser le compte omm.",
+    "gs_preinstall se lance en root, gs_install avec omm : ne pas inverser.",
+    "shared_buffers et listen_addresses exigent un redémarrage, pas un simple reload.",
+    "pg_hba.conf s'évalue de haut en bas : une règle générale placée avant une règle fine la masque.",
+    "Le port par défaut est 15400, et non 5432."
+  ],
+  "quiz": [
+    {
+      "id": "hcia-og-02-q01",
+      "type": "single",
+      "prompt": "Which operating-system account should own and start an openGauss instance?",
+      "options": [
+        "omm",
+        "nobody",
+        "postgres",
+        "root"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "openGauss s'exécute sous un compte système dédié, traditionnellement omm, propriétaire des répertoires applicatifs et de données. root est explicitement refusé pour des raisons de sécurité. nobody et postgres ne sont pas les comptes prévus par la procédure Huawei.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-og-02-q02",
+      "type": "single",
+      "prompt": "Which command initializes a data directory for a minimal single-node installation?",
+      "options": [
+        "gs_install",
+        "gs_initdb",
+        "gs_om",
+        "gs_dump"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "gs_initdb crée le catalogue système et les bases initiales dans un répertoire de données vierge. gs_install orchestre une installation complète à partir d'un XML, gs_om gère un cluster existant et gs_dump exporte des données : aucun ne remplit la fonction d'initialisation locale.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-og-02-q03",
+      "type": "single",
+      "prompt": "Which tool runs OS checks and creates the database user before an enterprise installation?",
+      "options": [
+        "gsql",
+        "gs_restore",
+        "gs_preinstall",
+        "gs_ctl"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "gs_preinstall, lancé en root, vérifie le système, crée l'utilisateur et les répertoires, et ajuste les paramètres noyau. gs_ctl contrôle une instance déjà installée, gsql est un client SQL et gs_restore restaure un dump.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-og-02-q04",
+      "type": "single",
+      "prompt": "Which gsql meta-command lists all databases?",
+      "options": [
+        "\\du",
+        "\\db",
+        "\\dt",
+        "\\l"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "\\l liste les bases de données. \\dt liste les tables, \\du les rôles et \\db les tablespaces. Ces quatre commandes sont souvent proposées ensemble pour vérifier la maîtrise des méta-commandes.",
+      "topic": "gsql"
+    },
+    {
+      "id": "hcia-og-02-q05",
+      "type": "single",
+      "prompt": "Which configuration file contains host-based authentication rules?",
+      "options": [
+        "pg_hba.conf",
+        "pg_ident.conf",
+        "recovery.conf",
+        "postgresql.conf"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "pg_hba.conf décide quels clients peuvent se connecter, depuis quelle adresse et avec quelle méthode. postgresql.conf contient les paramètres du serveur, pg_ident.conf les correspondances de noms et recovery.conf la configuration de récupération.",
+      "topic": "Authentification"
+    },
+    {
+      "id": "hcia-og-02-q06",
+      "type": "single",
+      "prompt": "After editing pg_hba.conf, which action applies the change without stopping the service?",
+      "options": [
+        "gs_preinstall",
+        "gs_ctl reload",
+        "gs_ctl stop",
+        "gs_initdb"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "pg_hba.conf est relu lors d'un reload, qui ne coupe pas les sessions existantes. Un stop interrompt le service sans nécessité, tandis que gs_initdb et gs_preinstall sont des commandes d'installation et détruiraient ou prépareraient des répertoires.",
+      "topic": "Authentification"
+    },
+    {
+      "id": "hcia-og-02-q07",
+      "type": "single",
+      "prompt": "Which view reports the current value, source and context of a server parameter?",
+      "options": [
+        "pg_indexes",
+        "pg_stat_activity",
+        "pg_settings",
+        "pg_class"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "pg_settings expose la valeur courante, la valeur de démarrage, la source et le contexte (reload, restart, session) de chaque paramètre. pg_class décrit les objets, pg_indexes les index et pg_stat_activity les sessions connectées.",
+      "topic": "Paramètres"
+    },
+    {
+      "id": "hcia-og-02-q08",
+      "type": "single",
+      "prompt": "Which connection failure indicates that the server was reached but the rule set refused the client?",
+      "options": [
+        "Could not translate host name",
+        "No route to host",
+        "Connection refused",
+        "No pg_hba.conf entry for host"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Le message « no pg_hba.conf entry » prouve que le paquet a atteint le serveur, mais qu'aucune règle ne correspond à la base, à l'utilisateur ou à l'adresse source. « Connection refused » suggère plutôt un service arrêté ou un mauvais port, et les deux derniers messages sont des erreurs réseau ou DNS.",
+      "topic": "Authentification"
+    },
+    {
+      "id": "hcia-og-02-q09",
+      "type": "single",
+      "prompt": "Which parameter controls the shared page cache of an openGauss instance?",
+      "options": [
+        "shared_buffers",
+        "statement_timeout",
+        "log_min_duration_statement",
+        "work_mem"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "shared_buffers dimensionne le cache de pages partagé entre les threads. work_mem limite la mémoire d'un tri ou d'un hachage par opération, statement_timeout borne la durée d'une requête et log_min_duration_statement pilote la journalisation des requêtes lentes.",
+      "topic": "Paramètres"
+    },
+    {
+      "id": "hcia-og-02-q10",
+      "type": "single",
+      "prompt": "Which tool gives a cluster-wide view of node roles and status?",
+      "options": [
+        "gs_initdb -D",
+        "gs_om -t status --detail",
+        "gsql \\dt",
+        "gs_dump -F c"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "gs_om -t status --detail affiche l'état du cluster, le rôle de chaque nœud et les chemins associés. Les autres commandes servent respectivement à lister des tables, à sauvegarder une base et à initialiser un répertoire de données.",
+      "topic": "Exploitation"
+    },
+    {
+      "id": "hcia-og-02-q11",
+      "type": "multi",
+      "prompt": "Which parameters usually require a restart after being changed? (Choose two.)",
+      "options": [
+        "listen_addresses",
+        "work_mem",
+        "statement_timeout",
+        "shared_buffers"
+      ],
+      "answer": [
+        0,
+        3
+      ],
+      "explanation_fr": "shared_buffers et listen_addresses modifient des ressources allouées au démarrage : ils exigent un redémarrage. work_mem et statement_timeout sont des paramètres de session ou de requête, appliqués aux connexions suivantes sans redémarrer le serveur.",
+      "topic": "Paramètres"
+    },
+    {
+      "id": "hcia-og-02-q12",
+      "type": "multi",
+      "prompt": "Which methods can legitimately appear in the authentication column of pg_hba.conf? (Choose three.)",
+      "options": [
+        "trust",
+        "cert",
+        "gs_ktool",
+        "sha256"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "sha256, trust et cert sont des méthodes d'authentification reconnues par pg_hba.conf. gs_ktool est un utilitaire de gestion de clés et de chiffrement, pas une méthode d'authentification : il ne peut donc pas figurer dans cette colonne.",
+      "topic": "Authentification"
+    },
+    {
+      "id": "hcia-og-02-q13",
+      "type": "multi",
+      "prompt": "Which actions are performed by gs_preinstall? (Choose two.)",
+      "options": [
+        "Initializing the database catalog",
+        "Starting the gaussdb process",
+        "Creating the database operating-system user",
+        "Checking and adjusting OS limits"
+      ],
+      "answer": [
+        2,
+        3
+      ],
+      "explanation_fr": "gs_preinstall prépare l'environnement : création de l'utilisateur, des répertoires, vérification des limites et des paramètres noyau. L'initialisation du catalogue et le démarrage de l'instance relèvent de gs_install puis de gs_ctl ou gs_om.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-og-02-q14",
+      "type": "tf",
+      "prompt": "It is recommended to run the openGauss database service with the root account.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux. openGauss refuse de démarrer sous root et doit être exploité par un compte dédié, généralement omm. Ce compte possède uniquement les droits nécessaires sur ses répertoires, ce qui limite l'impact d'une compromission.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-og-02-q15",
+      "type": "tf",
+      "prompt": "The order of the rules in pg_hba.conf matters, because the first matching rule is applied.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai. openGauss parcourt le fichier de haut en bas et applique la première règle qui correspond au type de connexion, à la base, à l'utilisateur et à l'adresse. Une règle générale placée trop haut peut donc masquer une règle plus spécifique.",
+      "topic": "Authentification"
+    },
+    {
+      "id": "hcia-og-02-q16",
+      "type": "tf",
+      "prompt": "A reload applies every parameter change immediately, including changes to shared_buffers.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux. Le reload ne concerne que les paramètres dont le contexte l'autorise. shared_buffers réserve de la mémoire au démarrage et nécessite un restart ; croire le contraire conduit à un paramètre affiché comme modifié mais non appliqué.",
+      "topic": "Paramètres"
+    },
+    {
+      "id": "hcia-og-02-q17",
+      "type": "text",
+      "prompt": "Which command starts an openGauss instance whose data directory is /data/openGauss/db1? (Give the command and its main option.)",
+      "accept": [
+        "gs_ctl start -D /data/openGauss/db1",
+        "gs_ctl start -D /data/openGauss/db1 -l logfile",
+        "gs_ctl start -D /data/openGauss/db1 -l /data/openGauss/db1/logfile"
+      ],
+      "sample_answer": "gs_ctl start -D /data/openGauss/db1",
+      "explanation_fr": "gs_ctl start démarre l'instance désignée par -D suivi du répertoire de données. L'option -l permet de rediriger la sortie vers un fichier de log. gs_om -t start démarrerait l'ensemble du cluster, ce qui est différent.",
+      "topic": "Exploitation"
+    },
+    {
+      "id": "hcia-og-02-q18",
+      "type": "text",
+      "prompt": "Give the gsql meta-command that lists the tables of the current schema.",
+      "accept": [
+        "\\dt",
+        "\\dt+",
+        "\\dt *"
+      ],
+      "sample_answer": "\\dt",
+      "explanation_fr": "\\dt liste les tables visibles dans le search_path courant. \\d+ table ajoute des détails comme la taille, et \\dn liste les schémas. \\l quant à lui liste les bases de données, pas les tables.",
+      "topic": "gsql"
+    },
+    {
+      "id": "hcia-og-02-q19",
+      "type": "text",
+      "prompt": "Which client command-line tool is used to connect to openGauss and run SQL interactively?",
+      "accept": [
+        "gsql",
+        "gsql -r",
+        "gsql -d postgres -p 15400 -r"
+      ],
+      "sample_answer": "gsql",
+      "explanation_fr": "gsql est le client interactif officiel d'openGauss. Il accepte les options -d, -U, -h, -p et -W, ainsi que des méta-commandes comme \\dt et \\l. Data Studio est l'interface graphique équivalente.",
+      "topic": "gsql"
+    },
+    {
+      "id": "hcia-og-02-q20",
+      "type": "text",
+      "prompt": "Name the file that stores the main server parameters such as port and shared_buffers.",
+      "accept": [
+        "postgresql.conf",
+        "postgresql conf",
+        "postgresql.conf.auto"
+      ],
+      "sample_answer": "postgresql.conf",
+      "explanation_fr": "postgresql.conf contient les paramètres du serveur, notamment listen_addresses, port, max_connections et shared_buffers. pg_hba.conf traite l'authentification des clients et pg_ident.conf les correspondances de noms d'utilisateurs.",
+      "topic": "Paramètres"
+    }
+  ]
+}

@@ -1,0 +1,565 @@
+{
+  "id": "hcia-og-01",
+  "phase": "HCIA",
+  "subject": "openGauss",
+  "number": 1,
+  "title_fr": "openGauss : présentation et architecture",
+  "title_en": "openGauss Overview and Architecture",
+  "minutes": 35,
+  "source": "HCIA-openGauss V2.0 Training Material — Session 1 «Database Overview · Introduction to openGauss · Technical Specifications»",
+  "objectives": [
+    "Situer openGauss dans l'écosystème des bases de données Huawei",
+    "Décrire l'architecture client/serveur multi-thread et le rôle du processus gaussdb",
+    "Expliquer la structure logique et physique d'une instance openGauss",
+    "Distinguer les moteurs de stockage Astore, Ustore et CStore",
+    "Identifier les mécanismes de haute disponibilité et de sécurité intégrés"
+  ],
+  "sections": [
+    {
+      "heading": "1. Qu'est-ce qu'openGauss ?",
+      "body": "openGauss est un système de gestion de base de données relationnel open source publié par Huawei en juin 2020 et confié à la communauté openGauss. Son code descend de PostgreSQL 9.2.4, mais Huawei en a profondément remanié les chemins critiques : moteur transactionnel, optimisation pour les processeurs ARM et Kunpeng, exécution parallèle, stockage en colonnes et outils d'exploitation. Il faut donc le voir comme un cousin éloigné de PostgreSQL, pas comme une simple copie.\n\nPourquoi ce choix ? PostgreSQL fournit un socle ACID mature et une licence permissive, ce qui permet d'innover sans repartir de zéro. openGauss ajoute une orientation HTAP : la même instance traite les transactions courtes d'un système OLTP et les analyses lourdes d'un entrepôt de données. Cette double compétence explique son adoption dans les télécoms, la finance et le secteur public.\n\nSur le marché, deux offres ne doivent pas être confondues. openGauss est le projet communautaire gratuit ; GaussDB est la version commerciale de Huawei Cloud ; MogDB et Vastbase sont des distributions dérivées de partenaires. Pour la compétition, retiens surtout que le socle open source reste openGauss.",
+      "bullets": [
+        "Projet open source annoncé en juin 2020, héritier de PostgreSQL 9.2.4",
+        "Optimisations Huawei : ARM/Kunpeng, transactions, parallélisme, stockage colonne",
+        "Positionnement HTAP : OLTP et OLAP sur la même instance",
+        "openGauss (communauté) ≠ GaussDB (offre commerciale cloud)"
+      ],
+      "code": [
+        "SELECT version();",
+        "SHOW server_version;"
+      ],
+      "tip": "Un QCM peut demander la version de PostgreSQL d'origine : c'est 9.2.4, et non 12 ou 14. openGauss a beaucoup évolué depuis, mais la base historique reste celle-là."
+    },
+    {
+      "heading": "2. Architecture client/serveur et modèle multi-thread",
+      "body": "openGauss suit une architecture client/serveur. Le client (gsql, JDBC, ODBC, Data Studio) ouvre une connexion TCP, par défaut sur le port 15400, et envoie des requêtes au serveur. Le serveur est représenté par le processus principal gaussdb, lancé avec un répertoire de données précis. Ce processus alloue la mémoire partagée, démarre les threads auxiliaires et accepte les connexions.\n\nLa différence majeure avec PostgreSQL concerne le modèle d'exécution. PostgreSQL crée un processus par connexion ; openGauss utilise un modèle multi-thread : chaque session est servie par un thread de service au sein du processus gaussdb. Les changements de contexte sont moins coûteux et la mémoire est mieux partagée, ce qui améliore la densité de connexions. Le prix à payer est une isolation moins forte : un plantage du processus principal affecte toutes les sessions.\n\nAutour des threads de service tournent des threads spécialisés : écriture WAL, checkpoint, écriture des pages, vacuum automatique, journalisation système et journal CSN. La mémoire se répartit entre zone partagée (buffer pool, buffers CLOG et CSN) et zone locale (work_mem, buffers temporaires).",
+      "bullets": [
+        "Client/serveur : gsql, JDBC, ODBC, Data Studio vers le port 15400",
+        "Processus principal gaussdb + threads auxiliaires",
+        "Un thread de service par session, au lieu d'un processus par connexion",
+        "Mémoire partagée (buffer pool) et mémoire locale (work_mem)"
+      ],
+      "code": [
+        "gsql -d postgres -p 15400 -r",
+        "gs_om -t status --detail",
+        "ps -ef | grep gaussdb"
+      ],
+      "diagram": "        Client gsql / JDBC / Data Studio\n                     |  TCP 15400\n                     v\n        +------------------------------+\n        |      processus gaussdb      |\n        |  +------------------------+  |\n        |  | threads de service     |  |  <- 1 thread / session\n        |  +------------------------+  |\n        |  | WAL writer             |  |\n        |  | checkpointer           |  |\n        |  | page writer            |  |\n        |  | autovacuum launcher    |  |\n        |  | syslogger              |  |\n        |  +------------------------+  |\n        |   memoire partagee + locale  |\n        +------------------------------+\n                     |\n              fichiers de donnees\n              base/  global/  pg_xlog/",
+      "exercises": [
+        {
+          "prompt": "Un stagiaire affirme : « openGauss crée un processus système par connexion cliente, exactement comme PostgreSQL ». Corrige-t-il sa phrase ?",
+          "correction": "Non. openGauss conserve le modèle client/serveur, mais il remplace le fork d'un processus par connexion par un modèle multi-thread : le processus principal gaussdb crée les threads de service qui traitent les sessions. L'avantage est un coût de commutation plus faible et une meilleure densité de connexions ; la contrepartie est qu'un incident sur le processus principal touche toutes les sessions."
+        }
+      ],
+      "tip": "Retiens la nuance : openGauss est dérivé de PostgreSQL, mais son modèle d'exécution est multi-thread. Une question qui parle de « processus par connexion » décrit PostgreSQL, pas openGauss."
+    },
+    {
+      "heading": "3. Structure logique et structure physique",
+      "body": "Il faut distinguer deux lectures d'une même réalité. La structure logique part du cluster, c'est-à-dire l'ensemble géré par une instance : un cluster contient plusieurs bases de données, une base contient des schémas, un schéma contient des objets (tables, vues, index, séquences). Le schéma public existe par défaut. Une table contient des lignes, une ligne est stockée dans des pages de 8 Ko, et chaque ligne possède un identifiant physique interne, le ctid, composé du numéro de page et du numéro de ligne.\n\nLa structure physique correspond aux fichiers du répertoire de données. Le catalogue global vit dans global/, les bases dans base/, les journaux de transactions dans pg_xlog/ et les fichiers de configuration à la racine. Un tablespace n'est qu'une correspondance logique vers un répertoire : la clause TABLESPACE déplace les fichiers, pas les objets du point de vue SQL.\n\nAutre détail utile : lorsqu'une table dépasse 1 Go, openGauss la découpe en fichiers de segment de 1 Go, nommés par numéro de relfile. Cette organisation facilite la gestion des gros volumes et explique pourquoi la taille d'une table ne se lit pas dans un seul fichier.",
+      "bullets": [
+        "Hiérarchie logique : cluster → base → schéma → objet → ligne → page de 8 Ko",
+        "ctid = adresse physique d'une ligne (page, offset)",
+        "Répertoires clés : base/, global/, pg_xlog/, fichiers de configuration",
+        "Découpage des tables en fichiers de segment de 1 Go"
+      ],
+      "code": [
+        "SELECT current_database(), current_schema(), current_user;",
+        "SELECT ctid, * FROM app.customers LIMIT 5;",
+        "SELECT relname, relfilenode FROM pg_class WHERE relname = 'customers';"
+      ],
+      "table": {
+        "headers": [
+          "Niveau",
+          "Objet",
+          "Rôle principal"
+        ],
+        "rows": [
+          [
+            "Cluster",
+            "Instance openGauss",
+            "Contient toutes les bases et les rôles"
+          ],
+          [
+            "Base de données",
+            "sales, postgres",
+            "Isolation des données et des connexions"
+          ],
+          [
+            "Schéma",
+            "public, app",
+            "Espace de noms des objets"
+          ],
+          [
+            "Table",
+            "app.customers",
+            "Stockage des lignes"
+          ],
+          [
+            "Page",
+            "bloc de 8 Ko",
+            "Unité d'entrée/sortie du buffer pool"
+          ]
+        ]
+      },
+      "tip": "Ne confonds pas base de données et schéma : on ne peut pas avoir deux schémas portant le même nom dans une base, mais deux bases différentes peuvent chacune contenir un schéma app."
+    },
+    {
+      "heading": "4. Moteurs de stockage : Astore, Ustore et CStore",
+      "body": "openGauss propose plusieurs moteurs pour épouser des charges différentes. Astore est le moteur en ligne historique, hérité de PostgreSQL : les mises à jour ajoutent une nouvelle version de la ligne et les anciennes versions sont nettoyées par vacuum. Il est simple et robuste, mais un rythme élevé de mises à jour gonfle les tables et dégrade les performances si le vacuum prend du retard.\n\nUstore est le moteur en ligne à mise à jour sur place. Les nouvelles versions de ligne sont écrites dans une zone dédiée et les anciennes sont recyclées plus efficacement, ce qui réduit fortement le gonflement et améliore les charges OLTP très modifiantes. C'est le moteur recommandé pour les tables à fort taux d'UPDATE.\n\nCStore est le moteur en colonnes : les valeurs d'une même colonne sont stockées ensemble et compressées. Une analyse qui lit trois colonnes sur cinquante ne lit que ces trois colonnes, ce qui est idéal pour l'OLAP. En revanche, les mises à jour ligne à ligne y sont coûteuses. Le choix du moteur est donc un choix de conception, déclaré à la création de la table avec la clause WITH (ORIENTATION = ...).",
+      "bullets": [
+        "Astore : lignes, héritage PostgreSQL, vacuum nécessaire",
+        "Ustore : mise à jour sur place, moins de gonflement, OLTP intense",
+        "CStore : colonnes compressées, lectures analytiques massives",
+        "Le moteur se choisit à la création, via WITH (ORIENTATION = ...)"
+      ],
+      "code": [
+        "CREATE TABLE app.orders (id bigint, amount numeric(12,2)) WITH (ORIENTATION = ROW, STORAGE_TYPE = USTORE);",
+        "CREATE TABLE app.sales_fact (id bigint, amount numeric(12,2)) WITH (ORIENTATION = COLUMN, COMPRESSION = HIGH);"
+      ],
+      "table": {
+        "headers": [
+          "Moteur",
+          "Organisation",
+          "Charge idéale",
+          "Point faible"
+        ],
+        "rows": [
+          [
+            "Astore",
+            "Lignes, versions empilées",
+            "OLTP classique, lecture ponctuelle",
+            "Gonflement si vacuum en retard"
+          ],
+          [
+            "Ustore",
+            "Lignes, mise à jour sur place",
+            "OLTP à forts UPDATE",
+            "Réglage et compatibilité plus stricts"
+          ],
+          [
+            "CStore",
+            "Colonnes compressées",
+            "OLAP, agrégats sur gros volumes",
+            "Écritures ligne à ligne coûteuses"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Une table de journal d'audit reçoit 20 000 UPDATE par minute et grossit anormalement vite. Quel moteur choisis-tu et pourquoi ?",
+          "correction": "Ustore est le meilleur candidat : la mise à jour sur place évite d'empiler indéfiniment des versions mortes, ce qui limite le gonflement et la pression sur vacuum. Astore fonctionnerait mais exigerait un vacuum très agressif. CStore serait un mauvais choix, car les mises à jour ligne à ligne y sont pénalisantes et le format colonne vise les lectures analytiques."
+        }
+      ],
+      "tip": "Ustore ne veut pas dire « colonne » : U et A désignent tous deux le stockage en ligne (row store). Seul CStore est le stockage en colonnes. C'est un piège classique."
+    },
+    {
+      "heading": "5. Optimiseur, exécution et orientation HTAP",
+      "body": "openGauss utilise un optimiseur basé sur les coûts (CBO). Pour choisir un plan, il s'appuie sur les statistiques collectées par ANALYZE : nombre de lignes, distribution des valeurs, nombre de valeurs distinctes. Sans statistiques à jour, l'optimiseur peut surestimer ou sous-estimer un filtre et choisir un mauvais chemin d'accès.\n\nLes chemins d'accès possibles sont le parcours séquentiel, le parcours d'index, le parcours bitmap, et pour les jointures la boucle imbriquée, le hachage ou la fusion triée. openGauss ajoute l'exécution parallèle : une requête peut être découpée entre plusieurs threads de travail, ce qui est précieux pour les agrégats analytiques.\n\nL'orientation HTAP se lit dans cette combinaison : une table CStore alimentée par des chargements batch, des index B-tree sur les tables OLTP, et un optimiseur capable de mélanger les deux dans une même base. Attention toutefois : le HTAP n'est pas magique. Une requête analytique lourde peut consommer toutes les ressources et pénaliser les transactions ; on l'isole par des ressources pools, des vues matérialisées ou une réplique dédiée.",
+      "bullets": [
+        "Optimiseur CBO : coût estimé à partir des statistiques d'ANALYZE",
+        "Chemins d'accès : seq scan, index scan, bitmap scan",
+        "Jointures : nested loop, hash join, merge join",
+        "HTAP = mêmes données, mais isolation des ressources indispensable"
+      ],
+      "code": [
+        "ANALYZE app.orders;",
+        "EXPLAIN SELECT * FROM app.orders WHERE customer_id = 42;",
+        "EXPLAIN PERFORMANCE SELECT count(*) FROM app.sales_fact;"
+      ],
+      "tip": "EXPLAIN affiche le plan estimé ; EXPLAIN ANALYZE exécute la requête ; EXPLAIN PERFORMANCE est la variante openGauss qui ajoute les métriques réelles détaillées. Ne les confonds pas dans un QCM."
+    },
+    {
+      "heading": "6. Haute disponibilité : primary, standby et CM",
+      "body": "Une instance unique s'arrête avec sa machine. Pour éviter la panne totale, openGauss organise la réplication entre un nœud primaire (primary) qui accepte les écritures et un ou plusieurs nœuds secondaires (standby) qui reçoivent le flux WAL. Le standby est en lecture seule : il peut servir des requêtes de consultation ou des sauvegardes, mais jamais des INSERT, UPDATE ou DELETE.\n\nLa réplication peut être asynchrone ou synchrone. En asynchrone, le primaire valide sans attendre le standby : les performances sont meilleures, mais une panne peut perdre les dernières transactions. En synchrone, le primaire attend l'accusé de réception du standby avant de valider : aucune perte de données, au prix d'une latence plus élevée.\n\nLe Cluster Manager (CM) surveille l'état des nœuds. Il déclenche un switchover planifié lorsqu'on veut basculer proprement, ou un failover lorsqu'une panne impose de promouvoir un standby. Depuis la version 3.0, le cadre DCF s'appuie sur un consensus de type Paxos pour éviter le double primaire. Après un incident, il faut souvent reconstruire le standby avec gs_ctl build ou gs_basebackup.",
+      "bullets": [
+        "Primary : écritures ; standby : lecture seule et réplication WAL",
+        "Synchrone = pas de perte, plus de latence ; asynchrone = inverse",
+        "CM : surveillance, switchover planifié, failover automatique",
+        "DCF/Paxos : éviter le double primaire et garantir le quorum"
+      ],
+      "code": [
+        "gs_om -t status --detail",
+        "gs_ctl switchover -D /data/openGauss/primary",
+        "gs_ctl build -D /data/openGauss/standby"
+      ],
+      "diagram": "            Application\n                |\n                v\n      +-------------------+\n      |   Primary (RW)    |\n      |  WAL writer       |\n      +---------+---------+\n                |  flux WAL (sync ou async)\n        +-------+--------+\n        |                |\n        v                v\n +-------------+  +-------------+\n | Standby 1   |  | Standby 2   |\n | (read only) |  | (read only) |\n +-------------+  +-------------+\n        ^                ^\n        +---- CM / DCF ---+\n        surveillance, quorum, bascule",
+      "exercises": [
+        {
+          "prompt": "Après une coupure réseau, le primaire et un standby se croient tous deux primaires. Quel mécanisme évite ce scénario et comment le vérifier ?",
+          "correction": "Le cadre DCF, fondé sur un consensus de type Paxos, exige un quorum pour élire le primaire : un nœud isolé ne peut pas obtenir la majorité et ne devient donc pas primaire. On vérifie l'état avec gs_om -t status --detail ou cm_ctl query, qui indiquent le rôle réel de chaque nœud et l'état de la réplication. En l'absence de DCF, le CM et les règles de quorum jouent le même rôle de garde-fou."
+        }
+      ],
+      "tip": "Switchover = bascule planifiée, sans perte, décidée par l'administrateur. Failover = bascule d'urgence après panne, potentiellement avec perte en réplication asynchrone. Les QCM adorent cette opposition."
+    },
+    {
+      "heading": "7. Sécurité, exploitation et écosystème",
+      "body": "openGauss intègre la sécurité à plusieurs niveaux. L'authentification des clients est décidée par pg_hba.conf, qui précise la base, l'utilisateur, l'adresse source et la méthode (trust, md5, sha256, sm3, cert). Les mots de passe sont stockés sous forme de condensat, sha256 par défaut, et les politiques de complexité, d'expiration et de verrouillage sont pilotées par des paramètres dédiés.\n\nLe contrôle d'accès repose sur des rôles. openGauss utilise l'attribut SYSADMIN plutôt que SUPERUSER : un compte sysadmin contourne les contrôles, il doit donc rester exceptionnel. Les privilèges s'accordent avec GRANT et se retirent avec REVOKE, au niveau des bases, des schémas et des objets. L'audit, activé par audit_enable, journalise les connexions, les DDL et les DML sensibles.\n\nCôté exploitation, la boîte à outils gs_* couvre l'installation (gs_preinstall, gs_install), le contrôle (gs_ctl), le cluster (gs_om), la sauvegarde (gs_dump, gs_basebackup, gs_probackup) et le diagnostic (gs_check, gs_collector). L'écosystème s'étend à Data Studio pour l'administration graphique, aux pilotes JDBC et ODBC, et à des distributions partenaires comme MogDB et Vastbase. openGauss s'installe typiquement sur openEuler, en RPM, en conteneur ou sur une machine virtuelle.",
+      "bullets": [
+        "pg_hba.conf : base, utilisateur, hôte, méthode d'authentification",
+        "sha256 par défaut, sm3 disponible, md5 considéré comme hérité",
+        "SYSADMIN remplace SUPERUSER ; principe du moindre privilège",
+        "Audit et outils gs_* pour la conformité et l'exploitation"
+      ],
+      "code": [
+        "SHOW password_encryption_type;",
+        "SELECT rolname, rolsystemadmin FROM pg_roles ORDER BY 1;",
+        "SHOW audit_enable;"
+      ],
+      "table": {
+        "headers": [
+          "Produit",
+          "Nature",
+          "À retenir"
+        ],
+        "rows": [
+          [
+            "openGauss",
+            "Projet open source communautaire",
+            "Socle gratuit, code et communauté"
+          ],
+          [
+            "GaussDB",
+            "Base commerciale Huawei Cloud",
+            "Service managé, support enterprise"
+          ],
+          [
+            "MogDB",
+            "Distribution partenaire (Enmotech)",
+            "Dérivée d'openGauss, services commerciaux"
+          ],
+          [
+            "Vastbase",
+            "Distribution partenaire (Vastdata)",
+            "Dérivée d'openGauss, orientée compatibilité"
+          ]
+        ]
+      },
+      "tip": "openGauss n'utilise pas le rôle SUPERUSER de PostgreSQL mais SYSADMIN. Une option qui parle de SUPERUSER dans un contexte openGauss est généralement un distracteur."
+    }
+  ],
+  "key_points": [
+    "openGauss est un SGBD open source de 2020, dérivé de PostgreSQL 9.2.4 et enrichi par Huawei.",
+    "Le port par défaut est 15400 ; gsql est le client en ligne de commande.",
+    "Architecture client/serveur multi-thread : processus gaussdb, threads de service, mémoire partagée et locale.",
+    "Trois moteurs : Astore (lignes classiques), Ustore (mise à jour sur place), CStore (colonnes compressées).",
+    "Haute disponibilité : primary en écriture, standby en lecture seule, CM pour la bascule, DCF pour le quorum.",
+    "Sécurité : pg_hba.conf, sha256/sm3, rôles SYSADMIN, GRANT/REVOKE, audit.",
+    "Écosystème : outils gs_*, Data Studio, pilotes JDBC/ODBC, distributions MogDB et Vastbase."
+  ],
+  "traps": [
+    "Le port par défaut d'openGauss est 15400, pas 5432 (PostgreSQL), 3306 (MySQL) ni 1521 (Oracle).",
+    "openGauss est multi-thread ; le modèle « un processus par connexion » est celui de PostgreSQL.",
+    "Ustore et Astore sont des moteurs en ligne ; seul CStore est un moteur en colonnes.",
+    "GaussDB est l'offre commerciale cloud, openGauss le projet communautaire open source.",
+    "Le standby est en lecture seule : il ne reçoit jamais d'écritures directes de l'application."
+  ],
+  "quiz": [
+    {
+      "id": "hcia-og-01-q01",
+      "type": "single",
+      "prompt": "In which year did Huawei announce openGauss as an open-source database?",
+      "options": [
+        "2020",
+        "2022",
+        "2017",
+        "2018"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "openGauss a été annoncé en juin 2020 et publié sous licence open source sur openEuler. 2017 et 2018 correspondent à des travaux internes antérieurs, non à l'annonce publique. 2022 est trop tardif : la version 3.0 de openGauss date de cette époque, mais le projet existe depuis 2020.",
+      "topic": "Historique"
+    },
+    {
+      "id": "hcia-og-01-q02",
+      "type": "single",
+      "prompt": "Which PostgreSQL version is the historical code base of openGauss?",
+      "options": [
+        "PostgreSQL 14",
+        "PostgreSQL 9.2.4",
+        "PostgreSQL 10",
+        "PostgreSQL 12"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "openGauss est parti du code de PostgreSQL 9.2.4, puis Huawei a réécrit de nombreux composants. PostgreSQL 10, 12 et 14 sont des versions bien plus récentes, dont certaines fonctionnalités ont ensuite été ajoutées à openGauss, mais elles ne constituent pas le socle d'origine.",
+      "topic": "Historique"
+    },
+    {
+      "id": "hcia-og-01-q03",
+      "type": "single",
+      "prompt": "Which TCP port does a freshly installed openGauss instance listen on by default?",
+      "options": [
+        "5432",
+        "1521",
+        "15400",
+        "3306"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "openGauss écoute par défaut sur le port 15400. Le port 5432 est celui de PostgreSQL, 3306 celui de MySQL et 1521 celui d'Oracle ; ce sont des distracteurs classiques destinés à tester la mémoire de l'installation.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-og-01-q04",
+      "type": "single",
+      "prompt": "Which process is the main server process of an openGauss instance?",
+      "options": [
+        "gs_om",
+        "gs_initdb",
+        "gsql",
+        "gaussdb"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Le binaire et processus principal s'appelle gaussdb : il alloue la mémoire partagée, démarre les threads auxiliaires et accepte les connexions. GaussMaster désigne son thread de gestion, parfois appelé postmaster par héritage de PostgreSQL. gsql est le client, gs_om l'outil de cluster et gs_initdb l'outil d'initialisation d'un répertoire de données.",
+      "topic": "Architecture"
+    },
+    {
+      "id": "hcia-og-01-q05",
+      "type": "single",
+      "prompt": "How does openGauss handle a new client connection?",
+      "options": [
+        "It assigns a service thread inside the gaussdb process",
+        "It starts a new gaussdb process per database",
+        "It routes the connection through gs_om",
+        "It forks a dedicated OS process for each connection"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "openGauss utilise un modèle multi-thread : un thread de service traite chaque session à l'intérieur du processus gaussdb. Le fork d'un processus par connexion est le modèle de PostgreSQL. Un processus par base ou un routage par gs_om ne correspondent à aucune réalité de l'architecture openGauss.",
+      "topic": "Architecture"
+    },
+    {
+      "id": "hcia-og-01-q06",
+      "type": "single",
+      "prompt": "Which storage engine performs in-place updates to reduce table bloat?",
+      "options": [
+        "Astore",
+        "Ustore",
+        "CStore",
+        "MOT"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Ustore met à jour les lignes sur place et recycle les anciennes versions, ce qui limite le gonflement des tables très modifiées. Astore empile les versions et dépend du vacuum. CStore est un moteur en colonnes, inadapté aux mises à jour ligne à ligne. MOT désigne les tables optimisées en mémoire, un autre usage.",
+      "topic": "Moteurs de stockage"
+    },
+    {
+      "id": "hcia-og-01-q07",
+      "type": "single",
+      "prompt": "Which storage engine is best suited to a large analytical query scanning a few columns of a very wide table?",
+      "options": [
+        "Astore",
+        "Ustore",
+        "CStore",
+        "Un moteur sans compression"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "CStore stocke les valeurs par colonne et les compresse : une requête qui lit trois colonnes ne parcourt que ces trois colonnes. Astore et Ustore stockent les lignes entières, donc le bénéfice de projection disparaît. Un moteur sans compression serait encore plus coûteux en entrées/sorties.",
+      "topic": "Moteurs de stockage"
+    },
+    {
+      "id": "hcia-og-01-q08",
+      "type": "single",
+      "prompt": "Which role attribute replaces SUPERUSER in openGauss?",
+      "options": [
+        "CREATEROLE",
+        "AUDITADMIN",
+        "REPLICATION",
+        "SYSADMIN"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "openGauss nomme SYSADMIN le rôle administratif qui contourne les contrôles d'accès, alors que PostgreSQL parle de SUPERUSER. CREATEROLE permet de créer des rôles, AUDITADMIN gère l'audit et REPLICATION autorise la réplication : aucun de ces attributs ne confère les pleins pouvoirs.",
+      "topic": "Sécurité"
+    },
+    {
+      "id": "hcia-og-01-q09",
+      "type": "single",
+      "prompt": "Which component monitors an openGauss cluster and triggers failover?",
+      "options": [
+        "CM (Cluster Manager)",
+        "gsql",
+        "pg_hba.conf",
+        "Data Studio"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le Cluster Manager surveille les nœuds, détecte les pannes et déclenche le failover ou le switchover. gsql est un client SQL, pg_hba.conf un fichier d'authentification et Data Studio un outil graphique d'administration : aucun ne pilote la bascule.",
+      "topic": "Haute disponibilité"
+    },
+    {
+      "id": "hcia-og-01-q10",
+      "type": "single",
+      "prompt": "What is the default behavior of a standby node in an openGauss replication cluster?",
+      "options": [
+        "It accepts read and write queries",
+        "It is read-only and replays WAL from the primary",
+        "It stores only archived WAL files",
+        "It acts as the cluster manager"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le standby rejoue le WAL reçu du primaire et reste en lecture seule : il peut servir des SELECT ou des sauvegardes, jamais des écritures. Il ne se limite pas à archiver le WAL et n'assure pas les fonctions du Cluster Manager, qui est un composant distinct.",
+      "topic": "Haute disponibilité"
+    },
+    {
+      "id": "hcia-og-01-q11",
+      "type": "multi",
+      "prompt": "Which tools belong to the openGauss operations toolkit? (Choose three.)",
+      "options": [
+        "gs_dump",
+        "gs_basebackup",
+        "sqlplus",
+        "gs_om"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "gs_om gère le cluster, gs_dump réalise une sauvegarde logique et gs_basebackup une sauvegarde physique : tous trois font partie de la suite openGauss. sqlplus est le client en ligne de commande d'Oracle et n'a aucun rôle dans openGauss.",
+      "topic": "Outils"
+    },
+    {
+      "id": "hcia-og-01-q12",
+      "type": "multi",
+      "prompt": "Which security mechanisms are built into openGauss? (Choose three.)",
+      "options": [
+        "SSL/TLS session encryption",
+        "Role-based access control",
+        "Audit of DDL and DML",
+        "MySQL native replication"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "openGauss prend en charge le chiffrement des sessions SSL/TLS, le contrôle d'accès par rôles et l'audit des opérations sensibles. La réplication MySQL native n'existe pas dans openGauss : la réplication repose sur le WAL et les mécanismes primary/standby.",
+      "topic": "Sécurité"
+    },
+    {
+      "id": "hcia-og-01-q13",
+      "type": "multi",
+      "prompt": "Which of these are row-oriented storage engines in openGauss? (Choose two.)",
+      "options": [
+        "Astore",
+        "Ustore",
+        "CStore",
+        "Parquet"
+      ],
+      "answer": [
+        0,
+        1
+      ],
+      "explanation_fr": "Astore et Ustore organisent les données par ligne ; ils diffèrent surtout par la gestion des mises à jour. CStore est le moteur en colonnes. Parquet est un format de fichier analytique externe, pas un moteur de stockage transactionnel d'openGauss.",
+      "topic": "Moteurs de stockage"
+    },
+    {
+      "id": "hcia-og-01-q14",
+      "type": "tf",
+      "prompt": "In an openGauss HA cluster, a standby node accepts both read and write queries.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux. Le standby applique le WAL du primaire et reste en lecture seule. Les écritures doivent passer par le primaire, puis être répliquées ; sinon les nœuds divergeraient et la cohérence serait perdue.",
+      "topic": "Haute disponibilité"
+    },
+    {
+      "id": "hcia-og-01-q15",
+      "type": "tf",
+      "prompt": "openGauss serves each client session with a thread inside the main gaussdb process rather than with a dedicated process.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai. openGauss a adopté un modèle multi-thread : le processus gaussdb crée un thread de service par session. Cette conception réduit le coût des changements de contexte par rapport au modèle multi-processus de PostgreSQL.",
+      "topic": "Architecture"
+    },
+    {
+      "id": "hcia-og-01-q16",
+      "type": "tf",
+      "prompt": "GaussDB and openGauss are exactly the same product distributed under two names.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux. openGauss est le projet communautaire open source, tandis que GaussDB est l'offre commerciale de Huawei Cloud, avec support, services managés et fonctionnalités propres. Les confondre est l'un des pièges les plus fréquents du module.",
+      "topic": "Écosystème"
+    },
+    {
+      "id": "hcia-og-01-q17",
+      "type": "text",
+      "prompt": "Give the default TCP port number of an openGauss instance.",
+      "accept": [
+        "15400",
+        "port 15400",
+        "15400/tcp"
+      ],
+      "sample_answer": "15400",
+      "explanation_fr": "Le port d'écoute par défaut est 15400. Il se configure dans postgresql.conf via le paramètre port, et doit être ouvert dans le pare-feu pour les connexions distantes. Ne le confonds pas avec 5432, utilisé par PostgreSQL.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-og-01-q18",
+      "type": "text",
+      "prompt": "Which command-line client is used to connect interactively to openGauss?",
+      "accept": [
+        "gsql",
+        "gsql -r",
+        "gsql -d postgres -p 15400 -r"
+      ],
+      "sample_answer": "gsql",
+      "explanation_fr": "gsql est le client interactif officiel, compatible avec la syntaxe des méta-commandes de PostgreSQL. On l'utilise par exemple avec gsql -d postgres -p 15400 -r, où -r active l'historique de lecture. Data Studio est l'équivalent graphique, pas un client en ligne de commande.",
+      "topic": "Outils"
+    },
+    {
+      "id": "hcia-og-01-q19",
+      "type": "text",
+      "prompt": "Which configuration file decides which clients may connect and with which authentication method?",
+      "accept": [
+        "pg_hba.conf",
+        "pghba.conf",
+        "pg hba conf"
+      ],
+      "sample_answer": "pg_hba.conf",
+      "explanation_fr": "pg_hba.conf contient les règles d'authentification basées sur l'hôte : type de connexion, base, utilisateur, adresse source et méthode (trust, md5, sha256, sm3, cert). postgresql.conf contient les paramètres du serveur et pg_ident.conf les correspondances de noms, pas les règles d'accès.",
+      "topic": "Sécurité"
+    },
+    {
+      "id": "hcia-og-01-q20",
+      "type": "text",
+      "prompt": "Name the openGauss storage engine that updates rows in place and limits bloat.",
+      "accept": [
+        "ustore",
+        "u-store",
+        "UStore"
+      ],
+      "sample_answer": "Ustore",
+      "explanation_fr": "Ustore est le moteur en ligne à mise à jour sur place : il recycle les anciennes versions et réduit le gonflement des tables. Astore est le moteur en ligne historique à versions empilées, et CStore le moteur en colonnes réservé aux charges analytiques.",
+      "topic": "Moteurs de stockage"
+    }
+  ]
+}

@@ -1,0 +1,628 @@
+{
+  "id": "hcia-oe-02",
+  "phase": "HCIA",
+  "subject": "openEuler",
+  "number": 2,
+  "title_fr": "Ligne de commande, Vim et gestion des fichiers",
+  "title_en": "Command Line, Vim, and File Management",
+  "minutes": 50,
+  "source": "HCIA-openEuler V2.0 Training Material — Session «Basic Knowledge of Linux Commands» · Lab Guide (commandes et fichiers)",
+  "objectives": [
+    "Se repérer dans l'arborescence Linux et distinguer chemins absolus et relatifs",
+    "Créer, copier, déplacer, lier et supprimer fichiers et répertoires sans perte de données",
+    "Rechercher des fichiers et du contenu avec find, grep et les métacaractères",
+    "Éditer un fichier avec Vim en maîtrisant ses trois modes",
+    "Composer des tubes et des redirections pour filtrer et journaliser des sorties",
+    "Trouver rapidement l'aide et réutiliser l'historique du shell"
+  ],
+  "sections": [
+    {
+      "heading": "1. Le shell Bash et l'arborescence Linux",
+      "body": "Le shell est le programme qui reçoit tes commandes, les interprète et demande au noyau de les exécuter. Sous openEuler, le shell par défaut est Bash (Bourne Again Shell). Il affiche un prompt, lit une ligne, effectue les substitutions, puis lance la commande. Sans shell, il faudrait passer par des appels système pour chaque opération : le shell est donc l'interface de travail quotidienne de l'administrateur.\n\nLinux organise les fichiers dans une arborescence unique qui part de la racine /. Il n'existe pas de lecteur C: ou D: : un disque supplémentaire est monté sur un répertoire existant, par exemple /data. Cette convention évite les chemins dépendants du matériel.\n\nLa norme FHS (Filesystem Hierarchy Standard) fixe le rôle des répertoires principaux. /etc contient la configuration, /var les données variables comme les journaux, /home les répertoires personnels, /bin et /usr/bin les commandes, /sbin les commandes d'administration, /tmp les fichiers temporaires et /dev les fichiers de périphériques. Comprendre cette carte mentale permet de retrouver un fichier sans le chercher au hasard.",
+      "bullets": [
+        "Bash lit, interprète puis transmet les commandes au noyau",
+        "Une seule arborescence part de / ; les disques se montent sur des répertoires",
+        "/etc = configuration, /var = données variables, /home = utilisateurs",
+        "/bin et /usr/bin = commandes, /sbin = administration",
+        "/tmp = temporaires, /dev = périphériques"
+      ],
+      "code": [
+        "echo $SHELL      # shell de l'utilisateur courant",
+        "ls /             # contenu de la racine",
+        "ls -l /etc       # détail des fichiers de configuration"
+      ],
+      "table": {
+        "headers": [
+          "Répertoire",
+          "Contenu principal"
+        ],
+        "rows": [
+          [
+            "/etc",
+            "Fichiers de configuration statiques"
+          ],
+          [
+            "/var",
+            "Journaux, files d'attente, données variables"
+          ],
+          [
+            "/home",
+            "Répertoires personnels des utilisateurs"
+          ],
+          [
+            "/usr/bin",
+            "Commandes accessibles aux utilisateurs"
+          ],
+          [
+            "/sbin",
+            "Commandes d'administration système"
+          ],
+          [
+            "/tmp",
+            "Fichiers temporaires, effaçables"
+          ],
+          [
+            "/dev",
+            "Fichiers de périphériques"
+          ]
+        ]
+      },
+      "tip": "Ne confonds pas /etc (configuration) et /var (données qui changent). Un fichier de configuration modifié à la main va dans /etc ; un journal écrit par un service va dans /var/log."
+    },
+    {
+      "heading": "2. Se déplacer et explorer l'arborescence",
+      "body": "La commande pwd affiche le répertoire courant sous forme de chemin absolu. Un chemin absolu commence toujours par / et ne dépend pas de l'endroit où tu te trouves ; un chemin relatif part du répertoire courant. Cette distinction est une source classique d'erreurs dans les scripts, car un script lancé depuis un autre répertoire peut ne plus retrouver un fichier relatif.\n\ncd change de répertoire. cd sans argument ramène dans le répertoire personnel, cd - revient au répertoire précédent, cd .. remonte d'un niveau et cd /etc va à la racine de la configuration. Les symboles . et .. désignent respectivement le répertoire courant et son parent.\n\nls liste le contenu. L'option -l affiche les droits, le propriétaire, la taille et la date, -a inclut les fichiers cachés, -h rend les tailles lisibles et -R parcourt récursivement. L'option -d affiche le répertoire lui-même au lieu de son contenu, ce qui est utile pour vérifier ses droits. tree, souvent absent d'une installation minimale, donne une vue arborescente plus lisible.",
+      "bullets": [
+        "pwd donne le chemin absolu du répertoire courant",
+        "Un chemin absolu commence par / ; un chemin relatif part du répertoire courant",
+        "cd sans argument va dans ~, cd - revient au répertoire précédent",
+        "ls -l détaille, -a montre les fichiers cachés, -h rend les tailles lisibles",
+        "ls -d examine le répertoire lui-même"
+      ],
+      "code": [
+        "pwd",
+        "cd /var/log && pwd",
+        "ls -lah /var/log",
+        "cd -"
+      ],
+      "diagram": "/\n|-- etc/        configuration\n|-- var/        donnees variables\n|   `-- log/    journaux\n|-- home/\n|   `-- alice/  repertoire personnel\n|-- usr/bin/    commandes\n`-- tmp/        temporaires",
+      "tip": "Dans un script, utilise des chemins absolus ou calcule le répertoire du script. Un chemin relatif dépend du répertoire depuis lequel le script est lancé, pas de l'endroit où il est stocké."
+    },
+    {
+      "heading": "3. Créer, copier, déplacer, lier et supprimer",
+      "body": "touch crée un fichier vide ou met à jour sa date de modification. mkdir crée un répertoire ; -p crée les parents manquants et ne proteste pas si le répertoire existe déjà, ce qui rend la commande idempotente.\n\ncp copie un fichier ou un répertoire. Sans -r, un répertoire est refusé ; -r copie récursivement, -a préserve les droits, les propriétaires, les liens et les horodatages, ce qui en fait l'option de sauvegarde. mv déplace ou renomme : c'est la même opération, car le nom complet d'un fichier inclut son chemin. rm supprime définitivement : -i demande confirmation, -r autorise les répertoires, -f force sans confirmation. Il n'y a pas de corbeille en ligne de commande.\n\nLes liens permettent de partager un même contenu. Un lien dur pointe vers le même inode : les deux noms sont équivalents et le contenu survit à la suppression de l'un. Un lien symbolique est un petit fichier qui contient un chemin : si la cible disparaît, le lien devient cassé. ln -s crée un lien symbolique.",
+      "bullets": [
+        "mkdir -p crée toute l'arborescence et reste sans erreur si elle existe",
+        "cp -r copie un répertoire ; cp -a préserve droits et horodatages",
+        "mv déplace et renomme, c'est la même opération",
+        "rm -i demande confirmation, rm -rf supprime sans retour",
+        "Un lien dur partage l'inode ; un lien symbolique pointe vers un chemin"
+      ],
+      "code": [
+        "mkdir -p /data/app/logs",
+        "cp -a /etc/ssh /backup/ssh",
+        "mv rapport.txt /data/rapport-final.txt",
+        "ln -s /data/app/current /opt/app",
+        "rm -i ancien-fichier.txt"
+      ],
+      "table": {
+        "headers": [
+          "Opération",
+          "Commande",
+          "Point d'attention"
+        ],
+        "rows": [
+          [
+            "Créer une arborescence",
+            "mkdir -p",
+            "Idempotent"
+          ],
+          [
+            "Copier un répertoire",
+            "cp -r",
+            "Refuse un répertoire sans -r"
+          ],
+          [
+            "Copier en préservant",
+            "cp -a",
+            "Droits, liens, horodatages"
+          ],
+          [
+            "Déplacer ou renommer",
+            "mv",
+            "Écrase la cible sans demander"
+          ],
+          [
+            "Supprimer",
+            "rm -i / rm -rf",
+            "Aucune corbeille"
+          ],
+          [
+            "Lien symbolique",
+            "ln -s cible nom",
+            "Cassé si la cible disparaît"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Tu dois sauvegarder le répertoire /etc/nginx vers /backup en conservant permissions, propriétaires et dates. Quelle commande utilises-tu et pourquoi ?",
+          "correction": "La commande est cp -a /etc/nginx /backup/nginx. L'option -a (archive) implique la copie récursive et préserve les permissions, les propriétaires, les liens symboliques et les horodatages. Un simple cp -r copierait le contenu mais recréerait les fichiers avec les droits de l'utilisateur courant et l'heure de la copie, ce qui fausserait une restauration."
+        }
+      ],
+      "tip": "rm -rf est irréversible. Avant de valider, relis le chemin et vérifie que la variable n'est pas vide : rm -rf $DIR/ avec DIR vide peut viser la racine. Préfère rm -i pour les opérations manuelles."
+    },
+    {
+      "heading": "4. Rechercher avec les métacaractères, find et grep",
+      "body": "Les métacaractères permettent de désigner plusieurs fichiers en une seule expression. L'étoile * remplace une chaîne quelconque, y compris vide ; le point d'interrogation ? remplace exactement un caractère ; les crochets [abc] désignent un caractère parmi la liste. Le shell développe ces motifs avant de lancer la commande : c'est le globbing. Un motif sans correspondance reste littéral, ce qui explique certains messages d'erreur surprenants.\n\nfind parcourt une arborescence selon des critères. find /var/log -name «*.log» cherche par nom, -type f limite aux fichiers réguliers, -mtime +7 cible les fichiers modifiés il y a plus de sept jours et -size +100M les gros fichiers. L'action -delete supprime les résultats, à manier avec prudence.\n\ngrep cherche du texte dans des fichiers. -i ignore la casse, -n affiche le numéro de ligne, -r parcourt un répertoire et -v inverse la sélection. Pour de gros volumes, combine find et grep plutôt que de lancer grep sur tout le disque. wc -l compte les lignes, head et tail extraient le début ou la fin, et tail -f suit un fichier en temps réel.",
+      "bullets": [
+        "* remplace une chaîne, ? un caractère, [abc] un caractère parmi plusieurs",
+        "Le shell développe les motifs avant d'exécuter la commande (globbing)",
+        "find filtre par nom, type, date et taille",
+        "grep -i ignore la casse, -n numérote, -r parcourt un répertoire, -v inverse",
+        "tail -f suit un fichier en temps réel"
+      ],
+      "code": [
+        "find /var/log -type f -name '*.log' -mtime +7",
+        "grep -in 'error' /var/log/messages",
+        "grep -r 'Listen 80' /etc/httpd/",
+        "tail -f /var/log/messages"
+      ],
+      "table": {
+        "headers": [
+          "Besoin",
+          "Commande"
+        ],
+        "rows": [
+          [
+            "Fichiers .log de plus de 7 jours",
+            "find /var/log -name '*.log' -mtime +7"
+          ],
+          [
+            "Fichiers de plus de 100 Mo",
+            "find / -type f -size +100M"
+          ],
+          [
+            "Ligne contenant error, sans casse",
+            "grep -in error fichier"
+          ],
+          [
+            "Nombre de lignes",
+            "wc -l fichier"
+          ],
+          [
+            "Suivi temps réel",
+            "tail -f fichier"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Écris une commande qui trouve les fichiers .log de /var/log modifiés il y a plus de 30 jours, puis affiche leur nombre.",
+          "correction": "find /var/log -type f -name '*.log' -mtime +30 | wc -l. find sélectionne les fichiers réguliers dont le nom correspond au motif et dont la date de modification dépasse 30 jours ; le tube envoie chaque chemin à wc -l, qui compte les lignes. Pour supprimer ces fichiers, on ajouterait -delete, mais il faut d'abord contrôler la liste sans l'action de suppression."
+        }
+      ],
+      "tip": "Le motif *.log doit être protégé par des guillemets dans find : sinon le shell peut l'étendre avant que find ne le reçoive, et la recherche ne porte plus sur le bon motif."
+    },
+    {
+      "heading": "5. Vim : trois modes, des gestes précis",
+      "body": "Vim est un éditeur modal : le comportement des touches dépend du mode courant. En mode normal, les lettres sont des commandes ; en mode insertion, elles saisissent du texte ; en mode ligne de commande, elles exécutent des instructions commençant par deux-points. Cette conception surprend au début, mais elle explique sa rapidité : la main ne quitte pas le clavier.\n\nOn entre en mode insertion avec i (avant le curseur), a (après), o (nouvelle ligne en dessous) ou O (au-dessus). Échap ramène en mode normal. Depuis le mode normal, dd coupe une ligne, yy la copie, p colle après le curseur, u annule, Ctrl+r rétablit, /motif cherche et n passe à l'occurrence suivante.\n\nPour sauvegarder et quitter, :w écrit, :q quitte, :wq ou :x font les deux, et :q! quitte en abandonnant les modifications. :set nu affiche les numéros de ligne. En cas de crash, les fichiers de swap permettent de récupérer une session ; Vim affiche alors un message demandant de choisir entre récupération et suppression du swap.",
+      "bullets": [
+        "Trois modes : normal, insertion, ligne de commande",
+        "i, a, o, O entrent en insertion ; Échap revient en normal",
+        "dd coupe une ligne, yy copie, p colle, u annule",
+        ":wq ou :x enregistrent et quittent ; :q! abandonne",
+        "/motif cherche, n va à l'occurrence suivante"
+      ],
+      "code": [
+        "vim /etc/hosts",
+        ":set nu",
+        "/127.0.0.1",
+        ":wq"
+      ],
+      "diagram": "        i, a, o, O\nNORMAL ---------------> INSERTION\n   ^                        |\n   |        Echap           |\n   +------------------------+\n   |\n   |  :\n   v\nLIGNE DE COMMANDE   :w  :q  :wq  :q!  :set nu",
+      "tip": "Si tu es perdu dans Vim, appuie sur Échap, puis tape :q! pour quitter sans enregistrer. Ne ferme pas brutalement le terminal : un fichier de swap restera et Vim le signalera à la prochaine ouverture."
+    },
+    {
+      "heading": "6. Redirections, tubes et traitement de flux",
+      "body": "Chaque processus dispose de trois flux standard : l'entrée standard (stdin, descripteur 0), la sortie standard (stdout, 1) et la sortie d'erreur (stderr, 2). Par défaut, stdin vient du clavier, stdout et stderr vont au terminal. Les redirections changent cette destination sans modifier le programme.\n\n> écrit stdout dans un fichier en l'écrasant, >> l'ajoute à la fin. 2> redirige les erreurs, &> ou > fichier 2>&1 redirige les deux. < lit depuis un fichier. Attention à l'ordre : 2>&1 > fichier ne fait pas ce que l'on croit, car 2>&1 copie la destination courante de stdout avant que celle-ci ne soit changée.\n\nLe pipe | connecte la stdout d'une commande à la stdin de la suivante. Il permet de composer des traitements : ps -ef | grep sshd | grep -v grep, ou sort fichier | uniq -c | sort -nr pour compter et classer. tee écrit à l'écran et dans un fichier en même temps, utile pour conserver une trace tout en surveillant le résultat.",
+      "bullets": [
+        "stdin = 0, stdout = 1, stderr = 2",
+        "> écrase, >> ajoute, 2> redirige les erreurs",
+        "> fichier 2>&1 réunit stdout et stderr",
+        "| relie la sortie d'une commande à l'entrée de la suivante",
+        "tee affiche et enregistre simultanément"
+      ],
+      "code": [
+        "ls /etc > liste.txt",
+        "commande 2> erreurs.log",
+        "commande > sortie.log 2>&1",
+        "ps -ef | grep sshd | grep -v grep",
+        "sort acces.log | uniq -c | sort -nr | head"
+      ],
+      "table": {
+        "headers": [
+          "Opérateur",
+          "Effet"
+        ],
+        "rows": [
+          [
+            ">",
+            "Écrase le fichier avec stdout"
+          ],
+          [
+            ">>",
+            "Ajoute stdout à la fin du fichier"
+          ],
+          [
+            "2>",
+            "Redirige stderr"
+          ],
+          [
+            "2>&1",
+            "Envoie stderr vers la destination actuelle de stdout"
+          ],
+          [
+            "|",
+            "Tube : stdout vers stdin de la commande suivante"
+          ],
+          [
+            "tee",
+            "Écrit sur le terminal et dans un fichier"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Tu veux compter combien de lignes du journal /var/log/messages contiennent le mot « failed », tout en conservant le résultat filtré dans failed.log. Propose une commande.",
+          "correction": "grep -i failed /var/log/messages | tee failed.log | wc -l. grep filtre les lignes, tee les écrit dans failed.log tout en les transmettant au tube, et wc -l en compte le nombre. Sans tee, il faudrait lancer deux commandes ou rediriger puis relire le fichier."
+        }
+      ],
+      "tip": ">> ajoute, > écrase. Le piège d'examen est classique. Autre piège : 2>&1 > fichier envoie les erreurs à l'ancienne destination (le terminal) et seulement stdout dans le fichier. L'ordre correct est > fichier 2>&1."
+    },
+    {
+      "heading": "7. Trouver de l'aide et réutiliser l'historique",
+      "body": "Savoir trouver l'aide est une compétence plus durable que mémoriser des options. man affiche le manuel d'une commande, organisé en sections numérotées : 1 pour les commandes utilisateur, 5 pour les formats de fichiers, 8 pour l'administration. man 5 fstab lit donc la page qui décrit le format de /etc/fstab, et non la commande fstab.\n\nDans man, la barre d'espace avance d'une page, b recule, /motif cherche et q quitte. man -k mot-clé, équivalent à apropos, cherche dans les descriptions ; cette commande dépend de l'index mandb, qui doit être généré. La plupart des commandes acceptent --help pour un résumé rapide, et certaines disposent d'une documentation info plus détaillée.\n\nL'historique complète ce dispositif : history liste les commandes passées, !! répète la dernière, !n répète la commande numéro n et Ctrl+R lance une recherche interactive. Les fichiers de documentation des paquets se trouvent souvent dans /usr/share/doc/nom-du-paquet/.",
+      "bullets": [
+        "man 1 = commandes, man 5 = formats de fichiers, man 8 = administration",
+        "Espace avance, b recule, / cherche, q quitte",
+        "man -k ou apropos cherche par mot-clé",
+        "history, !! et !n réutilisent les commandes",
+        "Ctrl+R cherche dans l'historique de façon interactive"
+      ],
+      "code": [
+        "man 5 fstab",
+        "man -k password",
+        "ls --help",
+        "history | tail -20"
+      ],
+      "tip": "man fstab peut ouvrir la page de la commande ou celle du fichier selon l'installation. Pour être sûr de consulter le format du fichier, précise la section : man 5 fstab."
+    }
+  ],
+  "key_points": [
+    "Bash interprète les commandes ; l'arborescence Linux part d'une racine unique /",
+    "/etc contient la configuration et /var les données variables",
+    "Un chemin absolu commence par /, un chemin relatif dépend du répertoire courant",
+    "cp -a préserve droits et horodatages ; rm -rf est irréversible",
+    "Les métacaractères sont développés par le shell avant l'exécution",
+    "find filtre par nom, type, date et taille ; grep cherche du contenu",
+    "Vim possède trois modes : normal, insertion et ligne de commande",
+    "> écrase, >> ajoute, 2> redirige les erreurs et | relie deux commandes"
+  ],
+  "traps": [
+    "Confondre > (écrasement) et >> (ajout)",
+    "Oublier -r ou -a lors de la copie d'un répertoire",
+    "Croire qu'un lien symbolique survit à la suppression de sa cible",
+    "Utiliser un chemin relatif dans un script sans contrôler le répertoire d'exécution",
+    "Chercher le format de /etc/fstab avec man 1 au lieu de man 5"
+  ],
+  "quiz": [
+    {
+      "id": "hcia-oe-02-q01",
+      "type": "single",
+      "prompt": "In openEuler, which statement about the command prompt is correct?",
+      "options": [
+        "# marks the prompt of the root user, and $ marks an ordinary user",
+        "$ marks the prompt of the root user, and # marks an ordinary user",
+        "All users have the same prompt",
+        "The prompt has no relationship with privileges"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le shell affiche # au root et $ aux utilisateurs ordinaires : c'est l'indicateur visuel du niveau de privilège. Les autres propositions inversent les symboles ou nient ce lien, alors que le prompt reflète bien l'identité effective.",
+      "topic": "Shell prompt"
+    },
+    {
+      "id": "hcia-oe-02-q02",
+      "type": "single",
+      "prompt": "Which directory stores most of the system configuration files in Linux?",
+      "options": [
+        "/var",
+        "/etc",
+        "/home",
+        "/bin"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "/etc est l'espace des fichiers de configuration : hosts, fstab, sshd_config, selinux, unités systemd. /var contient les données variables comme les journaux, /home les répertoires personnels et /bin des commandes, pas la configuration.",
+      "topic": "Filesystem hierarchy"
+    },
+    {
+      "id": "hcia-oe-02-q03",
+      "type": "single",
+      "prompt": "In Vim, which command saves the file and exits?",
+      "options": [
+        "Esc then Ctrl+S",
+        ":q!",
+        ":wq",
+        ":w"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": ":wq écrit le fichier puis quitte Vim. :q! quitte sans enregistrer, :w enregistre mais reste dans l'éditeur, et Ctrl+S n'est pas la commande de sauvegarde de Vim en mode terminal.",
+      "topic": "Vim"
+    },
+    {
+      "id": "hcia-oe-02-q04",
+      "type": "multi",
+      "prompt": "Which commands create a directory tree, copy recursively and remove a directory recursively? (Choose three.)",
+      "options": [
+        "touch -d",
+        "mkdir -p",
+        "cp -r",
+        "rm -r"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "mkdir -p crée les parents manquants, cp -r copie un répertoire avec son contenu et rm -r supprime récursivement. touch -d sert à fixer une date sur un fichier ; cette commande ne crée pas d'arborescence et ne copie rien.",
+      "topic": "File operations"
+    },
+    {
+      "id": "hcia-oe-02-q05",
+      "type": "multi",
+      "prompt": "Which wildcards are supported by the Bash shell? (Choose two.)",
+      "options": [
+        "*",
+        "?",
+        "#",
+        "@@"
+      ],
+      "answer": [
+        0,
+        1
+      ],
+      "explanation_fr": "* remplace une chaîne quelconque, y compris vide, et ? remplace exactement un caractère. # introduit un commentaire en début de mot et @@ n'est pas un métacaractère standard du shell.",
+      "topic": "Wildcards"
+    },
+    {
+      "id": "hcia-oe-02-q06",
+      "type": "tf",
+      "prompt": "In Vim, the Esc key returns from insert mode to command mode.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : Échap quitte le mode insertion et revient en mode normal, d'où l'on peut de nouveau utiliser les commandes de déplacement et d'édition. C'est le réflexe à acquérir avant de taper :wq.",
+      "topic": "Vim"
+    },
+    {
+      "id": "hcia-oe-02-q07",
+      "type": "tf",
+      "prompt": "The redirect operator >> overwrites the target file.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : >> ajoute à la fin du fichier sans effacer son contenu. C'est l'opérateur > seul qui écrase le fichier cible. Les deux se confondent souvent dans les pièges d'examen.",
+      "topic": "Redirection"
+    },
+    {
+      "id": "hcia-oe-02-q08",
+      "type": "text",
+      "prompt": "Which single command displays the current working directory? (one word)",
+      "accept": [
+        "pwd",
+        "pwd."
+      ],
+      "sample_answer": "pwd",
+      "explanation_fr": "pwd (print working directory) affiche le chemin absolu du répertoire courant. ls liste son contenu et cd le change : seule pwd répond exactement à la question « où suis-je ? ».",
+      "topic": "Navigation"
+    },
+    {
+      "id": "hcia-oe-02-q09",
+      "type": "text",
+      "prompt": "Which command follows the content of a log file in real time as lines are appended? (Give the command with its option.)",
+      "accept": [
+        "tail -f",
+        "tail -f /var/log/messages",
+        "tail -f messages"
+      ],
+      "sample_answer": "tail -f /var/log/messages",
+      "explanation_fr": "tail -f suit un fichier en continu et affiche les nouvelles lignes dès qu'elles sont ajoutées. head lit le début, cat affiche tout puis rend la main, et less permet de parcourir mais pas de suivre en direct.",
+      "topic": "Log monitoring"
+    },
+    {
+      "id": "hcia-oe-02-q10",
+      "type": "single",
+      "prompt": "Which pipeline counts the number of running sshd processes?",
+      "options": [
+        "ps -ef > wc -l",
+        "grep sshd -l ps",
+        "wc -l sshd",
+        "ps -ef | grep sshd | wc -l"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "ps liste les processus, grep filtre les lignes contenant sshd et wc -l compte les lignes obtenues. > redirige vers un fichier au lieu d'alimenter une commande, et les deux dernières propositions n'ont pas la syntaxe d'un tube valide. Pour un compte exact, on ajoute | grep -v grep afin d'exclure la ligne de la commande grep elle-même.",
+      "topic": "Pipes"
+    },
+    {
+      "id": "hcia-oe-02-q11",
+      "type": "single",
+      "prompt": "Which path is absolute?",
+      "options": [
+        "/etc/ssh/sshd_config",
+        "../backup",
+        "var/log/messages",
+        "./scripts/run.sh"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Un chemin absolu commence par / et décrit une position depuis la racine, comme /etc/ssh/sshd_config. Les trois autres partent du répertoire courant et changent de sens selon l'endroit d'où la commande est lancée.",
+      "topic": "Paths"
+    },
+    {
+      "id": "hcia-oe-02-q12",
+      "type": "single",
+      "prompt": "Which cd command returns to the previous working directory?",
+      "options": [
+        "cd ..",
+        "cd -",
+        "cd ~",
+        "cd /"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "cd - revient au répertoire précédent et l'affiche. cd .. remonte d'un niveau dans l'arborescence, cd ~ va dans le répertoire personnel et cd / va à la racine : aucune de ces trois commandes ne mémorise le répertoire d'où l'on vient.",
+      "topic": "Navigation"
+    },
+    {
+      "id": "hcia-oe-02-q13",
+      "type": "single",
+      "prompt": "Which cp option copies a directory recursively while preserving permissions, ownership and timestamps?",
+      "options": [
+        "cp -n",
+        "cp -i",
+        "cp -a",
+        "cp -f"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "cp -a copie en mode archive : récursif, avec conservation des droits, des propriétaires, des liens et des horodatages. -i demande confirmation avant écrasement, -f force l'écrasement et -n empêche l'écrasement, mais aucune de ces options ne préserve les attributs.",
+      "topic": "File operations"
+    },
+    {
+      "id": "hcia-oe-02-q14",
+      "type": "multi",
+      "prompt": "Which commands can display the contents of a text file? (Choose three.)",
+      "options": [
+        "cat",
+        "less",
+        "head",
+        "mkdir"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "cat affiche tout le fichier, less permet de le parcourir page par page et head affiche son début. mkdir crée un répertoire : elle ne lit ni n'affiche aucun contenu de fichier.",
+      "topic": "File viewing"
+    },
+    {
+      "id": "hcia-oe-02-q15",
+      "type": "tf",
+      "prompt": "The command rm -rf /tmp/build deletes the directory and its content without asking for confirmation.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : -r autorise la suppression récursive et -f supprime les demandes de confirmation. La suppression est immédiate et il n'existe pas de corbeille en ligne de commande, d'où la nécessité de vérifier le chemin avant de valider.",
+      "topic": "File operations"
+    },
+    {
+      "id": "hcia-oe-02-q16",
+      "type": "text",
+      "prompt": "Which command creates an empty file named report.txt if it does not exist? (Give the full command.)",
+      "accept": [
+        "touch report.txt",
+        "touch ./report.txt",
+        "> report.txt"
+      ],
+      "sample_answer": "touch report.txt",
+      "explanation_fr": "touch crée un fichier vide s'il n'existe pas et met à jour sa date de modification s'il existe. mkdir créerait un répertoire et cat sans redirection attendrait une saisie au clavier.",
+      "topic": "File operations"
+    },
+    {
+      "id": "hcia-oe-02-q17",
+      "type": "text",
+      "prompt": "Which Vim command displays line numbers? (Give the ex command.)",
+      "accept": [
+        ":set nu",
+        ":set number",
+        "set nu",
+        "set number"
+      ],
+      "sample_answer": ":set nu",
+      "explanation_fr": ":set nu active l'affichage des numéros de ligne. :set nonu les désactive. Cette commande s'exécute depuis le mode ligne de commande, atteint en appuyant d'abord sur Échap.",
+      "topic": "Vim"
+    },
+    {
+      "id": "hcia-oe-02-q18",
+      "type": "single",
+      "prompt": "In grep, what does the -n option display?",
+      "options": [
+        "Only file names",
+        "The number of matches",
+        "The lines that do not match",
+        "Line numbers"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "grep -n préfixe chaque ligne trouvée par son numéro dans le fichier. -l affiche seulement les noms de fichiers, -c compte les correspondances et -v affiche les lignes qui ne correspondent pas.",
+      "topic": "grep"
+    },
+    {
+      "id": "hcia-oe-02-q19",
+      "type": "single",
+      "prompt": "What happens to a symbolic link when its target file is deleted?",
+      "options": [
+        "The link becomes broken and points to a nonexistent path",
+        "The link is automatically converted into a hard link",
+        "The target file is recreated automatically",
+        "The link still gives access to the content through the inode"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Un lien symbolique contient un chemin, pas le contenu : si la cible disparaît, le lien devient cassé. Un lien dur, lui, partage l'inode et conserve le contenu tant qu'un autre nom existe. Un lien n'est jamais converti automatiquement et ne recrée pas sa cible.",
+      "topic": "Links"
+    },
+    {
+      "id": "hcia-oe-02-q20",
+      "type": "single",
+      "prompt": "Which command searches the manual page descriptions for a keyword?",
+      "options": [
+        "cat keyword",
+        "man -k keyword",
+        "man 5 keyword",
+        "history keyword"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "man -k, équivalent à apropos, cherche dans les descriptions des pages de manuel et affiche les pages correspondantes. man 5 ouvre la section des formats de fichiers pour un nom précis, history affiche l'historique et cat tente de lire un fichier nommé keyword.",
+      "topic": "Help"
+    }
+  ]
+}

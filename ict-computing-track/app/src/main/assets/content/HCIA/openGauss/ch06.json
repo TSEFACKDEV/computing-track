@@ -1,0 +1,551 @@
+{
+  "id": "hcia-og-06",
+  "phase": "HCIA",
+  "subject": "openGauss",
+  "number": 6,
+  "title_fr": "Sauvegarde, restauration et dépannage",
+  "title_en": "Backup, Restore and Troubleshooting",
+  "minutes": 50,
+  "source": "HCIA-openGauss V2.0 Training Material — Session 6 «GaussDB» · Lab Guide (sauvegarde et restauration)",
+  "objectives": [
+    "Distinguer sauvegarde logique et sauvegarde physique, et choisir selon RPO/RTO",
+    "Réaliser et restaurer un dump avec gs_dump, gs_dumpall et gs_restore",
+    "Comprendre WAL, checkpoints, archivage et restauration à un instant précis",
+    "Diagnostiquer une instance avec les journaux, les vues de session et les verrous",
+    "Exploiter un cluster en haute disponibilité : switchover, failover, reconstruction"
+  ],
+  "sections": [
+    {
+      "heading": "1. Stratégies de sauvegarde et objectifs RPO/RTO",
+      "body": "Une sauvegarde n'a de valeur que si l'on sait ce qu'elle permet de retrouver et en combien de temps. Le RPO (Recovery Point Objective) est la quantité maximale de données que l'on accepte de perdre, exprimée en temps : un RPO de quinze minutes signifie qu'une panne ne doit pas faire perdre plus d'un quart d'heure de transactions. Le RTO (Recovery Time Objective) est la durée maximale d'indisponibilité tolérée.\n\nDeux familles répondent à ces besoins. La sauvegarde logique exporte des instructions SQL ou un format intermédiaire : elle est portable entre versions et permet de restaurer une table précise, mais elle est lente sur de gros volumes et ne permet pas, à elle seule, une restauration à la seconde. La sauvegarde physique copie les fichiers de données et le WAL : elle est rapide à restaurer et permet le PITR, mais elle est liée à la version et à l'architecture.\n\nUne stratégie réaliste combine les deux : une sauvegarde physique complète hebdomadaire, des incréments quotidiens, l'archivage continu du WAL pour le PITR, et un dump logique périodique pour l'archivage à long terme ou la migration. La sauvegarde doit être stockée sur un support distinct du disque de données, et surtout testée : une restauration jamais essayée est une hypothèse, pas une garantie.",
+      "bullets": [
+        "RPO = perte de données maximale acceptée ; RTO = durée d'indisponibilité maximale",
+        "Logique : portable, granulaire, lente sur gros volumes",
+        "Physique : rapide, adaptée au PITR, liée à la version",
+        "Stocker hors du disque de données et tester la restauration"
+      ],
+      "code": [],
+      "table": {
+        "headers": [
+          "Critère",
+          "Sauvegarde logique",
+          "Sauvegarde physique"
+        ],
+        "rows": [
+          [
+            "Contenu",
+            "SQL ou archive d'objets",
+            "Fichiers de données + WAL"
+          ],
+          [
+            "Portabilité",
+            "Bonne entre versions",
+            "Limitée à la version et à l'architecture"
+          ],
+          [
+            "Granularité",
+            "Base, schéma, table",
+            "Instance ou tablespace"
+          ],
+          [
+            "PITR",
+            "Non",
+            "Oui, avec WAL archivé"
+          ],
+          [
+            "Restauration",
+            "Plus lente, rejouable",
+            "Rapide, cohérente"
+          ]
+        ]
+      },
+      "tip": "Ne confonds pas RPO et RTO : le RPO parle de données perdues, le RTO de temps d'arrêt. Une sauvegarde toutes les heures donne un RPO d'une heure, pas un RTO d'une heure."
+    },
+    {
+      "heading": "2. Sauvegarde logique : gs_dump, gs_dumpall et gs_restore",
+      "body": "gs_dump exporte une base. Le format plain (-F p) produit un fichier SQL lisible, rejouable avec gsql. Le format custom (-F c) produit une archive compressée, restaurable avec gs_restore et parallélisable. Le format directory (-F d) crée un répertoire de fichiers, également parallélisable, et le format tar (-F t) produit une archive unique. Le choix dépend de l'usage : lisibilité pour un petit dump, custom pour une grosse base à restaurer vite.\n\nLes options de filtrage sont précieuses : -t table pour une table précise, -n schéma pour un schéma, -s pour la structure seule, -a pour les données seules. gs_dumpall, lui, exporte toutes les bases ainsi que les objets globaux comme les rôles et les tablespaces. Il est indispensable pour une migration complète, car gs_dump ne sauvegarde pas les rôles du cluster.\n\nLa restauration d'un dump custom se fait avec gs_restore -d base fichier, avec -j n pour paralléliser et -t ou -n pour restaurer un sous-ensemble. Un dump plain se rejoue avec gsql -d base -f fichier. Avant toute restauration, vérifier que la base cible existe, que l'utilisateur possède les droits nécessaires et que l'archive n'est pas corrompue.",
+      "bullets": [
+        "Formats : plain (SQL), custom (compressé), directory, tar",
+        "Filtres : -t table, -n schéma, -s structure, -a données",
+        "gs_dumpall inclut les bases et les objets globaux comme les rôles",
+        "gs_restore -j n parallélise ; gsql rejoue un dump plain"
+      ],
+      "code": [
+        "gs_dump -d sales -F c -f /backup/sales.dump",
+        "gs_dump -d sales -F p -f /backup/sales.sql",
+        "gs_dump -d sales -n app -t orders -s -f /backup/orders_schema.sql",
+        "gs_dumpall -f /backup/all.sql",
+        "gs_restore -d sales_new -j 4 /backup/sales.dump"
+      ],
+      "exercises": [
+        {
+          "prompt": "Tu dois migrer la base sales vers un autre serveur en conservant les rôles et les tablespaces. Quel enchaînement de commandes proposes-tu ?",
+          "correction": "Utiliser gs_dumpall pour capturer les bases et les objets globaux, ou combiner gs_dumpall -s pour les rôles et gs_dump -F c pour chaque base. Créer les tablespaces sur la cible avec les mêmes chemins ou des chemins adaptés, puis restaurer. Avec un dump custom, gs_restore -d sales_new -j 4 permet de paralléliser. Il faut vérifier les propriétaires, les privilèges et les extensions avant de basculer l'application."
+        }
+      ],
+      "tip": "gs_dump ne sauvegarde pas les rôles : ils appartiennent au cluster, pas à la base. Pour une migration complète, gs_dumpall ou une sauvegarde séparée des rôles est nécessaire."
+    },
+    {
+      "heading": "3. Sauvegarde physique : gs_basebackup et gs_probackup",
+      "body": "La sauvegarde physique copie le répertoire de données dans un état cohérent, généralement après un checkpoint, et inclut les journaux nécessaires à la récupération. gs_basebackup réalise une copie complète : gs_basebackup -D /backup/base -h 192.168.1.10 -p 15400 -U omm. Le répertoire cible doit être vide et appartenir au compte omm. Cette copie sert aussi à initialiser un standby.\n\ngs_probackup ajoute la gestion du catalogue de sauvegardes, les sauvegardes incrémentales, la validation et la rétention. On initialise un dépôt avec gs_probackup init -B /backup, on déclare une instance avec add-instance, puis on lance backup -b FULL ou une sauvegarde incrémentale. La restauration sélective avec restore permet de revenir à une sauvegarde donnée, éventuellement dans un répertoire différent.\n\nPourquoi préférer l'incrémental ? Une base de plusieurs téraoctets ne peut pas être copiée intégralement chaque nuit sans saturer le réseau et le stockage. L'incrémental ne copie que les pages modifiées depuis la dernière sauvegarde, ce qui réduit la fenêtre de sauvegarde. En contrepartie, la chaîne de dépendances doit être conservée : perdre un incrément intermédiaire rend les suivants inutilisables.",
+      "bullets": [
+        "gs_basebackup : copie physique complète, aussi utilisée pour créer un standby",
+        "Répertoire cible vide et propriétaire omm",
+        "gs_probackup : catalogue, incréments, validation, rétention",
+        "Conserver toute la chaîne d'incréments, sinon la restauration échoue"
+      ],
+      "code": [
+        "gs_basebackup -D /backup/base -h 192.168.1.10 -p 15400 -U omm",
+        "gs_probackup init -B /backup",
+        "gs_probackup add-instance -B /backup -D /data/openGauss/db1 --instance=main",
+        "gs_probackup backup -B /backup --instance=main -b FULL",
+        "gs_probackup restore -B /backup --instance=main -i <backup_id>"
+      ],
+      "diagram": "Dimanche      Lundi        Mardi        Mercredi\n FULL  ----->  INC1  ----->  INC2  ----->  INC3\n   \\             |             |             |\n    +------------+-------------+-------------+\n          chaine necessaire pour restaurer Mercredi\n\nPerte de INC2  ->  INC3 inutilisable",
+      "tip": "Une sauvegarde physique n'est pas un simple copier-coller du répertoire : une copie à chaud sans mécanisme cohérent produit des fichiers inutilisables. Utilise gs_basebackup ou gs_probackup."
+    },
+    {
+      "heading": "4. WAL, checkpoints et restauration à un instant précis",
+      "body": "Le WAL (Write-Ahead Log) enregistre chaque modification avant que les pages de données ne soient écrites sur disque. Cette règle garantit la durabilité : après une coupure, le serveur relit le WAL et rejoue ce qui n'a pas encore été appliqué aux fichiers de données. Le WAL se trouve dans le répertoire pg_xlog, hérité de PostgreSQL 9.2, et se compose de segments qui tournent au fur et à mesure.\n\nUn checkpoint force l'écriture des pages modifiées et note un point de reprise dans le WAL. Plus les checkpoints sont fréquents, plus la reprise après crash est rapide, mais plus les entrées/sorties sont nombreuses. Le paramètre checkpoint_timeout règle leur périodicité. L'archivage continu, activé par archive_mode et archive_command, copie chaque segment complété vers un répertoire d'archive. Sans archive, on peut restaurer une sauvegarde physique à son instant initial, mais pas revenir à un instant intermédiaire.\n\nLe PITR combine trois éléments : une sauvegarde de base, les segments WAL archivés et une cible de récupération. On restaure la base, on configure recovery_target_time ou un point de restauration créé par pg_create_restore_point, puis on démarre : le serveur rejoue le WAL jusqu'à la cible. C'est la procédure qui permet d'annuler une suppression accidentelle survenue à 14 h 32 en restaurant l'état de 14 h 31.",
+      "bullets": [
+        "WAL écrit avant les pages : durabilité et rejeu après crash",
+        "Checkpoint : point de reprise, fréquence pilotée par checkpoint_timeout",
+        "archive_mode + archive_command : archivage continu des segments",
+        "PITR = sauvegarde de base + WAL archivé + recovery_target_time"
+      ],
+      "code": [
+        "# postgresql.conf",
+        "wal_level = hot_standby",
+        "archive_mode = on",
+        "archive_command = 'cp %p /backup/wal/%f'",
+        "checkpoint_timeout = 15min",
+        "SELECT pg_create_restore_point('avant_migration');"
+      ],
+      "diagram": "10:00        14:00        14:31   14:32        15:00\n  |            |            |       |            |\nbackup ----- WAL archive ---- cible   incident     maintenant\n                                  ^\n                     PITR : rejouer jusqu'a 14:31\n                     puis s'arreter avant la suppression",
+      "exercises": [
+        {
+          "prompt": "Une table a été vidée par erreur à 14 h 32. La sauvegarde complète date de 2 h du matin et l'archivage WAL est actif. Décris la restauration.",
+          "correction": "Restaurer la sauvegarde physique de 2 h dans un répertoire de données, puis configurer la récupération avec restore_command pointant vers l'archive WAL et recovery_target_time = 14 h 31. Démarrer l'instance : elle rejoue le WAL jusqu'à la cible et s'arrête avant la suppression. Vérifier les données, puis rouvrir l'application. Il est prudent de restaurer sur une instance isolée pour contrôler le contenu avant de basculer la production."
+        }
+      ],
+      "tip": "Sans archivage WAL, une sauvegarde physique ne permet pas le PITR. Elle restaure uniquement l'état du moment de la copie, pas un instant intermédiaire."
+    },
+    {
+      "heading": "5. Surveiller : journaux, sessions et verrous",
+      "body": "Le premier réflexe face à un incident est de lire les journaux. openGauss écrit dans le répertoire de données et dans $GAUSSLOG/pg_log. On y trouve les erreurs de démarrage, les échecs d'authentification, les erreurs SQL, les messages de checkpoint et de réplication. Un message de « too many connections » n'a pas la même cause qu'un « could not extend file » ou qu'un « requested WAL segment has already been removed ».\n\npg_stat_activity montre les sessions : PID, utilisateur, base, état, durée depuis le début de la requête et texte SQL. Les états actifs, idle et idle in transaction n'ont pas la même signification. Une session idle in transaction depuis une heure retient des verrous et empêche le vacuum de progresser ; il faut la repérer et la terminer. pg_locks expose les verrous accordés et en attente, et permet d'identifier un blocage en chaîne.\n\nPour agir, pg_cancel_backend(pid) annule la requête en cours sans tuer la session, tandis que pg_terminate_backend(pid) ferme la connexion. La seconde est plus brutale : elle provoque un rollback et force le client à se reconnecter. Toujours identifier le PID et la requête avant d'agir, car terminer le mauvais backend peut interrompre un batch critique.",
+      "bullets": [
+        "Journaux dans le datadir et $GAUSSLOG/pg_log",
+        "pg_stat_activity : état, durée, requête, utilisateur, base",
+        "idle in transaction retient des verrous et gêne le vacuum",
+        "pg_locks pour les blocages ; pg_cancel_backend vs pg_terminate_backend"
+      ],
+      "code": [
+        "SELECT pid, usename, state, now() - query_start AS duration, query FROM pg_stat_activity WHERE state <> 'idle' ORDER BY duration DESC;",
+        "SELECT pid, pg_cancel_backend(pid) FROM pg_stat_activity WHERE state = 'idle in transaction' AND query_start < now() - interval '30 minutes';",
+        "SELECT locktype, relation, mode, granted, pid FROM pg_locks WHERE NOT granted;",
+        "gs_om -t status --detail"
+      ],
+      "table": {
+        "headers": [
+          "Symptôme",
+          "Vue ou outil",
+          "Action"
+        ],
+        "rows": [
+          [
+            "Requête longue",
+            "pg_stat_activity",
+            "Analyser puis annuler si nécessaire"
+          ],
+          [
+            "Blocage",
+            "pg_locks",
+            "Identifier le détenteur et libérer"
+          ],
+          [
+            "Réplication en retard",
+            "pg_stat_replication",
+            "Vérifier réseau, CPU et WAL"
+          ],
+          [
+            "Disque plein",
+            "df -h, tailles pg_*",
+            "Purger archives et logs, étendre"
+          ]
+        ]
+      },
+      "tip": "pg_cancel_backend annule la requête mais laisse la connexion ouverte ; pg_terminate_backend ferme la session. Pour un idle in transaction, le second est généralement nécessaire."
+    },
+    {
+      "heading": "6. Pannes courantes et méthode de diagnostic",
+      "body": "Les incidents se ressemblent mais leurs causes diffèrent. Un serveur qui ne démarre pas peut avoir un port occupé, des permissions incorrectes sur le répertoire de données, un fichier de configuration invalide ou un WAL manquant. Un client qui ne se connecte pas peut être bloqué par le pare-feu, par listen_addresses ou par pg_hba.conf. Un ralentissement soudain peut venir d'un verrou, d'un checkpoint trop agressif, d'un disque saturé ou de statistiques obsolètes.\n\nLa méthode est toujours la même : constater, localiser, corriger, vérifier. Constater avec gs_om -t status --detail et gs_ctl status. Localiser avec les journaux, pg_stat_activity, pg_locks et l'espace disque. Corriger de la manière la moins invasive possible. Vérifier que le service est réellement revenu à la normale, avec des tests applicatifs et une surveillance sur plusieurs minutes.\n\nQuelques règles précieuses : ne jamais supprimer un fichier du répertoire de données pour « faire de la place » sans savoir à quoi il sert ; ne pas utiliser pg_resetwal sauf en dernier recours, car il peut entraîner une perte de données ; et ne pas redémarrer en boucle sans lire le journal, car chaque tentative peut aggraver l'état des fichiers. Un disque plein sur pg_xlog bloque toutes les écritures, car le WAL ne peut plus être écrit.",
+      "bullets": [
+        "Méthode : constater, localiser, corriger, vérifier",
+        "Démarrage : port, permissions, configuration, WAL",
+        "Connexion : pare-feu, listen_addresses, pg_hba.conf",
+        "Disque plein sur pg_xlog = écritures bloquées",
+        "pg_resetwal en dernier recours seulement"
+      ],
+      "code": [
+        "gs_ctl status -D /data/openGauss/db1",
+        "tail -n 100 $GAUSSLOG/pg_log/postgresql-*.log",
+        "df -h /data",
+        "du -sh /data/openGauss/db1/pg_xlog",
+        "gs_check -i CheckSpace,CheckCPU -h 192.168.1.10 -U omm"
+      ],
+      "exercises": [
+        {
+          "prompt": "L'application reçoit des timeouts. gs_ctl status indique running, mais les INSERT ne progressent plus. Cite trois causes à vérifier en priorité et les commandes associées.",
+          "correction": "Vérifier d'abord les verrous avec pg_locks et pg_stat_activity : une transaction idle in transaction peut bloquer les autres. Vérifier ensuite l'espace disque avec df -h et la taille de pg_xlog : un disque plein bloque l'écriture du WAL, donc toutes les validations. Vérifier enfin la réplication si synchronous_commit attend un standby : un standby en retard ou déconnecté peut ralentir le primaire. Les journaux du datadir et de $GAUSSLOG confirment généralement la cause."
+        }
+      ],
+      "tip": "Un service « running » n'est pas un service « sain ». Il faut aussi vérifier les verrous, l'espace disque, la réplication et le temps de réponse applicatif."
+    },
+    {
+      "heading": "7. Haute disponibilité : switchover, failover et reconstruction",
+      "body": "En cluster, les opérations de maintenance doivent préserver le service. Le switchover est une bascule planifiée : on vérifie que le standby est à jour, on promeut le standby et on transforme l'ancien primaire en standby. Il ne devrait entraîner aucune perte de données et s'utilise avant une intervention sur le serveur primaire. Le failover, lui, est une promotion d'urgence après une panne : en réplication asynchrone, les dernières transactions non répliquées peuvent être perdues.\n\nAprès une bascule, l'ancien primaire doit souvent être reconstruit avant de rejoindre le cluster. gs_ctl build -D datadir réinitialise le répertoire à partir du nouveau primaire, en mode full ou incrémental selon l'écart. Sans cette étape, le nœud peut être incohérent et refuser de redémarrer, ou pire, provoquer un double primaire si les mécanismes de quorum ne le bloquent pas.\n\nLa supervision est continue : pg_stat_replication indique l'état des expéditeurs WAL, les positions et le retard ; gs_om -t status --detail donne la vue du cluster. Le CM et DCF apportent l'arbitrage automatique et le quorum. Une bascule non testée est un risque : il faut répéter le scénario en environnement de recette, mesurer le RTO réel et documenter la procédure.",
+      "bullets": [
+        "Switchover : planifié, sans perte attendue ; failover : urgence, perte possible",
+        "gs_ctl build reconstruit un nœud à partir du primaire",
+        "pg_stat_replication : état, positions et retard des standby",
+        "CM et DCF : arbitrage, quorum, prévention du double primaire"
+      ],
+      "code": [
+        "gs_ctl switchover -D /data/openGauss/primary",
+        "gs_ctl failover -D /data/openGauss/standby",
+        "gs_ctl build -D /data/openGauss/standby -b full",
+        "SELECT application_name, state, sync_state FROM pg_stat_replication;"
+      ],
+      "diagram": "Avant switchover          Apres switchover\n\n  P (RW)                    P' (RW)\n    |  sync                   |  sync\n  S (RO)                    S' (RO, ex-primaire)\n\n1. verifier le retard = 0\n2. promouvoir S\n3. reconstruire l'ancien P si necessaire",
+      "tip": "Un failover en réplication asynchrone peut perdre les transactions non encore reçues par le standby. C'est précisément la différence avec un switchover planifié, qui attend que le standby soit à jour."
+    }
+  ],
+  "key_points": [
+    "RPO mesure la perte de données acceptable, RTO la durée d'indisponibilité acceptable.",
+    "gs_dump exporte une base ; gs_dumpall ajoute les bases et les objets globaux comme les rôles.",
+    "Les formats custom et directory se restaurent avec gs_restore, parallélisable par -j.",
+    "gs_basebackup copie l'instance ; gs_probackup gère les incréments et le catalogue.",
+    "Le WAL est écrit avant les pages ; l'archivage continu permet le PITR.",
+    "pg_stat_activity, pg_locks et les journaux sont les outils de diagnostic de base.",
+    "Switchover est planifié, failover est d'urgence ; un nœud reconstruit passe par gs_ctl build."
+  ],
+  "traps": [
+    "Sans archivage WAL, aucune restauration à un instant précis n'est possible.",
+    "Un disque plein sur pg_xlog bloque toutes les écritures, pas seulement les sauvegardes.",
+    "gs_dump ne sauvegarde pas les rôles : ils sont globaux au cluster.",
+    "Un failover asynchrone peut perdre des transactions, contrairement à un switchover planifié.",
+    "pg_cancel_backend annule une requête ; pg_terminate_backend ferme la session."
+  ],
+  "quiz": [
+    {
+      "id": "hcia-og-06-q01",
+      "type": "single",
+      "prompt": "Which tool performs a logical backup of a single openGauss database?",
+      "options": [
+        "gs_dump",
+        "gs_basebackup",
+        "gs_probackup",
+        "gs_ctl"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "gs_dump produit un export logique, en SQL ou dans un format d'archive, d'une base donnée. gs_basebackup et gs_probackup réalisent des sauvegardes physiques, et gs_ctl contrôle le démarrage et l'arrêt de l'instance. Seul gs_dump permet de filtrer par schéma ou par table dans un export logique.",
+      "topic": "Sauvegarde logique"
+    },
+    {
+      "id": "hcia-og-06-q02",
+      "type": "single",
+      "prompt": "Which tool restores a custom-format dump file?",
+      "options": [
+        "pg_resetwal",
+        "gs_restore",
+        "gsql",
+        "gs_ctl reload"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "gs_restore lit les archives custom ou directory et permet de paralléliser avec -j. gsql rejoue un dump au format plain, pas une archive custom. gs_ctl reload recharge la configuration et pg_resetwal est un outil de réparation du WAL, sans rapport avec une restauration logique.",
+      "topic": "Restauration"
+    },
+    {
+      "id": "hcia-og-06-q03",
+      "type": "single",
+      "prompt": "Which is the minimum wal_level setting that lets a standby replay WAL and serve read-only queries?",
+      "options": [
+        "minimal",
+        "archive",
+        "hot_standby",
+        "logical"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "hot_standby est le niveau minimal qui produit assez d'informations WAL pour qu'un standby applique les changements et réponde en lecture. minimal réduit le WAL au strict nécessaire et ne permet pas la réplication. archive autorise l'archivage mais pas les requêtes sur le standby. logical fonctionne aussi, mais il ajoute le décodage logique et n'est donc pas le minimum demandé.",
+      "topic": "WAL"
+    },
+    {
+      "id": "hcia-og-06-q04",
+      "type": "single",
+      "prompt": "What is the main purpose of archive_mode and archive_command?",
+      "options": [
+        "Encrypt client connections",
+        "Schedule logical dumps",
+        "Compress data files automatically",
+        "Copy completed WAL segments to an archive for recovery"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "archive_mode active l'archivage et archive_command indique comment copier chaque segment WAL complété vers un stockage d'archive. Cet archivage est la base du PITR. Il ne compresse pas les fichiers de données, ne chiffre pas les connexions et ne planifie pas de dumps logiques.",
+      "topic": "WAL"
+    },
+    {
+      "id": "hcia-og-06-q05",
+      "type": "single",
+      "prompt": "Which view on the primary shows the state and lag of standby servers?",
+      "options": [
+        "pg_stat_replication",
+        "pg_stat_database",
+        "pg_class",
+        "pg_settings"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "pg_stat_replication expose les expéditeurs WAL, l'état de chaque standby et les retards d'écriture ou de rejeu. pg_stat_database agrège l'activité par base, pg_class décrit les objets et pg_settings les paramètres. Aucune de ces trois vues ne décrit la réplication.",
+      "topic": "Haute disponibilité"
+    },
+    {
+      "id": "hcia-og-06-q06",
+      "type": "single",
+      "prompt": "What happens when the disk holding pg_xlog becomes completely full?",
+      "options": [
+        "The instance automatically switches to another disk",
+        "Writes are blocked because WAL cannot be written",
+        "The standby becomes the primary",
+        "Only backups fail, writes continue"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le WAL doit être écrit avant la validation d'une transaction : si pg_xlog est plein, plus aucune écriture ne peut être validée et l'instance se bloque fonctionnellement. openGauss ne bascule pas automatiquement les fichiers vers un autre disque et ne promeut pas un standby pour cette raison.",
+      "topic": "Dépannage"
+    },
+    {
+      "id": "hcia-og-06-q07",
+      "type": "single",
+      "prompt": "What is the main advantage of gs_probackup over gs_basebackup?",
+      "options": [
+        "It replaces the WAL",
+        "It works without a data directory",
+        "It supports incremental backups and backup catalog management",
+        "It converts SQL to NoSQL"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "gs_probackup gère un catalogue de sauvegardes, les incréments, la validation et la rétention, ce qui réduit la fenêtre de sauvegarde sur de gros volumes. Il ne transforme pas SQL en NoSQL, ne remplace pas le WAL et nécessite évidemment un répertoire de données.",
+      "topic": "Sauvegarde physique"
+    },
+    {
+      "id": "hcia-og-06-q08",
+      "type": "single",
+      "prompt": "Which function cancels the current query of a session while keeping the connection open?",
+      "options": [
+        "pg_terminate_backend",
+        "pg_reload_conf",
+        "pg_create_restore_point",
+        "pg_cancel_backend"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "pg_cancel_backend(pid) demande l'annulation de la requête en cours, mais laisse la session connectée. pg_terminate_backend(pid) ferme la connexion, ce qui est plus brutal. pg_reload_conf recharge la configuration et pg_create_restore_point crée un point de restauration nommé.",
+      "topic": "Dépannage"
+    },
+    {
+      "id": "hcia-og-06-q09",
+      "type": "single",
+      "prompt": "What distinguishes a switchover from a failover?",
+      "options": [
+        "Switchover is planned and should not lose data; failover is an emergency promotion",
+        "Failover is always lossless; switchover may lose data",
+        "Switchover only works on a single node",
+        "They are exactly the same operation"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le switchover est décidé et préparé : on vérifie que le standby est à jour avant de basculer, ce qui évite la perte de données. Le failover est une promotion d'urgence après panne, potentiellement avec perte en réplication asynchrone. Les deux opérations sont distinctes et ne se limitent pas au single node.",
+      "topic": "Haute disponibilité"
+    },
+    {
+      "id": "hcia-og-06-q10",
+      "type": "single",
+      "prompt": "What does RPO measure in a backup strategy?",
+      "options": [
+        "The number of standby nodes required",
+        "The maximum acceptable amount of data loss, expressed in time",
+        "The maximum acceptable service downtime",
+        "The size of the backup file"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le RPO exprime la perte de données maximale tolérable, souvent en minutes ou en heures de transactions. Le RTO mesure au contraire la durée d'indisponibilité acceptable. La taille du fichier et le nombre de standby sont des conséquences de l'architecture, pas des objectifs de reprise.",
+      "topic": "Stratégie"
+    },
+    {
+      "id": "hcia-og-06-q11",
+      "type": "multi",
+      "prompt": "Which elements are required to perform point-in-time recovery? (Choose three.)",
+      "options": [
+        "A base backup",
+        "Archived WAL segments",
+        "A recovery target such as a timestamp",
+        "An autovacuum run"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Le PITR restaure une sauvegarde de base, puis rejoue les segments WAL archivés jusqu'à une cible de récupération exprimée par un temps ou un point de restauration. autovacuum est une tâche de maintenance des lignes mortes et n'intervient pas dans la récupération.",
+      "topic": "PITR"
+    },
+    {
+      "id": "hcia-og-06-q12",
+      "type": "multi",
+      "prompt": "Which output formats are supported by gs_dump? (Choose three.)",
+      "options": [
+        "Directory",
+        "Excel workbook",
+        "Plain SQL",
+        "Custom"
+      ],
+      "answer": [
+        0,
+        2,
+        3
+      ],
+      "explanation_fr": "gs_dump propose le format plain pour un script SQL lisible, custom pour une archive compressée restaurable par gs_restore et directory pour un ensemble de fichiers parallélisables. Le format Excel n'est pas un format de sauvegarde de base de données.",
+      "topic": "Sauvegarde logique"
+    },
+    {
+      "id": "hcia-og-06-q13",
+      "type": "multi",
+      "prompt": "Which tools or views help diagnose a performance incident? (Choose three.)",
+      "options": [
+        "pg_dump",
+        "pg_stat_activity",
+        "pg_locks",
+        "The server log files"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "pg_stat_activity montre les sessions et leurs requêtes, pg_locks révèle les blocages, et les journaux contiennent les erreurs et les messages du moteur. pg_dump sert à sauvegarder une base, pas à diagnostiquer une performance.",
+      "topic": "Dépannage"
+    },
+    {
+      "id": "hcia-og-06-q14",
+      "type": "tf",
+      "prompt": "WAL records changes before the corresponding data pages are written to disk.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai. C'est le principe du Write-Ahead Log : la journalisation précède l'écriture des pages de données. Après un crash, le serveur rejoue les enregistrements WAL pour rétablir un état cohérent et durable.",
+      "topic": "WAL"
+    },
+    {
+      "id": "hcia-og-06-q15",
+      "type": "tf",
+      "prompt": "A full disk on the pg_xlog directory has no impact on write availability.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux. Le WAL est indispensable à la validation des transactions. Si pg_xlog est saturé, le moteur ne peut plus écrire de WAL, donc plus valider d'écritures. Il faut purger les archives correctement, étendre l'espace ou déplacer le WAL.",
+      "topic": "Dépannage"
+    },
+    {
+      "id": "hcia-og-06-q16",
+      "type": "tf",
+      "prompt": "A logical dump can be replayed into another database with gs_restore or gsql, depending on its format.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai. Un dump custom ou directory se restaure avec gs_restore, tandis qu'un dump plain, constitué d'instructions SQL, se rejoue avec gsql. Cette souplesse explique l'usage du logique pour la migration et l'archivage à long terme.",
+      "topic": "Restauration"
+    },
+    {
+      "id": "hcia-og-06-q17",
+      "type": "text",
+      "prompt": "Give the gs_dump command that backs up database sales in custom format to /backup/sales.dump.",
+      "accept": [
+        "gs_dump -d sales -f c -f /backup/sales.dump",
+        "gs_dump -d sales -fc /backup/sales.dump",
+        "gs_dump -d sales -F c -f /backup/sales.dump",
+        "gs_dump -d sales -Fc -f /backup/sales.dump"
+      ],
+      "sample_answer": "gs_dump -d sales -F c -f /backup/sales.dump",
+      "explanation_fr": "L'option -d désigne la base, -F c le format custom et -f le fichier de sortie. Le format custom est compressé et se restaure avec gs_restore, éventuellement en parallèle avec -j. Le format plain produirait un script SQL à rejouer avec gsql.",
+      "topic": "Sauvegarde logique"
+    },
+    {
+      "id": "hcia-og-06-q18",
+      "type": "text",
+      "prompt": "Which function forcibly terminates a backend session identified by its PID?",
+      "accept": [
+        "pg_terminate_backend",
+        "pg_terminate_backend(pid)",
+        "pg terminate backend"
+      ],
+      "sample_answer": "pg_terminate_backend",
+      "explanation_fr": "pg_terminate_backend(pid) ferme la session et provoque un rollback de sa transaction en cours. pg_cancel_backend(pid), à ne pas confondre, annule seulement la requête et laisse la connexion ouverte. Les deux exigent d'identifier correctement le PID.",
+      "topic": "Dépannage"
+    },
+    {
+      "id": "hcia-og-06-q19",
+      "type": "text",
+      "prompt": "Which recovery parameter specifies the timestamp at which point-in-time recovery must stop?",
+      "accept": [
+        "recovery_target_time",
+        "recovery target time",
+        "recovery_target_time = '...'"
+      ],
+      "sample_answer": "recovery_target_time",
+      "explanation_fr": "recovery_target_time indique l'horodatage cible : le serveur rejoue le WAL archivé jusqu'à cet instant puis s'arrête. On peut aussi utiliser un point de restauration nommé avec recovery_target_name. Sans archivage WAL, ce paramètre ne peut pas être exploité.",
+      "topic": "PITR"
+    },
+    {
+      "id": "hcia-og-06-q20",
+      "type": "text",
+      "prompt": "Which command displays the detailed status of an openGauss cluster, including node roles?",
+      "accept": [
+        "gs_om -t status --detail",
+        "gs_om -t status",
+        "gs_om status --detail",
+        "gs om -t status --detail"
+      ],
+      "sample_answer": "gs_om -t status --detail",
+      "explanation_fr": "gs_om -t status --detail affiche l'état du cluster, le rôle de chaque nœud et les chemins associés. C'est le premier contrôle à effectuer avant toute opération de maintenance ou de bascule. gs_ctl status ne donne qu'une vue locale de l'instance.",
+      "topic": "Exploitation"
+    }
+  ]
+}

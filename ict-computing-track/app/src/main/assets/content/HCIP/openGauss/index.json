@@ -1,0 +1,27 @@
+{
+  "phase": "HCIP",
+  "subject": "openGauss",
+  "name": "openGauss — HA, performance et sécurité",
+  "tagline": "Réplication, tuning, TDE, sauvegardes professionnelles",
+  "weight": 30,
+  "chapters": [
+    {
+      "id": "hcip-og-01",
+      "file": "ch01.json",
+      "title": "Haute disponibilité et réplication openGauss",
+      "minutes": 60
+    },
+    {
+      "id": "hcip-og-02",
+      "file": "ch02.json",
+      "title": "Optimisation des performances openGauss",
+      "minutes": 60
+    },
+    {
+      "id": "hcip-og-03",
+      "file": "ch03.json",
+      "title": "Sécurité avancée et sauvegarde professionnelle",
+      "minutes": 60
+    }
+  ]
+}

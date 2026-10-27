@@ -1,0 +1,39 @@
+{
+  "phase": "HCIA",
+  "subject": "openEuler",
+  "name": "openEuler — cours système complet",
+  "tagline": "Écosystème, CLI/Vim, systemd, stockage/LVM, scripts et conteneurs iSula",
+  "weight": 50,
+  "chapters": [
+    {
+      "id": "hcia-oe-01",
+      "file": "ch01.json",
+      "title": "Écosystème openEuler, IA et installation",
+      "minutes": 45
+    },
+    {
+      "id": "hcia-oe-02",
+      "file": "ch02.json",
+      "title": "Ligne de commande, Vim et gestion des fichiers",
+      "minutes": 50
+    },
+    {
+      "id": "hcia-oe-03",
+      "file": "ch03.json",
+      "title": "Utilisateurs, paquets DNF et systemd",
+      "minutes": 50
+    },
+    {
+      "id": "hcia-oe-04",
+      "file": "ch04.json",
+      "title": "Stockage, LVM et réseau",
+      "minutes": 55
+    },
+    {
+      "id": "hcia-oe-05",
+      "file": "ch05.json",
+      "title": "Scripts bash, cron et conteneurs iSula",
+      "minutes": 55
+    }
+  ]
+}

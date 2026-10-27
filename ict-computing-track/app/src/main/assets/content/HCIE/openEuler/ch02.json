@@ -1,0 +1,721 @@
+{
+  "id": "hcie-oe-02",
+  "phase": "HCIE",
+  "subject": "openEuler",
+  "number": 2,
+  "title_fr": "Kubernetes avancé : clusters de production",
+  "title_en": "Advanced Kubernetes for Production",
+  "minutes": 90,
+  "source": "HCIE-openEuler V1.0 Training Material — Sessions 7-12 et 15 «Kubernetes : clusters, réseau, stockage/CSI, scheduling, HPA, tuning»",
+  "objectives": [
+    "Concevoir un control plane hautement disponible avec etcd en quorum",
+    "Maîtriser le scheduling : requests/limits, affinity, taints et topology spread",
+    "Choisir un CNI et exposer les applications avec Service et Ingress",
+    "Provisionner du stockage persistant via CSI et StorageClass",
+    "Sécuriser avec RBAC, admission et NetworkPolicy",
+    "Exploiter HPA, les Operators et les montées de version kubeadm"
+  ],
+  "sections": [
+    {
+      "heading": "Control plane HA : apiserver, etcd et VIP",
+      "body": "Le control plane est le cerveau du cluster : kube-apiserver expose l'API REST, kube-scheduler choisit un nœud, kube-controller-manager réconcilie l'état désiré et etcd conserve cet état. En production, on déploie trois masters, chacun avec un apiserver, un scheduler, un controller-manager et un membre etcd, derrière une adresse virtuelle gérée par keepalived ou un load balancer externe. Pourquoi trois ? Parce qu'etcd est un consensus Raft : avec trois membres, le quorum est de deux et la perte d'un nœud laisse le cluster écrire ; avec deux membres, la perte d'un seul bloque tout. La VIP évite d'inscrire une IP de master en dur dans les kubeconfigs et permet le remplacement d'un nœud sans réinstaller les workers. kubeadm utilise par défaut une topologie « stacked », où etcd vit sur les masters ; une topologie « external » sépare etcd, utile pour les très gros clusters. La sauvegarde etcd est le vrai RPO du control plane : un snapshot régulier, stocké hors du cluster et testé par une restauration, vaut mieux que trois réplicas synchronisés qui partagent la même erreur.",
+      "bullets": [
+        "Trois masters, trois membres etcd : quorum de deux, tolérance d'un nœud",
+        "VIP keepalived ou LB devant les apiservers pour un endpoint stable",
+        "Topologie stacked par défaut, external etcd pour les grands clusters",
+        "Un snapshot etcd testé définit le RPO réel du control plane"
+      ],
+      "code": [
+        "kubeadm init --control-plane-endpoint k8s-vip:6443 --upload-certs",
+        "kubeadm join k8s-vip:6443 --token <token> --control-plane --certificate-key <key>",
+        "ETCDCTL_API=3 etcdctl endpoint health --cluster",
+        "ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-$(date +%F).db",
+        "kubectl get --raw='/readyz?verbose'"
+      ],
+      "table": {
+        "headers": [
+          "Membres etcd",
+          "Quorum",
+          "Pannes tolérées"
+        ],
+        "rows": [
+          [
+            "1",
+            "1",
+            "0"
+          ],
+          [
+            "2",
+            "2",
+            "0"
+          ],
+          [
+            "3",
+            "2",
+            "1"
+          ],
+          [
+            "5",
+            "3",
+            "2"
+          ]
+        ]
+      },
+      "diagram": "              VIP 192.168.1.10:6443\n                        |\n        +---------------+---------------+\n        v               v               v\n  master1:6443   master2:6443   master3:6443\n  apiserver       apiserver       apiserver\n  scheduler       scheduler       scheduler\n  controller      controller      controller\n  etcd            etcd            etcd\n        \\               |               /\n         +-------- Raft quorum 2/3 -----+\n                        |\n             workers: kubelet + kube-proxy + CNI",
+      "tip": "Un contrôleur de load balancer qui sonde seulement le port TCP peut envoyer du trafic vers un apiserver vivant mais sans quorum etcd. Sondez /readyz, pas seulement 6443, et testez la perte d'un master avant la mise en production."
+    },
+    {
+      "heading": "Scheduling : requests, QoS, affinity et taints",
+      "body": "Le scheduler ne regarde pas l'utilisation réelle : il raisonne sur les requests déclarées dans chaque pod. Un pod sans requests est difficile à placer proprement et fausse le calcul du HPA ; un pod avec des requests trop généreuses gaspille la capacité. Les limits plafonnent l'usage, et le couple requests/limits détermine la classe QoS : Guaranteed lorsque les deux sont égales pour tous les conteneurs, Burstable lorsqu'elles diffèrent, BestEffort lorsqu'elles sont absentes. En cas de pression mémoire, le kubelet évince d'abord les BestEffort, ce qui explique bien des surprises en production. Pour orienter le placement, on combine nodeSelector et node affinity (règles sur les labels du nœud), pod affinity et anti-affinity (proximité ou séparation entre pods), topologySpreadConstraints (répartition équilibrée entre zones ou hôtes), puis taints et tolerations pour réserver un nœud à certains workloads. Une taint NoSchedule n'éjecte pas les pods déjà présents ; NoExecute, elle, les expulse s'ils ne tolèrent pas la taint. Enfin, les PriorityClass et la préemption permettent à un pod critique de déloger un pod moins important, à condition que les budgets de perturbation soient respectés.",
+      "bullets": [
+        "Le scheduler place selon les requests, pas selon l'usage observé",
+        "Guaranteed > Burstable > BestEffort pour la priorité d'éviction",
+        "Affinity oriente, anti-affinity sépare, topology spread équilibre",
+        "NoSchedule bloque les nouveaux pods, NoExecute expulse les existants",
+        "PDB protège les workloads lors des évictions volontaires"
+      ],
+      "code": [
+        "kubectl describe node node1 | sed -n '/Allocated resources/,/Events/p'",
+        "kubectl taint nodes node1 dedicated=gpu:NoSchedule",
+        "kubectl label nodes node2 disktype=ssd",
+        "kubectl get pod api-0 -o jsonpath='{.status.qosClass}'",
+        "kubectl describe pod api-0 | sed -n '/Events/,$p'"
+      ],
+      "table": {
+        "headers": [
+          "QoS",
+          "Requests / limits",
+          "Comportement sous pression"
+        ],
+        "rows": [
+          [
+            "Guaranteed",
+            "Égales et définies partout",
+            "Évincé en dernier"
+          ],
+          [
+            "Burstable",
+            "Définies mais différentes",
+            "Évincé selon l'usage au-delà des requests"
+          ],
+          [
+            "BestEffort",
+            "Absentes",
+            "Évincé en premier"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un pod reste en Pending. Les nœuds ont du CPU libre, mais le pod demande 16 Gi de mémoire et aucun nœud n'affiche cette capacité disponible. Décrivez la démarche de diagnostic et les corrections possibles.",
+          "correction": "On commence par kubectl describe pod : la section Events indique généralement « 0/3 nodes are available: Insufficient memory » ou un problème de taint, d'affinity ou de PVC. On compare ensuite la request de 16 Gi avec kubectl describe node et la colonne Allocated resources, qui montre la capacité déjà réservée et non l'usage réel. Trois corrections sont possibles : réduire la request si elle est surdimensionnée, ajouter un nœud avec assez de mémoire via le cluster-autoscaler, ou assouplir une contrainte de scheduling (taint, affinity, topology spread) qui exclut les nœuds disponibles. Vérifier aussi qu'aucun LimitRange n'impose une valeur par défaut supérieure à la capacité des nœuds."
+        }
+      ],
+      "tip": "Un pod Pending avec « Insufficient cpu » alors que top montre un CPU faible signale un manque de requests disponibles, pas un manque de CPU réel. Les requests sont des réservations comptables : elles s'additionnent même si les pods ne consomment presque rien."
+    },
+    {
+      "heading": "Réseau des pods : CNI, Calico, Flannel et NetworkPolicy",
+      "body": "Kubernetes impose un modèle réseau simple : chaque pod possède une adresse IP unique, et tous les pods peuvent se joindre directement sans NAT, y compris entre nœuds. Ce modèle est implémenté par un plugin CNI, appelé par le runtime au moment de la création du pod. Les plugins se répartissent en solutions de pont L2 (macvlan), de routage L3 (Calico en BGP) et de superposition (Flannel en VXLAN). Calico annonce les routes des pods par BGP, ce qui donne de bonnes performances et une mise à l'échelle adaptée aux grands clusters, au prix d'une configuration réseau plus exigeante. Flannel encapsule les paquets dans VXLAN : simple à déployer, mais le forwarding consomme du CPU et le MTU doit être réduit pour absorber l'en-tête. Cilium s'appuie sur eBPF pour filtrer et observer les flux avec moins de règles iptables. NetworkPolicy est l'objet Kubernetes qui exprime l'isolation ; il n'est appliqué que si le CNI le supporte. Une politique avec podSelector vide et policyTypes Ingress, Egress, sans aucune règle, isole totalement les pods sélectionnés : c'est le point de départ d'un modèle « deny-all puis allow list ».",
+      "bullets": [
+        "Un pod = une IP routable, sans NAT entre pods",
+        "Le CNI est invoqué par le runtime, pas par kube-apiserver",
+        "Calico : routage L3 BGP ; Flannel : superposition VXLAN",
+        "NetworkPolicy n'est effective que si le CNI l'implémente",
+        "Deny-all puis autorisations explicites : le modèle le plus sûr"
+      ],
+      "code": [
+        "kubectl get pods -n kube-system -l k8s-app=calico-node",
+        "kubectl get ippools.crd.projectcalico.org",
+        "kubectl get networkpolicy -A",
+        "kubectl describe networkpolicy deny-all -n app",
+        "ip route | grep cali"
+      ],
+      "table": {
+        "headers": [
+          "Solution",
+          "Mode",
+          "Points forts",
+          "Limites"
+        ],
+        "rows": [
+          [
+            "Calico",
+            "Routage L3 BGP",
+            "Performance, grands clusters, NetworkPolicy",
+            "Configuration BGP et réseau underlay"
+          ],
+          [
+            "Flannel",
+            "Overlay VXLAN",
+            "Déploiement simple",
+            "CPU de forwarding, MTU réduit"
+          ],
+          [
+            "Cilium",
+            "eBPF",
+            "Observation fine, sécurité L7",
+            "Courbe d'apprentissage, noyau récent"
+          ]
+        ]
+      },
+      "diagram": "  Noeud A                                   Noeud B\n  ------                                    ------\n  pod 10.244.1.5                            pod 10.244.2.7\n      | veth                                    | veth\n  cni0 / cali0                              cni0 / cali0\n      |                                         |\n  route 10.244.2.0/24 --> 192.168.0.12     route 10.244.1.0/24 --> 192.168.0.11\n      |                                         |\n      +------------ reseau underlay ------------+\n\n  Calico: routes BGP annoncees, pas d'encapsulation par defaut\n  Flannel: VXLAN encapsule le paquet pod dans UDP",
+      "tip": "Après un changement de MTU sur l'underlay, les petits paquets passent et les gros échouent : les téléchargements se figent, les health checks réussissent. Vérifiez le MTU du CNI et testez avec ping -M do -s 1472 avant d'accuser l'application."
+    },
+    {
+      "heading": "Services, Ingress et exposition des applications",
+      "body": "Un Service donne une adresse stable à un ensemble de pods sélectionnés par labels. ClusterIP expose le service uniquement dans le cluster, NodePort ouvre un port sur chaque nœud, LoadBalancer demande une IP externe au fournisseur cloud, et le mode headless (clusterIP: None) publie directement les IP des pods pour les StatefulSets. kube-proxy programme les règles iptables ou IPVS qui traduisent l'IP virtuelle vers les endpoints ; si le selector ne correspond à aucun pod prêt, le Service n'a aucun endpoint et les connexions échouent immédiatement. Ingress ajoute une couche HTTP/HTTPS : un contrôleur (NGINX, HAProxy, Traefik) lit les objets Ingress et route selon le nom d'hôte ou le chemin, termine TLS et applique des annotations. Un Ingress sans contrôleur installé ou sans ingressClassName reste sans effet, erreur fréquente après un déploiement manuel. Pour les protocoles non HTTP, on utilise un Service LoadBalancer, NodePort ou un Gateway API avec des listeners adaptés. Enfin, les readinessProbes conditionnent l'entrée dans les endpoints : un pod qui répond mais n'est pas prêt ne doit pas recevoir de trafic.",
+      "bullets": [
+        "ClusterIP pour l'interne, NodePort/LoadBalancer pour l'externe",
+        "Headless Service pour une découverte directe des pods",
+        "kube-proxy traduit l'IP virtuelle vers les endpoints prêts",
+        "Un Ingress exige un contrôleur et un ingressClassName valides",
+        "Les readinessProbes déterminent l'entrée dans les endpoints"
+      ],
+      "code": [
+        "kubectl expose deployment web --port=80 --target-port=8080 --type=ClusterIP",
+        "kubectl get endpointslices -l kubernetes.io/service-name=web",
+        "kubectl get ingressclass",
+        "kubectl describe ingress web -n app",
+        "kubectl port-forward svc/web 8080:80 -n app"
+      ],
+      "table": {
+        "headers": [
+          "Type",
+          "Portée",
+          "Usage"
+        ],
+        "rows": [
+          [
+            "ClusterIP",
+            "Interne au cluster",
+            "Communication entre services"
+          ],
+          [
+            "NodePort",
+            "Chaque nœud",
+            "Accès direct sans LB cloud"
+          ],
+          [
+            "LoadBalancer",
+            "Externe",
+            "Production cloud ou LB matériel"
+          ],
+          [
+            "Headless",
+            "Interne, sans VIP",
+            "StatefulSet, bases de données"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Le Service web répond en timeout, mais les pods tournent et le port 8080 écoute dans le conteneur. Le Service cible le port 80. Expliquez le diagnostic et la correction.",
+          "correction": "On vérifie d'abord kubectl get endpointslices -l kubernetes.io/service-name=web : si les endpoints sont vides, le selector ne correspond à aucun pod ou les pods ne sont pas Ready. On compare les labels du Service et ceux des pods, puis on contrôle les readinessProbes. Si les endpoints existent, on inspecte targetPort : le Service doit pointer vers le port réellement exposé par le conteneur, ici 8080, et non 80. La correction consiste à aligner targetPort sur 8080 ou à faire écouter l'application sur 80, puis à vérifier avec kubectl port-forward que le pod répond avant de tester le Service."
+        }
+      ],
+      "tip": "Un Service sans endpoint est presque toujours un problème de labels ou de readiness, pas de réseau. Comparer kubectl get svc -o wide, kubectl get pods --show-labels et kubectl get endpointslices fait gagner plus de temps que de relancer le CNI."
+    },
+    {
+      "heading": "Stockage persistant : PV, PVC, StorageClass et CSI",
+      "body": "Le stockage Kubernetes sépare l'offre (PersistentVolume) de la demande (PersistentVolumeClaim). Une StorageClass décrit un provisionneur et ses paramètres ; quand un PVC la référence, le provisionneur crée dynamiquement un PV. CSI est le contrat qui permet à un éditeur de stockage de brancher son backend sans modifier Kubernetes : le contrôleur CSI tourne généralement en Deployment ou StatefulSet et gère create, delete, attach, detach ; le composant node tourne en DaemonSet sur chaque nœud et gère le montage. CephCSI expose ainsi RBD pour le bloc et CephFS pour le fichier. Deux réglages sont décisifs : reclaimPolicy Retain conserve le volume après suppression du PVC, Delete le supprime ; volumeBindingMode WaitForFirstConsumer attend que le pod soit planifié avant de créer le volume, ce qui permet de respecter la topologie de la zone ou du nœud. Sans WaitForFirstConsumer, un volume RBD peut être créé dans une zone où aucun pod ne pourra être planifié. Les StatefulSets utilisent des volumeClaimTemplates pour donner à chaque réplica un PVC stable, et les snapshots CSI permettent des sauvegardes cohérentes.",
+      "bullets": [
+        "PVC décrit le besoin, PV représente la ressource, StorageClass automatise",
+        "CSI contrôleur gère le cycle de vie, CSI node gère le montage",
+        "Retain protège les données, Delete nettoie automatiquement",
+        "WaitForFirstConsumer respecte la topologie du pod",
+        "StatefulSet + volumeClaimTemplates : un volume stable par réplica"
+      ],
+      "code": [
+        "kubectl get storageclass",
+        "kubectl get pvc -A",
+        "kubectl describe pvc data-app-0 -n app",
+        "kubectl get volumesnapshotclass",
+        "kubectl patch storageclass csi-rbd -p '{\"metadata\":{\"annotations\":{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'"
+      ],
+      "table": {
+        "headers": [
+          "Paramètre",
+          "Valeur",
+          "Effet"
+        ],
+        "rows": [
+          [
+            "reclaimPolicy",
+            "Delete",
+            "Le PV et les données sont supprimés avec le PVC"
+          ],
+          [
+            "reclaimPolicy",
+            "Retain",
+            "Le PV reste, intervention manuelle requise"
+          ],
+          [
+            "volumeBindingMode",
+            "Immediate",
+            "Création sans attendre le pod"
+          ],
+          [
+            "volumeBindingMode",
+            "WaitForFirstConsumer",
+            "Création après planification, topologie respectée"
+          ]
+        ]
+      },
+      "diagram": "  PVC (demande) --> StorageClass --> CSI provisioner\n                                      |\n                                      v\n                                 PV (volume)\n                                      |\n                    +-----------------+-----------------+\n                    v                                   v\n            CSI controller                      CSI node (DaemonSet)\n            create/attach/delete                mount sur le noeud\n                    |                                   |\n                    +-------- backend Ceph -------------+\n                              RBD ou CephFS",
+      "tip": "Un PVC Pending sans StorageClass par défaut n'a aucun provisionneur : le message « no persistent volumes available » est trompeur. Vérifiez kubectl get storageclass et l'annotation is-default-class avant de recréer le PVC."
+    },
+    {
+      "heading": "Sécurité : RBAC, admission et isolation réseau",
+      "body": "La sécurité d'un cluster repose sur plusieurs couches complémentaires. RBAC répond à « qui peut faire quoi » : un Role et un RoleBinding s'appliquent à un namespace, un ClusterRole et un ClusterRoleBinding à l'ensemble du cluster. Un RoleBinding peut référencer un ClusterRole, mais les droits restent limités au namespace du binding. Les ServiceAccounts donnent une identité aux pods ; monter leur token par défaut est pratique mais élargit la surface d'attaque, d'où l'intérêt de automountServiceAccountToken: false quand l'application n'appelle pas l'API. L'admission contrôle la forme des objets avant leur persistance : Pod Security Admission applique les profils privileged, baseline ou restricted selon les labels du namespace, tandis qu'OPA Gatekeeper ou Kyverno expriment des règles métier. NetworkPolicy limite les flux, et le chiffrement des Secrets au repos via encryption-config protège etcd, car un Secret n'est encodé qu'en base64 par défaut. Les audit logs de l'apiserver tracent les actions sensibles, et la signature d'images (cosign) vérifie la provenance. Enfin, un ServiceAccount avec cluster-admin reste l'erreur la plus fréquente : chaque workload doit avoir un rôle minimal et des credentials renouvelés.",
+      "bullets": [
+        "Role/RoleBinding = namespace ; ClusterRole/ClusterRoleBinding = cluster",
+        "Désactiver le token de ServiceAccount quand il est inutile",
+        "Pod Security Admission : privileged, baseline, restricted",
+        "NetworkPolicy et chiffrement des Secrets complètent RBAC",
+        "Les audit logs tracent les actions, pas seulement les erreurs"
+      ],
+      "code": [
+        "kubectl create role pod-reader --verb=get,list,watch --resource=pods -n app",
+        "kubectl create rolebinding alice-read --role=pod-reader --user=alice -n app",
+        "kubectl auth can-i delete pods --as=alice -n app",
+        "kubectl label namespace app pod-security.kubernetes.io/enforce=restricted",
+        "kubectl get secrets -n app",
+        "kubectl get --raw /metrics | grep apiserver_audit"
+      ],
+      "table": {
+        "headers": [
+          "Couche",
+          "Question",
+          "Outil"
+        ],
+        "rows": [
+          [
+            "Identité",
+            "Qui agit ?",
+            "ServiceAccount, certificats"
+          ],
+          [
+            "Autorisation",
+            "Que peut-il faire ?",
+            "RBAC"
+          ],
+          [
+            "Admission",
+            "L'objet est-il conforme ?",
+            "PSA, Gatekeeper, Kyverno"
+          ],
+          [
+            "Réseau",
+            "Qui peut parler à qui ?",
+            "NetworkPolicy, Cilium"
+          ],
+          [
+            "Données",
+            "Le secret est-il protégé ?",
+            "Encryption at rest, KMS"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Alice doit pouvoir lire les pods du namespace app, mais pas les supprimer ni voir les autres namespaces. Écrivez les objets RBAC et la commande de vérification.",
+          "correction": "On crée un Role dans app : kubectl create role pod-reader --verb=get,list,watch --resource=pods -n app. Puis un RoleBinding qui lie ce Role à l'utilisatrice : kubectl create rolebinding alice-read --role=pod-reader --user=alice -n app. Le Role étant namespaced, Alice n'obtient aucun droit ailleurs. On vérifie avec kubectl auth can-i get pods --as=alice -n app (oui) et kubectl auth can-i delete pods --as=alice -n app (non). Évitez un ClusterRoleBinding, qui donnerait le droit dans tous les namespaces."
+        }
+      ],
+      "tip": "kubectl auth can-i est la vérification la plus rapide après un changement RBAC, mais elle ne teste pas l'admission ni les NetworkPolicy. Un pod peut avoir le droit API de joindre un service et être bloqué par le réseau : testez les deux couches."
+    },
+    {
+      "heading": "Autoscaling : HPA, VPA et cluster-autoscaler",
+      "body": "HPA ajuste le nombre de réplicas d'un Deployment ou d'un StatefulSet en comparant la métrique observée à la cible. Le calcul de base est desiredReplicas = ceil(currentReplicas × currentMetric / desiredMetric), avec une tolérance par défaut de 10 % qui évite les oscillations. Les métriques CPU et mémoire proviennent de metrics-server ; les métriques personnalisées passent par un adaptateur, souvent Prometheus Adapter. Un HPA calcule l'utilisation par rapport aux requests : sans requests, la métrique CPU est indéfinie et le scaling ne fonctionne pas. La fenêtre de stabilisation par défaut est de 300 secondes à la baisse, ce qui explique qu'un pic retombé ne réduit pas immédiatement les réplicas. VPA ajuste les requests et limits, et peut redémarrer les pods pour appliquer une nouvelle valeur : il ne faut pas le combiner aveuglément avec HPA sur les mêmes métriques. Le cluster-autoscaler ajoute ou retire des nœuds selon les pods non planifiables, pas selon le nombre de réplicas. Enfin, les PodDisruptionBudgets limitent les évictions volontaires pendant les maintenances, et les requests bien calibrées restent la base de tout scaling fiable.",
+      "bullets": [
+        "HPA scale les réplicas selon une métrique et une cible",
+        "La formule compare l'usage aux requests, pas au CPU total",
+        "Tolérance 10 % et stabilisation 300 s évitent les oscillations",
+        "VPA ajuste les ressources, cluster-autoscaler ajoute des nœuds",
+        "PDB protège la disponibilité pendant les évictions"
+      ],
+      "code": [
+        "kubectl autoscale deployment web --min=2 --max=10 --cpu-percent=70",
+        "kubectl get hpa web -w",
+        "kubectl describe hpa web",
+        "kubectl top pods -n app",
+        "kubectl get pdb -A"
+      ],
+      "table": {
+        "headers": [
+          "Composant",
+          "Ce qu'il ajuste",
+          "Déclencheur"
+        ],
+        "rows": [
+          [
+            "HPA",
+            "Nombre de réplicas",
+            "Métrique vs cible"
+          ],
+          [
+            "VPA",
+            "Requests et limits",
+            "Historique de consommation"
+          ],
+          [
+            "Cluster-autoscaler",
+            "Nombre de nœuds",
+            "Pods non planifiables"
+          ],
+          [
+            "PDB",
+            "Évictions autorisées",
+            "Maintenance volontaire"
+          ]
+        ]
+      },
+      "tip": "Un HPA qui affiche <unknown> pour la métrique CPU signifie presque toujours que metrics-server est absent ou que le pod n'a pas de requests. Corrigez la source de métrique avant d'augmenter maxReplicas."
+    },
+    {
+      "heading": "Operators et montée de version maîtrisée",
+      "body": "Un Operator est un contrôleur qui encode le savoir-faire d'une application dans du code : il observe des objets personnalisés (CRD), compare l'état réel à l'état désiré et agit par boucles de réconciliation. Contrairement à un script, il est idempotent et reprend automatiquement après un redémarrage ; c'est ce qui le rend adapté aux bases de données, à Prometheus ou à un cluster Ceph. Un opérateur ne remplace pas la supervision : il automatise les tâches répétitives, mais une mauvaise réconciliation peut propager une erreur à grande échelle, d'où l'intérêt des tests et des garde-fous. Pour les montées de version, kubeadm suit une règle stricte : une version mineure à la fois, jamais de saut de n+3. On commence par kubeadm upgrade plan, on sauvegarde etcd, on met à jour le premier control plane, puis les autres, et enfin les workers un par un avec drain, mise à jour de kubelet et kubectl, puis uncordon. Le drain évite d'interrompre les pods, mais il faut vérifier les DaemonSets, les volumes locaux et les PDB. Un rollback de control plane est difficile : la sauvegarde etcd et un plan de retour testé sont la véritable assurance.",
+      "bullets": [
+        "CRD décrit l'API, le contrôleur réconcilie l'état désiré",
+        "Une boucle de réconciliation est idempotente et reprend après crash",
+        "kubeadm upgrade : une mineure à la fois, plan puis application",
+        "drain, mise à jour, uncordon : un nœud à la fois",
+        "Sauvegarde etcd et rollback testé avant toute montée de version"
+      ],
+      "code": [
+        "kubectl get crd",
+        "kubectl get pods -n operators",
+        "kubeadm upgrade plan",
+        "kubeadm upgrade apply v1.30.0",
+        "kubectl drain node1 --ignore-daemonsets --delete-emptydir-data",
+        "kubectl uncordon node1",
+        "etcdctl snapshot save /backup/etcd-before-upgrade.db"
+      ],
+      "diagram": "  CRD (etat desire) --> API server --> controleur\n                                           |\n                                    observe / compare\n                                           |\n                              +------------+------------+\n                              v                         v\n                        cree un pod              met a jour un service\n                              |                         |\n                              +------ reconciliation ----+\n\n  Upgrade: plan -> backup etcd -> master1 -> master2/3\n           -> drain worker -> kubelet -> uncordon -> suivant",
+      "tip": "kubeadm upgrade apply ne met pas à jour kubelet ni kubectl sur les nœuds : il faut les paquets puis systemctl restart kubelet. Un nœud laissé en cordon après maintenance réduit silencieusement la capacité du cluster."
+    }
+  ],
+  "key_points": [
+    "Trois masters et trois etcd : quorum de deux, un nœud perdu sans interruption",
+    "Le scheduler place selon les requests ; le QoS détermine l'ordre d'éviction",
+    "Le CNI implémente le réseau plat des pods ; NetworkPolicy dépend de lui",
+    "Service donne une adresse stable, Ingress ajoute le routage HTTP et TLS",
+    "CSI et StorageClass automatisent le provisioning ; WaitForFirstConsumer respecte la topologie",
+    "RBAC, admission, NetworkPolicy et chiffrement des Secrets forment une défense en profondeur",
+    "HPA scale les réplicas, VPA les ressources, cluster-autoscaler les nœuds",
+    "Les Operators réconcilient en boucle ; kubeadm impose une mineure à la fois"
+  ],
+  "traps": [
+    "Deux membres etcd ne tolèrent aucune panne : le quorum est de deux",
+    "Un pod sans requests fausse le scheduler et rend le HPA CPU inopérant",
+    "Un Ingress sans contrôleur ou sans ingressClassName n'expose rien",
+    "Un PVC sans StorageClass par défaut reste Pending indéfiniment",
+    "kubeadm n'autorise pas un saut de plusieurs versions mineures"
+  ],
+  "quiz": [
+    {
+      "id": "hcie-oe-02-q01",
+      "type": "single",
+      "topic": "Control plane HA",
+      "prompt": "A production cluster uses three stacked etcd members. How many member failures can it tolerate while keeping quorum?",
+      "options": [
+        "1",
+        "2",
+        "3",
+        "0"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Avec trois membres, le quorum Raft est de deux : la perte d'un membre laisse encore une majorité. Perdre deux membres ne laisse qu'un seul votant, donc plus de quorum, et perdre les trois arrête toute écriture. Un déploiement à deux membres serait encore plus fragile, car il ne tolère aucune panne."
+    },
+    {
+      "id": "hcie-oe-02-q02",
+      "type": "single",
+      "topic": "Composants",
+      "prompt": "Which control plane component assigns a pod to a node?",
+      "options": [
+        "kube-apiserver",
+        "kube-scheduler",
+        "kube-controller-manager",
+        "kubelet"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "kube-scheduler évalue les nœuds éligibles puis choisit celui qui respecte les requests, l'affinity et les taints. kube-apiserver expose l'API et stocke l'objet, kube-controller-manager réconcilie les contrôleurs et kubelet exécute les pods sur le nœud. Le scheduler écrit sa décision dans le champ nodeName du pod."
+    },
+    {
+      "id": "hcie-oe-02-q03",
+      "type": "single",
+      "topic": "CNI",
+      "prompt": "Which CNI is based on layer 3 BGP routing and supports NetworkPolicy natively?",
+      "options": [
+        "Weave",
+        "Flannel",
+        "Calico",
+        "macvlan"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Calico annonce les routes des pods en BGP et applique les NetworkPolicy via Felix et iptables. Flannel est principalement une superposition VXLAN, macvlan est une solution L2 et Weave n'est pas le choix décrit dans le cours. Calico est donc adapté aux grands clusters routés."
+    },
+    {
+      "id": "hcie-oe-02-q04",
+      "type": "single",
+      "topic": "Stockage CSI",
+      "prompt": "Which object triggers dynamic provisioning of a PersistentVolume?",
+      "options": [
+        "A ConfigMap",
+        "A NetworkPolicy",
+        "A Pod with hostPath",
+        "A PersistentVolumeClaim referencing a StorageClass"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Le PVC exprime une demande de capacité et de mode d'accès ; s'il référence une StorageClass, le provisionneur CSI crée le PV correspondant. Un pod avec hostPath utilise le disque du nœud sans provisioning dynamique. ConfigMap et NetworkPolicy n'ont aucun rôle dans le stockage persistant."
+    },
+    {
+      "id": "hcie-oe-02-q05",
+      "type": "single",
+      "topic": "Stockage",
+      "prompt": "A PVC stays Pending and no PersistentVolume exists. What is the most likely cause when dynamic provisioning is expected?",
+      "options": [
+        "The PVC has no StorageClass or the default class is missing",
+        "The pod has no liveness probe",
+        "The CNI is not installed",
+        "The Service has no clusterIP"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Sans StorageClass référencée ni classe par défaut, aucun provisionneur n'est sollicité et le PVC reste Pending. Un problème de sonde, de CNI ou de Service n'empêche pas la création du volume. La correction consiste à créer une StorageClass par défaut ou à la référencer explicitement dans le PVC."
+    },
+    {
+      "id": "hcie-oe-02-q06",
+      "type": "single",
+      "topic": "HPA",
+      "prompt": "On which value does the HPA compute CPU utilization for a Deployment?",
+      "options": [
+        "Node CPU capacity",
+        "Container CPU requests",
+        "Container CPU limits only",
+        "Total cluster CPU usage"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le HPA calcule l'utilisation en pourcentage des requests CPU déclarées par les conteneurs. Sans requests, la métrique est indéfinie et le HPA ne peut pas scaler. Les limits servent à plafonner l'usage, pas de base au calcul, et la capacité du nœud n'entre pas dans la formule."
+    },
+    {
+      "id": "hcie-oe-02-q07",
+      "type": "single",
+      "topic": "Scheduling",
+      "prompt": "What is the effect of a taint with effect NoSchedule on a node?",
+      "options": [
+        "The node is removed from the cluster",
+        "The node accepts only DaemonSets",
+        "New pods without a matching toleration are not scheduled there",
+        "All running pods are immediately evicted"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "NoSchedule empêche la planification de nouveaux pods qui ne tolèrent pas la taint, sans évincer les pods déjà présents. C'est NoExecute qui expulse les pods existants non tolérants. La taint ne retire pas le nœud du cluster et ne réserve pas le nœud aux seuls DaemonSets."
+    },
+    {
+      "id": "hcie-oe-02-q08",
+      "type": "single",
+      "topic": "Upgrade",
+      "prompt": "Which upgrade path does kubeadm officially support between minor versions?",
+      "options": [
+        "n to n+3 in one step",
+        "Any version to the latest",
+        "Only patch upgrades",
+        "n to n+1 only"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "kubeadm impose une montée d'une version mineure à la fois, par exemple 1.29 vers 1.30. Sauter deux ou trois mineures n'est pas pris en charge et peut laisser des objets ou des certificats incompatibles. Les mises à jour de patch restent possibles dans la même mineure, mais ne remplacent pas ce chemin."
+    },
+    {
+      "id": "hcie-oe-02-q09",
+      "type": "single",
+      "topic": "RBAC",
+      "prompt": "What is the scope of a Role and a RoleBinding?",
+      "options": [
+        "A single namespace",
+        "A single node",
+        "A single pod",
+        "The whole cluster"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Un Role et son RoleBinding accordent des permissions dans un namespace précis. Pour un accès cluster-wide, il faut un ClusterRole et un ClusterRoleBinding. Un RoleBinding peut référencer un ClusterRole, mais les droits restent alors limités au namespace du binding."
+    },
+    {
+      "id": "hcie-oe-02-q10",
+      "type": "single",
+      "topic": "NetworkPolicy",
+      "prompt": "Which NetworkPolicy implements a default deny-all for both ingress and egress in a namespace?",
+      "options": [
+        "A PodDisruptionBudget with minAvailable: 0",
+        "podSelector: {} with policyTypes Ingress and Egress and no rules",
+        "podSelector: {matchLabels: {app: none}} with an allow rule",
+        "A Service of type NodePort"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un podSelector vide sélectionne tous les pods du namespace ; avec les deux policyTypes et aucune règle, tout trafic entrant et sortant est refusé. Un selector qui ne correspond à rien ne bloque rien, et Service comme PDB ne filtrent pas les flux. Il faut ensuite ajouter des politiques d'autorisation explicites."
+    },
+    {
+      "id": "hcie-oe-02-q11",
+      "type": "multi",
+      "topic": "Sauvegarde etcd",
+      "prompt": "Which practices make an etcd backup usable for disaster recovery? (Choose 3)",
+      "options": [
+        "Store the snapshot outside the cluster and its failure domain",
+        "Restore the snapshot in a test environment periodically",
+        "Keep the snapshot only on the same etcd data disk",
+        "Take regular snapshots with etcdctl snapshot save"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Un snapshot régulier, conservé hors du cluster et testé par une restauration réelle constitue une sauvegarde exploitable. Le stocker uniquement sur le disque etcd le rend inutile si ce disque ou le site disparaît. La restauration de test vérifie aussi la version de l'outil et la procédure de redémarrage."
+    },
+    {
+      "id": "hcie-oe-02-q12",
+      "type": "multi",
+      "topic": "Sécurité",
+      "prompt": "Which measures reduce the impact of a compromised pod? (Choose 3)",
+      "options": [
+        "Granting cluster-admin to every ServiceAccount for simplicity",
+        "Dedicated ServiceAccount with least-privilege RBAC",
+        "NetworkPolicy limiting ingress and egress",
+        "Pod Security Admission at the restricted level"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "Un ServiceAccount dédié et minimal, des NetworkPolicy restrictives et le profil restricted de PSA limitent les actions et les communications d'un pod compromis. Donner cluster-admin à tous les ServiceAccounts transforme une compromission locale en compromission totale du cluster. La défense en profondeur combine identité, réseau et admission."
+    },
+    {
+      "id": "hcie-oe-02-q13",
+      "type": "multi",
+      "topic": "StatefulSet",
+      "prompt": "Which statements about StatefulSets and storage are correct? (Choose 3)",
+      "options": [
+        "All replicas share exactly one ReadWriteOnce PVC by design",
+        "Each replica keeps a stable ordinal identity",
+        "volumeClaimTemplates creates a PVC per replica",
+        "A headless Service is commonly used for stable DNS names"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "Un StatefulSet conserve une identité stable (pod-0, pod-1), crée un PVC par réplica via volumeClaimTemplates et s'appuie souvent sur un Service headless pour le DNS. Un PVC ReadWriteOnce est monté par un seul nœud à la fois et n'est pas partagé par conception entre tous les réplicas. Le partage de fichiers nécessite un mode ReadWriteMany et un backend adapté."
+    },
+    {
+      "id": "hcie-oe-02-q14",
+      "type": "tf",
+      "topic": "Maintenance",
+      "prompt": "kubectl drain cordons a node and evicts its evictable pods before maintenance.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "drain marque d'abord le nœud comme non planifiable (cordon), puis évince les pods qui peuvent l'être. Les DaemonSets et les pods avec stockage local exigent des options explicites comme --ignore-daemonsets ou --delete-emptydir-data. Après maintenance, uncordon rend le nœud de nouveau planifiable."
+    },
+    {
+      "id": "hcie-oe-02-q15",
+      "type": "tf",
+      "topic": "RBAC",
+      "prompt": "A ClusterRoleBinding grants its permissions only inside the namespace where it was created.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un ClusterRoleBinding accorde les permissions dans tout le cluster, car il n'est pas attaché à un namespace. C'est le RoleBinding qui limite l'effet au namespace où il réside, même lorsqu'il référence un ClusterRole. Cette distinction est essentielle pour éviter les élévations de privilèges."
+    },
+    {
+      "id": "hcie-oe-02-q16",
+      "type": "tf",
+      "topic": "HPA",
+      "prompt": "HPA can scale on custom metrics exposed through an adapter such as Prometheus Adapter.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le HPA peut consommer des métriques personnalisées ou externes via l'API metrics, alimentée par un adaptateur comme Prometheus Adapter. Cela permet de scaler sur le débit ou la latence plutôt que sur le seul CPU. L'adaptateur doit être déployé et la requête PromQL correctement configurée, sinon la métrique reste indisponible."
+    },
+    {
+      "id": "hcie-oe-02-q17",
+      "type": "text",
+      "topic": "HPA",
+      "prompt": "Give the kubectl command that creates an HPA for deployment app with 2 to 10 replicas and a 75 percent CPU target.",
+      "accept": [
+        "kubectl autoscale deployment app --min=2 --max=10 --cpu-percent=75",
+        "kubectl autoscale deployment.apps/app --min=2 --max=10 --cpu-percent=75"
+      ],
+      "sample_answer": "kubectl autoscale deployment app --min=2 --max=10 --cpu-percent=75",
+      "explanation_fr": "kubectl autoscale crée un objet HorizontalPodAutoscaler lié au Deployment, avec les bornes min et max et la cible CPU. La cible s'exprime en pourcentage des requests, pas en cœurs absolus. Vérifiez ensuite avec kubectl get hpa que la colonne TARGETS affiche une valeur et non <unknown>."
+    },
+    {
+      "id": "hcie-oe-02-q18",
+      "type": "text",
+      "topic": "Diagnostic",
+      "prompt": "Which kubectl command shows the events and scheduling failure reasons for a Pending pod named api-0?",
+      "accept": [
+        "kubectl describe pod api-0",
+        "kubectl describe pod api-0 -n <namespace>"
+      ],
+      "sample_answer": "kubectl describe pod api-0",
+      "explanation_fr": "kubectl describe pod affiche les conditions, les volumes et surtout les Events, où le scheduler indique pourquoi aucun nœud n'a été retenu. On y lit par exemple Insufficient memory, node affinity mismatch ou un PVC non lié. kubectl logs ne sert à rien ici, car le conteneur n'a pas encore démarré."
+    },
+    {
+      "id": "hcie-oe-02-q19",
+      "type": "text",
+      "topic": "Maintenance",
+      "prompt": "Which command drains node1 while ignoring DaemonSets and allowing deletion of emptyDir data?",
+      "accept": [
+        "kubectl drain node1 --ignore-daemonsets --delete-emptydir-data",
+        "kubectl drain node1 --ignore-daemonsets --delete-emptydir-data --force"
+      ],
+      "sample_answer": "kubectl drain node1 --ignore-daemonsets --delete-emptydir-data",
+      "explanation_fr": "kubectl drain évince les pods du nœud après l'avoir cordonné. --ignore-daemonsets est nécessaire car les DaemonSets ne peuvent pas être déplacés, et --delete-emptydir-data autorise la suppression des données éphémères. Sans cette dernière option, le drain s'arrête dès qu'un pod utilise emptyDir."
+    },
+    {
+      "id": "hcie-oe-02-q20",
+      "type": "text",
+      "topic": "Sauvegarde etcd",
+      "prompt": "Which etcdctl command saves a snapshot of the cluster to /backup/etcd.db?",
+      "accept": [
+        "etcdctl snapshot save /backup/etcd.db",
+        "ETCDCTL_API=3 etcdctl snapshot save /backup/etcd.db"
+      ],
+      "sample_answer": "etcdctl snapshot save /backup/etcd.db",
+      "explanation_fr": "etcdctl snapshot save capture l'état cohérent du magasin etcd dans un fichier. La restauration se fait avec etcdctl snapshot restore, sur un répertoire de données neuf, avant de redémarrer les membres. Un snapshot jamais restauré n'est qu'une hypothèse de sauvegarde."
+    }
+  ]
+}

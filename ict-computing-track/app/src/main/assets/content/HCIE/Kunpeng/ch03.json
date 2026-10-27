@@ -1,0 +1,619 @@
+{
+  "id": "hcie-kp-03",
+  "phase": "HCIE",
+  "subject": "Kunpeng",
+  "number": 3,
+  "title_fr": "Migration d'un datacenter vers Kunpeng",
+  "title_en": "Datacenter Migration to Kunpeng",
+  "minutes": 75,
+  "source": "Pas de Training Material Kunpeng dédié dans les ressources (la gamme Computing Track ne couvre Kunpeng qu'en HCIA) — contenu aligné sur la documentation publique Huawei (openEuler sur Kunpeng, Kunpeng Porting Advisor, ExaGear) et sur les pratiques d'industrie de migration de datacenter.",
+  "objectives": [
+    "Construire un inventaire applicatif et une matrice de compatibilité x86 vers ARM64 exploitables",
+    "Distinguer les applications portables, recompilables, remplaçables et non supportées",
+    "Organiser la migration en vagues avec POC, critères d'entrée et de sortie",
+    "Choisir une méthode de migration de données selon le RTO et le RPO",
+    "Concevoir une validation par tests fonctionnels, benchmark A/B et canary",
+    "Préparer une bascule réversible et décider d'un rollback sur des critères objectifs"
+  ],
+  "sections": [
+    {
+      "heading": "Cartographier le portefeuille applicatif",
+      "body": "Un projet de migration vers Kunpeng commence par une photographie précise de l'existant, pas par un plan de bascule. L'inventaire doit dépasser la liste des serveurs : pour chaque application, il faut connaître la version de l'OS, le runtime et sa version, les bibliothèques natives, les agents de supervision et de sécurité, les bases de données, les files de messages, les interfaces avec les autres systèmes, les volumes de données et les contraintes réglementaires. Un composant oublié à cette étape réapparaît toujours au pire moment, souvent pendant la fenêtre de bascule.\n\nLa matrice de compatibilité classe ensuite chaque élément selon l'effort nécessaire : natif ARM64, recompilation simple, remplacement par un équivalent, émulation transitoire, ou non supporté. Cette classification ne suffit pas : il faut la croiser avec la criticité métier. Une application de reporting interne peut être migrée en dernier sans risque, tandis qu'un service de paiement exige un POC, un plan de retour arrière et une fenêtre négociée.\n\nLe livrable n'est pas un tableur de paquets, c'est une carte de dépendances. Elle répond à trois questions : que faut-il reconstruire, dans quel ordre, et qu'est-ce qui empêche de démarrer ? Sans cette carte, les vagues se transforment en surprises successives.",
+      "bullets": [
+        "Inventorier applications, runtimes, bibliothèques natives, agents et interfaces",
+        "Classer chaque élément : natif, recompilable, remplaçable, émulé, non supporté",
+        "Croiser la compatibilité technique avec la criticité métier",
+        "Produire une carte de dépendances, pas une simple liste de serveurs"
+      ],
+      "code": [
+        "rpm -qa | sort > os_inventory.txt",
+        "ss -lntup > listening_services.txt",
+        "systemctl list-units --type=service --state=running",
+        "find /opt /usr/local -name '*.so*' -exec file {} \\; | grep -i x86"
+      ],
+      "table": {
+        "headers": [
+          "Catégorie",
+          "Exemple",
+          "Effort typique"
+        ],
+        "rows": [
+          [
+            "Natif ARM64",
+            "Paquet openEuler aarch64",
+            "Faible"
+          ],
+          [
+            "Recompilable",
+            "C/C++ avec sources",
+            "Moyen"
+          ],
+          [
+            "Remplaçable",
+            "Bibliothèque propriétaire x86",
+            "Moyen à élevé"
+          ],
+          [
+            "Émulable",
+            "Binaire legacy sans source",
+            "Transitoire, coût CPU"
+          ],
+          [
+            "Non supporté",
+            "Driver ou appliance fermé",
+            "Blocage possible"
+          ]
+        ]
+      },
+      "tip": "Un inventaire limité aux packages RPM rate les binaires copiés à la main dans /opt, les wheels Python et les agents installés par script. En examen, la première étape d'une migration est toujours l'inventaire, jamais la bascule.",
+      "exercises": []
+    },
+    {
+      "heading": "Évaluer la compatibilité applicative",
+      "body": "Les langages interprétés donnent une fausse impression de portabilité. Python, Java ou Node.js s'exécutent bien sur ARM64, mais leurs extensions natives ne suivent pas automatiquement : une wheel compilée pour x86, un module Node avec du C++ ou une bibliothèque JNI doit être reconstruit ou remplacé. Le code source reste souvent identique, mais la chaîne de build, les drapeaux du compilateur et les dépendances système changent.\n\nPour le C et le C++, la recompilation est la voie normale, à condition de traiter les hypothèses implicites : alignement mémoire, accès non alignés, ordre des octets, intrinsics SIMD écrits pour SSE ou AVX, assembleur en ligne et tailles de types. ARM64 est little-endian comme x86, ce qui élimine un grand nombre de problèmes, mais les instructions vectorielles et certaines optimisations ne se traduisent pas directement. Les outils comme file, ldd, readelf et le porting advisor aident à repérer les binaires et les dépendances à remplacer.\n\nL'émulation, avec une solution comme ExaGear, peut dépanner un binaire legacy sans source pendant une transition. Elle ne constitue pas une cible de production durable pour les charges critiques : le coût CPU et les limites de compatibilité finissent par peser. Une migration réussie remplace l'émulation par une reconstruction native dès que possible.",
+      "bullets": [
+        "Les runtimes interprétés sont portables, pas leurs extensions natives",
+        "Recompiler du C/C++ exige d'auditer SIMD, alignement et assembleur en ligne",
+        "file, ldd et readelf révèlent les binaires et dépendances x86",
+        "L'émulation est une transition, pas une cible de production durable"
+      ],
+      "code": [
+        "file ./libnative.so",
+        "ldd ./app | grep -E 'not found|x86'",
+        "readelf -h ./app | grep Machine",
+        "python3 -m pip debug --verbose | grep aarch64"
+      ],
+      "tip": "Une compilation qui réussit ne garantit pas un comportement correct : les tests de non-régression doivent couvrir les calculs numériques, la sérialisation et les chemins qui dépendent de l'alignement ou de la taille des types.",
+      "exercises": [
+        {
+          "prompt": "Lors d'un inventaire, vous découvrez dans /opt une bibliothèque libcodec.so compilée pour x86, utilisée par un service Python dont les sources sont disponibles. Le service est critique. Quelle démarche suivez-vous avant la bascule ?",
+          "correction": "On confirme d'abord l'architecture et les dépendances avec file, readelf et ldd pour identifier tous les binaires x86, pas seulement celui repéré. On recherche ensuite les sources ou le paquet ARM64 officiel : si les sources existent, on reconstruit la bibliothèque avec le compilateur ARM64 et les options adaptées, puis on exécute les tests de non-régression sur les fonctions de codage et de décodage. Si les sources sont indisponibles, on cherche un équivalent maintenu en ARM64 ; l'émulation peut servir de solution transitoire mais doit être documentée comme risque et limitée dans le temps. Enfin, on ajoute un contrôle de dépendance dans le pipeline CI pour empêcher la réintroduction d'un binaire x86 et on valide le service de bout en bout avant la fenêtre de bascule."
+        }
+      ]
+    },
+    {
+      "heading": "Organiser les vagues et les POC",
+      "body": "Une migration en une seule vague concentre tous les risques sur une nuit : c'est rarement une bonne idée. Le découpage par vagues permet d'apprendre sur des périmètres maîtrisés avant d'attaquer les systèmes critiques. La première vague rassemble généralement les services sans état, les outils internes, les environnements de test et les applications dont le retour arrière est immédiat. La deuxième couvre les middlewares standards : reverse proxies, files de messages, caches, services de découverte. La troisième concerne les bases de données critiques, les systèmes temps réel et les applicatifs réglementés.\n\nChaque vague doit définir des critères d'entrée et de sortie explicites. À l'entrée : inventaire validé, POC concluant, plan de rollback testé, équipe formée, fenêtre approuvée. À la sortie : tests fonctionnels passés, performance conforme, données vérifiées, incidents clos, documentation à jour. Sans ces critères, une vague dérive et contamine la suivante.\n\nLe POC n'est pas une démonstration commerciale : c'est une répétition à échelle réduite avec la vraie application, les vraies données anonymisées et les vrais outils d'exploitation. Il révèle les dépendances oubliées, les licences incompatibles et les performances réelles. Mieux vaut découvrir ces points trois semaines avant la bascule que pendant la nuit de cutover.",
+      "bullets": [
+        "Vague 1 : services sans état et outils ; vague 3 : bases critiques",
+        "Chaque vague a des critères d'entrée et de sortie explicites",
+        "Le POC utilise la vraie application et des données réalistes",
+        "Un rollback non testé n'est pas un rollback"
+      ],
+      "code": [
+        "ansible-playbook -i inventories/poc site.yml --check",
+        "kubectl get nodes -o wide",
+        "kubectl get pods -A -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName"
+      ],
+      "diagram": "Vague 0  : environnement de test, outillage, CI/CD\nVague 1  : services sans état, portails, outils internes\nVague 2  : middlewares (proxy, MQ, cache, DNS interne)\nVague 3  : bases critiques, temps réel, applicatifs réglementés\n           |\n           +--> chaque vague : POC -> pilote -> généralisation\n                critères go/no-go + rollback testé",
+      "tip": "Ne placez jamais une base critique en vague 1 sous prétexte qu'elle est « prête techniquement ». La maturité de l'équipe et la qualité du rollback comptent autant que la compatibilité binaire.",
+      "exercises": []
+    },
+    {
+      "heading": "Migrer l'OS et l'infrastructure",
+      "body": "Une migration x86 vers ARM64 ne se fait pas en place : le jeu d'instructions change, donc le noyau, les pilotes et tous les binaires doivent être reconstruits. L'approche fiable consiste à provisionner des serveurs ARM64 neufs avec openEuler, puis à rejouer la configuration via Infrastructure as Code. Ansible, cloud-init ou tout autre outil idempotent garantit que le serveur ARM reçoit la même configuration que son prédécesseur x86, à quelques exceptions près : noms d'interface, pilotes, paramètres de noyau et chemins de bibliothèques.\n\nLes conteneurs simplifient une partie du travail mais ne suppriment pas l'architecture : une image construite pour amd64 ne s'exécute pas nativement sur ARM64. Il faut reconstruire les images avec buildx et publier un manifeste multi-arch, ou faire compiler le pipeline pour chaque plateforme. Les charts Helm et les manifestes Kubernetes doivent éviter les images figées sur une seule architecture et les nodeSelector codés en dur.\n\nLa période de double run est précieuse : l'infrastructure ARM tourne en parallèle de l'ancienne, reçoit du trafic de test ou une copie du trafic, et prouve sa stabilité avant la bascule. Cette période révèle les écarts de configuration, les dépendances réseau et les oublis de supervision. Elle coûte quelques semaines de capacité, mais elle évite une migration à l'aveugle.",
+      "bullets": [
+        "Pas de migration in-place entre jeux d'instructions : reconstruction ARM64",
+        "Rejouer la configuration avec Ansible ou cloud-init idempotents",
+        "Reconstruire les images et publier un manifeste multi-arch",
+        "Double run pour valider la configuration et la supervision"
+      ],
+      "code": [
+        "ansible-playbook -i inventories/arm64 site.yml",
+        "docker buildx build --platform linux/amd64,linux/arm64 -t app:1.0 --push .",
+        "docker manifest inspect app:1.0",
+        "kubectl get nodes -l kubernetes.io/arch=arm64"
+      ],
+      "tip": "Un manifeste Kubernetes qui contient image: app:latest sans contrôle d'architecture peut tirer une image amd64 et échouer avec exec format error. Vérifiez le manifeste multi-arch, pas seulement le succès du build.",
+      "exercises": []
+    },
+    {
+      "heading": "Migrer les données sans perdre le fil",
+      "body": "La migration des données est souvent le point le plus sensible, car elle touche à l'état métier. Trois méthodes se combinent selon la taille et le RTO. Le dump/restore convient aux bases petites ou moyennes et aux fenêtres d'indisponibilité acceptables : on exporte, on transfère, on restaure, on vérifie. La réplication logique convient aux bases plus grosses : on initialise une copie, puis on rejoue en continu les changements vers la cible, ce qui réduit la fenêtre de gel. Le change data capture pousse la logique plus loin en lisant le journal des transactions et en propageant chaque changement, avec une latence faible et un impact maîtrisé sur la source.\n\nLa séquence est toujours la même : instantané initial, réplication continue, validation, gel des écritures, rattrapage final, bascule des connexions, puis réplication inverse pour le rollback. Les vérifications ne se limitent pas au nombre de lignes : il faut comparer des checksums sur les colonnes clés, contrôler les séquences et les identités, vérifier les procédures stockées, les collations, les jeux de caractères et les objets volumineux. Un count identique peut cacher des lignes différentes.\n\nLes fichiers suivent le même principe : transfert avec rsync, comparaison des checksums, puis synchronisation finale pendant le gel. Le rollback repose sur la réplication inverse et sur la conservation de l'infrastructure source jusqu'à la fin de la fenêtre de réversibilité.",
+      "bullets": [
+        "dump/restore pour les petites bases, réplication logique pour les grosses, CDC pour le quasi zéro downtime",
+        "Séquence : instantané, réplication, validation, gel, rattrapage, bascule",
+        "Comparer checksums, séquences, collations et objets, pas seulement les counts",
+        "La réplication inverse est le chemin de rollback des données"
+      ],
+      "code": [
+        "pg_dump -Fc source_db -f /tmp/prod.dump",
+        "gs_restore -d arm_target /tmp/prod.dump",
+        "rsync -aHAX --checksum /data/ arm-target:/data/",
+        "SELECT count(*), sum(hashtext(t::text)) FROM orders t;"
+      ],
+      "diagram": "Source x86                         Cible ARM64\n+-----------+   instantané    +-----------+\n|  Base     | ------------->  |  Base     |\n|  active   |                 |  réplique |\n+-----+-----+                 +-----+-----+\n      |  CDC / réplication logique   ^\n      +-----------------------------+\n      |  gel + rattrapage final      |\n      v                              |\n  bascule des connexions ------------+\n      |\n      +--> réplication inverse (rollback)",
+      "tip": "Les nombres de lignes identiques ne prouvent rien : deux tables peuvent avoir le même count avec des contenus différents. En examen, l'intégrité se valide par checksums et tests applicatifs, pas par un simple SELECT COUNT(*).",
+      "exercises": [
+        {
+          "prompt": "Une base de 8 To doit migrer avec un RTO de 30 minutes et un RPO de 5 minutes. Décrivez la méthode et l'enchaînement de bascule, puis les contrôles d'intégrité.",
+          "correction": "Un dump/restore de 8 To ne tient pas dans un RTO de 30 minutes : on retient une réplication logique ou du CDC. On commence par un instantané initial, puis on laisse la réplication continue rattraper l'écart. On valide régulièrement les checksums par table et les objets annexes (séquences, index, procédures, collations). Le jour J, on abaisse le TTL DNS, on gèle les écritures, on attend que le retard de réplication soit nul, on vérifie une dernière fois les checksums et les counts, puis on bascule les connexions applicatives vers ARM64. On conserve la réplication inverse active pour permettre un retour arrière pendant la fenêtre convenue. Après bascule, on surveille les erreurs, la latence et la cohérence métier. Le RPO de 5 minutes impose que la réplication soit supervisée et alertée bien avant le cutover."
+        }
+      ]
+    },
+    {
+      "heading": "Valider : tests, benchmark A/B et canary",
+      "body": "La validation d'une migration ne se réduit pas à « l'application démarre ». Elle se construit en couches. Les tests unitaires et d'intégration vérifient que le comportement fonctionnel est inchangé. Les tests de bout en bout rejouent les parcours métier critiques sur un environnement ARM64 aussi proche que possible de la production. Les tests de performance comparent les mêmes workloads, avec les mêmes clients, la même topologie réseau et les mêmes versions applicatives, sur x86 et sur ARM64.\n\nLe benchmark A/B doit être équitable : pas de comparaison entre un serveur x86 surdimensionné et un pod ARM64 sous-dimensionné, pas de mesure à froid sans warm-up, pas de différence de données. On compare le débit, la latence moyenne, le p99, le taux d'erreur et la consommation de ressources. Une dégradation de quelques pour cent du p99 peut être acceptable si le coût global baisse ; une dégradation du taux d'erreur ne l'est jamais.\n\nLe canary prolonge la validation en production. On dirige 5 à 10 % du trafic vers ARM64 pendant plusieurs jours, en comparant en continu les métriques avec la référence x86. Les critères de sortie sont définis à l'avance : taux d'erreur stable, p99 dans la marge convenue, absence d'anomalie métier. Le canary n'est pas un test de charge : c'est une observation contrôlée du comportement réel.",
+      "bullets": [
+        "Valider en couches : unitaire, intégration, bout en bout, performance",
+        "Benchmark A/B à configuration, données et charge égales",
+        "Comparer débit, p99, erreurs et ressources, pas seulement la moyenne",
+        "Canary 5-10 % avec critères de sortie définis à l'avance"
+      ],
+      "code": [
+        "kubectl set image deploy/app app=registry/app:arm64",
+        "kubectl get pods -o wide | grep arm64",
+        "hey -z 5m -c 50 https://api.example.com/health",
+        "kubectl top pods -l app=api"
+      ],
+      "table": {
+        "headers": [
+          "Niveau",
+          "Objectif",
+          "Signal d'échec"
+        ],
+        "rows": [
+          [
+            "Fonctionnel",
+            "Comportement identique",
+            "Test rouge, régression métier"
+          ],
+          [
+            "Performance",
+            "Débit et p99 conformes",
+            "Dégradation hors marge"
+          ],
+          [
+            "Intégrité",
+            "Données exactes",
+            "Checksum ou count incohérent"
+          ],
+          [
+            "Canary",
+            "Comportement en production",
+            "Erreurs ou latence anormales"
+          ]
+        ]
+      },
+      "tip": "Un canary sans baseline x86 contemporaine ne prouve rien : les conditions de charge changent. Comparez toujours les deux populations sur la même période et avec les mêmes indicateurs.",
+      "exercises": []
+    },
+    {
+      "heading": "Bascule, rollback et stabilisation",
+      "body": "La bascule est un processus répété, pas un moment d'improvisation. Le runbook décrit chaque étape, son responsable, sa durée estimée, son point de contrôle et le signal qui déclenche un go ou un no-go. Il commence par la répétition générale, plusieurs jours avant, puis la préparation de la fenêtre : baisse du TTL DNS, vérification des sauvegardes, gel des changements, communication aux équipes. Le jour J, on gèle les écritures, on effectue le rattrapage final, on vérifie les données, on bascule le load balancer ou le DNS, puis on surveille.\n\nLe rollback doit être décidé sur des critères objectifs, pas sur l'émotion du moment. On définit à l'avance les seuils : taux d'erreur supérieur à un niveau, p99 au-delà de la marge, corruption de données, fonctionnalité critique indisponible. La décision appartient à un rôle nommé, qui dispose du pouvoir d'arrêter. Le retour arrière suppose que l'infrastructure source est encore intacte, que la réplication inverse fonctionne et que les données écrites sur la cible peuvent être réconciliées. Un rollback non testé est une hypothèse, pas une sécurité.\n\nAprès la bascule commence la période de stabilisation : surveillance renforcée, astreinte, revue quotidienne des incidents, correction des écarts. On ne clôture pas une vague le lendemain du cutover, mais après une période de stabilité démontrée et un sign-off formel.",
+      "bullets": [
+        "Runbook répété avec responsables, points de contrôle et critères go/no-go",
+        "Rollback décidé sur des seuils objectifs et par un rôle nommé",
+        "Le retour arrière exige une source intacte et une réplication inverse testée",
+        "La clôture intervient après une période de stabilité démontrée"
+      ],
+      "code": [
+        "kubectl rollout undo deploy/app",
+        "kubectl set image deploy/app app=registry/app:x86-1.4",
+        "dig +short api.example.com",
+        "kubectl rollout status deploy/app --timeout=5m"
+      ],
+      "diagram": "J-7   répétition générale, rollback testé\nJ-1   sauvegardes, TTL DNS abaissé, gel des changements\nJ0    gel écritures -> rattrapage -> contrôles -> switch LB/DNS\nJ0+   hypercare, métriques, décision go/no-go de poursuite\nJ+30  revue de stabilité, sign-off, clôture de la vague",
+      "tip": "Un TTL DNS de 24 heures rend un rollback très lent, même si l'application est prête. En examen, la préparation du rollback inclut la réduction du TTL bien avant la fenêtre de bascule.",
+      "exercises": [
+        {
+          "prompt": "Trente minutes après la bascule, le taux d'erreur de l'API passe de 0,2 % à 4 % sur ARM64, le p99 reste correct et les données semblent cohérentes. Le runbook prévoit un seuil de rollback à 2 % d'erreurs. Que faites-vous et comment documentez-vous la décision ?",
+          "correction": "Le seuil objectif est franchi : on déclenche le rollback prévu, sans attendre que la situation se dégrade ni tenter une correction à chaud pendant la fenêtre. Le responsable nommé valide la décision, on bascule le load balancer ou l'image vers la version x86, on vérifie le retour du taux d'erreur et la cohérence des données, puis on gèle les écritures sur la cible pour réconcilier les transactions éventuellement créées. On documente l'heure, les métriques observées, la décision, les actions et les données à analyser. L'analyse post-incident cherche la cause racine : dépendance native, différence de configuration, agent manquant ou comportement applicatif spécifique. La migration reprend ensuite avec un correctif validé et un nouveau canary, pas par une nouvelle bascule immédiate."
+        }
+      ]
+    },
+    {
+      "heading": "TCO, compétences et clôture",
+      "body": "Le business case d'une migration ne se limite pas au prix des serveurs. Le coût total de possession inclut le matériel, les licences, l'énergie, l'espace en baie, le refroidissement, les coûts de portage, la formation des équipes et la double exploitation pendant la transition. Une licence facturée au cœur peut coûter plus cher sur une machine ARM64 très dense que sur un serveur x86 à moins de cœurs ; à l'inverse, une meilleure densité peut réduire le nombre de serveurs et la consommation électrique. Il faut comparer à périmètre et performance équivalents.\n\nLa performance par watt et le taux de consolidation sont souvent plus pertinents que le prix d'achat brut. Un serveur ARM64 qui offre le même débit avec moins de machines réduit aussi les coûts d'exploitation, mais seulement si les applications sont correctement dimensionnées et que les équipes savent les exploiter. Une migration techniquement réussie mais mal accompagnée finit en dette opérationnelle.\n\nLa clôture d'une vague repose sur des preuves : métriques stables, incidents clos, documentation à jour, runbooks transférés, équipes formées et bénéfices mesurés par rapport au business case. C'est aussi le moment de capitaliser : les dépendances découvertes, les scripts de portage et les procédures de rollback serviront aux vagues suivantes.",
+      "bullets": [
+        "Le TCO inclut licences, énergie, portage, formation et double exploitation",
+        "Comparer à performance et périmètre équivalents, pas au prix d'achat",
+        "La densité ARM peut réduire l'empreinte, mais alourdit parfois les licences par cœur",
+        "La clôture exige des preuves de stabilité et un transfert de compétences"
+      ],
+      "code": [
+        "dmidecode -t processor | grep -E 'Core Count|Thread Count'",
+        "lscpu | grep -E '^CPU\\(s\\)|Core|Socket'",
+        "kubectl describe node | grep -A5 'Allocated resources'",
+        "powerstat -d 0 1 60"
+      ],
+      "table": {
+        "headers": [
+          "Poste de coût",
+          "Exemple",
+          "Piège fréquent"
+        ],
+        "rows": [
+          [
+            "Matériel",
+            "Serveurs Kunpeng",
+            "Comparer à cœurs inégaux"
+          ],
+          [
+            "Licences",
+            "Facturation par socket ou par cœur",
+            "Densité qui augmente le coût"
+          ],
+          [
+            "Énergie",
+            "Consommation et refroidissement",
+            "Oubliée dans le business case"
+          ],
+          [
+            "Portage",
+            "Recompilation, tests, experts",
+            "Sous-estimé sur les binaires legacy"
+          ],
+          [
+            "Exploitation",
+            "Formation, astreinte, double run",
+            "Compétences non transférées"
+          ]
+        ]
+      },
+      "tip": "Un gain de 20 % sur le prix du matériel peut disparaître si les licences sont facturées par cœur et que la densité double. En examen, le TCO se raisonne toujours à périmètre de service équivalent.",
+      "exercises": []
+    }
+  ],
+  "key_points": [
+    "La migration commence par un inventaire et une matrice de compatibilité croisés avec la criticité métier.",
+    "Les runtimes interprétés sont portables, mais leurs extensions natives doivent être reconstruites.",
+    "Les vagues vont du moins risqué au plus critique, avec POC, critères go/no-go et rollback testé.",
+    "Une migration OS x86 vers ARM64 se fait par reconstruction et Infrastructure as Code, jamais in-place.",
+    "Les images de conteneurs doivent être reconstruites et publiées en manifeste multi-arch.",
+    "La migration de données combine dump/restore, réplication logique ou CDC selon le RTO et le RPO.",
+    "L'intégrité se vérifie par checksums, tests applicatifs et contrôles des objets, pas par les seuls counts.",
+    "La bascule se décide sur des seuils objectifs ; la clôture exige une période de stabilité démontrée."
+  ],
+  "traps": [
+    "Croire qu'une migration OS in-place est possible entre x86 et ARM64 : le jeu d'instructions impose une reconstruction.",
+    "Valider les données uniquement par SELECT COUNT(*) : deux tables peuvent avoir le même nombre de lignes et des contenus différents.",
+    "Lancer un canary sans baseline x86 contemporaine : la comparaison ne prouve alors rien.",
+    "Prévoir un rollback théorique sans avoir testé la réplication inverse ni réduit le TTL DNS.",
+    "Clôturer une vague dès le cutover réussi, sans période de stabilisation ni sign-off."
+  ],
+  "quiz": [
+    {
+      "id": "hcie-kp-03-q01",
+      "type": "single",
+      "prompt": "What is the first step of a datacenter migration to Kunpeng?",
+      "options": [
+        "Building an application inventory and compatibility matrix",
+        "Decommissioning the x86 servers",
+        "Running the production cutover",
+        "Switching DNS to the ARM64 cluster"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "L'inventaire et la matrice de compatibilité établissent quelles applications sont natives, recompilables, remplaçables ou bloquées, et dans quel ordre les migrer. Basculer le DNS, décommissionner le x86 ou lancer le cutover avant cette étape revient à migrer sans connaître les dépendances.",
+      "topic": "Cadrage"
+    },
+    {
+      "id": "hcie-kp-03-q02",
+      "type": "single",
+      "prompt": "Why is an in-place OS upgrade from CentOS x86 to openEuler ARM64 not feasible?",
+      "options": [
+        "The two distributions use different package managers",
+        "The CPU instruction set architecture is different",
+        "openEuler does not support containers",
+        "The DNS configuration would change"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le jeu d'instructions x86 et ARM64 est incompatible : le noyau, les pilotes et tous les binaires doivent être reconstruits pour AArch64. Les gestionnaires de paquets, le support des conteneurs et la configuration DNS ne sont pas les causes profondes de cette impossibilité.",
+      "topic": "Migration OS"
+    },
+    {
+      "id": "hcie-kp-03-q03",
+      "type": "single",
+      "prompt": "Which technique minimizes downtime when migrating a large, continuously updated database?",
+      "options": [
+        "A manual export of selected tables",
+        "A full dump taken during peak hours",
+        "Change data capture with continuous replication",
+        "A nightly backup restored a week later"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "CDC lit le journal des transactions et propage continuellement les changements vers la cible, ce qui réduit la fenêtre de gel à un rattrapage final court. Un dump au pic, une sauvegarde restaurée une semaine plus tard ou un export manuel imposent une indisponibilité ou une perte de données incompatible avec un RTO et un RPO stricts.",
+      "topic": "Migration des données"
+    },
+    {
+      "id": "hcie-kp-03-q04",
+      "type": "single",
+      "prompt": "Which command builds and pushes a multi-architecture image for ARM64 and x86?",
+      "options": [
+        "docker commit --arch arm64 app",
+        "docker save --platform arm64 app",
+        "docker build --platform arm64 .",
+        "docker buildx build --platform linux/amd64,linux/arm64 -t app:1.0 --push ."
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "buildx construit plusieurs variantes et --push publie le manifeste multi-arch qui permet aux nœuds de tirer la bonne image. docker build classique ne produit pas de manifeste multi-arch, docker commit crée une image à partir d'un conteneur et docker save exporte une image locale sans gérer les architectures.",
+      "topic": "Conteneurs"
+    },
+    {
+      "id": "hcie-kp-03-q05",
+      "type": "single",
+      "prompt": "Which pair of metrics is most relevant to decide whether a canary can receive 100 percent of traffic?",
+      "options": [
+        "Error rate and p99 latency compared with the x86 baseline",
+        "Number of commits and container image size",
+        "CPU model and disk capacity",
+        "Number of YAML files and deployment speed"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le canary se juge sur le comportement observé : taux d'erreur et latence p99 comparés à une baseline x86 contemporaine. Le nombre de fichiers, la vitesse de déploiement, la taille d'image ou le modèle de CPU ne disent rien de la qualité de service réellement perçue.",
+      "topic": "Validation"
+    },
+    {
+      "id": "hcie-kp-03-q06",
+      "type": "single",
+      "prompt": "What is reverse replication used for during a migration?",
+      "options": [
+        "Speeding up the initial dump",
+        "Providing a tested rollback path to the source system",
+        "Compressing backups",
+        "Encrypting data at rest"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "La réplication inverse propage les changements de la cible ARM64 vers la source x86, ce qui permet de revenir en arrière sans perdre les écritures effectuées après la bascule. Elle n'accélère pas le dump initial, ne compresse pas les sauvegardes et ne chiffre pas les données.",
+      "topic": "Rollback"
+    },
+    {
+      "id": "hcie-kp-03-q07",
+      "type": "single",
+      "prompt": "What is the appropriate role of x86 emulation such as ExaGear in a migration?",
+      "options": [
+        "A tool that recompiles C++ automatically",
+        "A permanent production target for all critical workloads",
+        "A transitional measure for legacy binaries without available sources",
+        "A replacement for the compatibility inventory"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "L'émulation permet de faire tourner temporairement un binaire x86 sans source sur ARM64, le temps de trouver ou reconstruire une version native. Elle ne doit pas devenir la cible permanente des charges critiques, ne remplace pas l'inventaire et ne recompile rien : elle interprète ou traduit les instructions.",
+      "topic": "Compatibilité"
+    },
+    {
+      "id": "hcie-kp-03-q08",
+      "type": "single",
+      "prompt": "Which wave order is recommended for a datacenter migration?",
+      "options": [
+        "Alphabetical order of application names",
+        "All applications simultaneously to reduce the project duration",
+        "Critical databases first, then internal tools",
+        "Low-risk stateless services first, critical databases last"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "On commence par les services sans état et les outils internes, dont le rollback est simple, pour apprendre et corriger les procédures. Les bases critiques viennent ensuite, une fois les runbooks et l'outillage éprouvés. L'ordre alphabétique ou le big bang concentrent les risques sans permettre d'apprentissage.",
+      "topic": "Vagues de migration"
+    },
+    {
+      "id": "hcie-kp-03-q09",
+      "type": "single",
+      "prompt": "Why are checksums required in addition to row counts during data validation?",
+      "options": [
+        "They detect content differences even when row counts match",
+        "They replace the need for application tests",
+        "They encrypt the migrated data",
+        "They make the migration faster"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Deux tables peuvent avoir exactement le même nombre de lignes avec des valeurs différentes, des lignes dupliquées ou des colonnes tronquées. Les checksums sur les colonnes clés détectent ces écarts. Ils n'accélèrent pas la migration, ne remplacent pas les tests fonctionnels et ne chiffrent rien.",
+      "topic": "Intégrité des données"
+    },
+    {
+      "id": "hcie-kp-03-q10",
+      "type": "single",
+      "prompt": "When can a migration wave be formally closed?",
+      "options": [
+        "As soon as the cutover command succeeds",
+        "After a demonstrated stability period, incident review and sign-off",
+        "When the x86 servers are powered off",
+        "When the first canary request succeeds"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "La clôture exige une période de stabilité observée, une revue des incidents, une documentation à jour et un sign-off formel. Le succès immédiat du cutover, l'extinction des serveurs x86 ou une seule requête canary ne prouvent pas que la vague est stable et exploitable.",
+      "topic": "Clôture"
+    },
+    {
+      "id": "hcie-kp-03-q11",
+      "type": "multi",
+      "prompt": "Which elements belong in a migration inventory? (Choose three.)",
+      "options": [
+        "Monitoring and security agents",
+        "Database versions and data volumes",
+        "The color scheme of the internal portal",
+        "The office floor plan",
+        "Application runtimes and native dependencies"
+      ],
+      "answer": [
+        0,
+        1,
+        4
+      ],
+      "explanation_fr": "L'inventaire doit couvrir les runtimes, les dépendances natives, les agents de supervision et de sécurité, les bases et les volumes de données, car chacun peut bloquer la migration. La charte graphique d'un portail et le plan des bureaux n'ont pas d'impact sur la compatibilité ARM64.",
+      "topic": "Cadrage"
+    },
+    {
+      "id": "hcie-kp-03-q12",
+      "type": "multi",
+      "prompt": "Which controls validate data integrity after a database migration? (Choose three.)",
+      "options": [
+        "Verification of sequences and identity values",
+        "End-to-end application tests on migrated data",
+        "A single SELECT COUNT(*) on one table",
+        "A ping to the database server",
+        "Checksums on key columns"
+      ],
+      "answer": [
+        0,
+        1,
+        4
+      ],
+      "explanation_fr": "Les checksums détectent les différences de contenu, la vérification des séquences évite les collisions d'identifiants et les tests applicatifs valident les parcours métier. Un count unique peut masquer des écarts, et un ping ne prouve que la joignabilité réseau, pas l'intégrité des données.",
+      "topic": "Intégrité des données"
+    },
+    {
+      "id": "hcie-kp-03-q13",
+      "type": "multi",
+      "prompt": "Which conditions must be met before increasing canary traffic? (Choose three.)",
+      "options": [
+        "The deployment pipeline has produced more YAML files",
+        "Error rate remains comparable to the x86 baseline",
+        "p99 latency stays within the agreed margin",
+        "No business or data integrity anomaly is observed",
+        "The ARM64 nodes have a newer kernel than production"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "L'augmentation du trafic canary dépend de la stabilité des erreurs, du respect de la marge de p99 et de l'absence d'anomalie métier ou de données. Un noyau plus récent ou un plus grand nombre de fichiers YAML ne sont pas des critères de qualité de service.",
+      "topic": "Validation"
+    },
+    {
+      "id": "hcie-kp-03-q14",
+      "type": "multi",
+      "prompt": "Which elements make a rollback plan credible? (Choose three.)",
+      "options": [
+        "Keeping the source infrastructure available during the rollback window",
+        "Testing reverse replication before the cutover",
+        "Defining objective thresholds and a named decision owner",
+        "Assuming the source data is unchanged after cutover",
+        "Relying on DNS with a 24-hour TTL"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Un rollback crédible suppose une source intacte, une réplication inverse testée et des critères de décision objectifs portés par un rôle nommé. Supposer que les données source n'ont pas changé ignore les écritures post-bascule, et un TTL de 24 heures rend le retour DNS beaucoup trop lent.",
+      "topic": "Rollback"
+    },
+    {
+      "id": "hcie-kp-03-q15",
+      "type": "tf",
+      "prompt": "An in-place operating system upgrade can convert an x86 CentOS server into an ARM64 openEuler server.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un système d'exploitation est compilé pour un jeu d'instructions donné : les binaires x86 ne peuvent pas devenir des binaires ARM64 par une simple mise à jour. Il faut provisionner un serveur ARM64, installer openEuler et rejouer la configuration avec les outils d'automatisation.",
+      "topic": "Migration OS"
+    },
+    {
+      "id": "hcie-kp-03-q16",
+      "type": "tf",
+      "prompt": "Matching row counts on source and target tables is sufficient proof of data integrity.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Des comptages identiques peuvent cacher des valeurs modifiées, des doublons, des colonnes tronquées ou des objets manquants. Il faut compléter par des checksums, le contrôle des séquences et des tests applicatifs de bout en bout.",
+      "topic": "Intégrité des données"
+    },
+    {
+      "id": "hcie-kp-03-q17",
+      "type": "tf",
+      "prompt": "A properly published multi-architecture image can run on both x86 and ARM64 Kubernetes nodes.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Un manifeste multi-arch référence une variante par architecture ; le runtime tire celle qui correspond au nœud. Cela suppose que chaque variante a bien été construite et publiée, et que le manifeste n'est pas figé sur une seule plateforme.",
+      "topic": "Conteneurs"
+    },
+    {
+      "id": "hcie-kp-03-q18",
+      "type": "text",
+      "prompt": "Which Ansible command applies site.yml using the inventory arm64_inventory? (Enter the full command.)",
+      "options": [],
+      "answer": [],
+      "accept": [
+        "ansible-playbook -i arm64_inventory site.yml",
+        "ansible-playbook -i inventories/arm64 site.yml",
+        "ansible-playbook -i ./arm64_inventory site.yml"
+      ],
+      "sample_answer": "ansible-playbook -i arm64_inventory site.yml",
+      "explanation_fr": "ansible-playbook applique un playbook de manière idempotente sur les hôtes décrits par l'inventaire. L'option -i désigne l'inventaire ARM64, ce qui permet de rejouer la même configuration que sur x86 sans intervention manuelle.",
+      "topic": "Infrastructure as Code"
+    },
+    {
+      "id": "hcie-kp-03-q19",
+      "type": "text",
+      "prompt": "Which command restores an openGauss custom-format dump into the database arm_target? (Enter the full command.)",
+      "options": [],
+      "answer": [],
+      "accept": [
+        "gs_restore -d arm_target /tmp/prod.dump",
+        "gs_restore -d arm_target prod.dump"
+      ],
+      "sample_answer": "gs_restore -d arm_target /tmp/prod.dump",
+      "explanation_fr": "gs_restore restaure un dump au format personnalisé produit par gs_dump, en le dirigeant vers la base cible avec -d. Cette étape doit être suivie de contrôles de checksums, de séquences et de tests applicatifs, car une restauration réussie ne garantit pas l'intégrité fonctionnelle.",
+      "topic": "Migration des données"
+    },
+    {
+      "id": "hcie-kp-03-q20",
+      "type": "text",
+      "prompt": "Which metric defines the maximum acceptable amount of data loss after an incident? (Enter the acronym.)",
+      "options": [],
+      "answer": [],
+      "accept": [
+        "RPO",
+        "rpo",
+        "Recovery Point Objective"
+      ],
+      "sample_answer": "RPO",
+      "explanation_fr": "Le RPO, Recovery Point Objective, exprime la perte de données maximale tolérable, en unités de temps ou de transactions. Il détermine la fréquence des sauvegardes ou la mise en place d'une réplication continue, tandis que le RTO mesure le délai maximal de remise en service.",
+      "topic": "Continuité"
+    }
+  ]
+}

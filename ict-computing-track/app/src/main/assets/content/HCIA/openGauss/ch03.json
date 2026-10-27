@@ -1,0 +1,543 @@
+{
+  "id": "hcia-og-03",
+  "phase": "HCIA",
+  "subject": "openGauss",
+  "number": 3,
+  "title_fr": "SQL : types, DDL, DML et requêtes",
+  "title_en": "SQL: Data Types, DDL, DML and Queries",
+  "minutes": 50,
+  "source": "HCIA-openGauss V2.0 Training Material — Session 5 «SQL Syntax Quick Start» · Lab Guide (SQL)",
+  "objectives": [
+    "Choisir le type de données adapté à chaque colonne",
+    "Créer et modifier des objets avec les instructions DDL",
+    "Écrire des DML sûres et comprendre les transactions",
+    "Construire des requêtes avec filtres, jointures, agrégats et tri",
+    "Lire un plan d'exécution et éviter les pièges d'indexation"
+  ],
+  "sections": [
+    {
+      "heading": "1. Types de données et choix de conception",
+      "body": "Le type d'une colonne n'est pas un détail cosmétique : il détermine la précision, l'espace disque, les index possibles et les conversions implicites. Pour les chaînes, char(n) complète à droite avec des espaces jusqu'à la longueur n, tandis que varchar(n) stocke la longueur réelle et text n'impose aucune limite pratique. Pour un identifiant variable, varchar est presque toujours préférable.\n\nPour les nombres, integer et bigint suffisent aux compteurs, mais les montants exigent numeric(p,s) ou decimal(p,s), qui stockent une valeur décimale exacte. Les types real et double precision sont binaires : ils conviennent aux mesures scientifiques, pas à la comptabilité, car 0,1 n'y possède pas de représentation exacte. Pour les dates, date ne garde que le jour, timestamp garde la date et l'heure, timestamptz normalise en UTC et interval représente une durée.\n\nopenGauss ajoute des types utiles comme serial, qui crée une séquence et une valeur par défaut, json et jsonb pour les documents, bytea pour le binaire, uuid pour les identifiants globaux et boolean pour vrai/faux. Le type doit être choisi à la création : le changer ensuite impose une réécriture de table et un verrou.",
+      "bullets": [
+        "char(n) complète avec des espaces ; varchar(n) et text non",
+        "numeric(p,s) exact pour l'argent ; real et double pour le scientifique",
+        "date, timestamp, timestamptz et interval couvrent les besoins temporels",
+        "serial = séquence + valeur par défaut ; jsonb pour les documents"
+      ],
+      "code": [
+        "CREATE TABLE app.orders (",
+        "  id bigserial PRIMARY KEY,",
+        "  customer_id integer NOT NULL,",
+        "  amount numeric(12,2) NOT NULL CHECK (amount > 0),",
+        "  status varchar(16) DEFAULT 'new',",
+        "  created_at timestamptz DEFAULT now()",
+        ");"
+      ],
+      "table": {
+        "headers": [
+          "Besoin",
+          "Type recommandé",
+          "À éviter"
+        ],
+        "rows": [
+          [
+            "Montant financier",
+            "numeric(12,2)",
+            "real, double precision"
+          ],
+          [
+            "Nom ou libellé variable",
+            "varchar(n) ou text",
+            "char(n) surdimensionné"
+          ],
+          [
+            "Identifiant auto-incrémenté",
+            "bigserial",
+            "Entier géré à la main"
+          ],
+          [
+            "Date et heure avec fuseau",
+            "timestamptz",
+            "varchar contenant du texte"
+          ]
+        ]
+      },
+      "tip": "Un QCM oppose souvent numeric et double precision pour les montants. La réponse est numeric, car elle garantit l'exactitude décimale ; double precision introduit des erreurs d'arrondi binaires."
+    },
+    {
+      "heading": "2. DDL : créer, modifier et supprimer des objets",
+      "body": "Le DDL décrit la structure : CREATE, ALTER, DROP et TRUNCATE. CREATE TABLE déclare les colonnes, les types et les contraintes. La clé primaire identifie chaque ligne de façon unique et non nulle ; la clé étrangère garantit qu'une valeur existe dans une table parente ; UNIQUE interdit les doublons ; CHECK impose une condition ; NOT NULL et DEFAULT complètent la robustesse.\n\nALTER TABLE fait évoluer une table existante : ajouter une colonne, changer son type, la renommer, la supprimer, ajouter une contrainte. Ces opérations peuvent verrouiller la table, surtout sur les gros volumes. DROP TABLE supprime la table et son contenu ; l'option CASCADE entraîne la suppression des objets dépendants, comme les vues qui la référencent, ce qui est puissant mais dangereux.\n\nUn index est aussi un objet DDL : CREATE INDEX accélère les recherches mais ralentit les écritures, car chaque INSERT, UPDATE ou DELETE doit le mettre à jour. Un index unique ajoute une garantie d'intégrité. La bonne pratique consiste à indexer les colonnes réellement utilisées dans les filtres et les jointures, pas toutes les colonnes par principe.",
+      "bullets": [
+        "Contraintes : PRIMARY KEY, FOREIGN KEY, UNIQUE, CHECK, NOT NULL, DEFAULT",
+        "ALTER TABLE ajoute, modifie, renomme ou supprime des colonnes",
+        "DROP TABLE CASCADE supprime aussi les objets dépendants",
+        "CREATE INDEX accélère la lecture mais coûte à l'écriture"
+      ],
+      "code": [
+        "ALTER TABLE app.orders ADD COLUMN channel varchar(20);",
+        "ALTER TABLE app.orders ALTER COLUMN status TYPE varchar(32);",
+        "CREATE INDEX idx_orders_customer ON app.orders(customer_id);",
+        "DROP TABLE app.orders CASCADE;"
+      ],
+      "tip": "DROP TABLE CASCADE ne se contente pas de supprimer la table : il supprime aussi les vues et contraintes qui en dépendent. En production, vérifie les dépendances avant d'exécuter."
+    },
+    {
+      "heading": "3. DML et transactions",
+      "body": "Les DML manipulent les lignes : INSERT ajoute, UPDATE modifie, DELETE supprime. INSERT peut prendre plusieurs tuples en une seule instruction, ce qui réduit les allers-retours réseau. UPDATE doit presque toujours être accompagné d'un WHERE ; sans lui, toutes les lignes sont modifiées. openGauss propose aussi l'upsert avec ON DUPLICATE KEY UPDATE ou ON CONFLICT, qui insère ou met à jour selon la clé.\n\nUne transaction regroupe plusieurs instructions en une unité atomique. BEGIN ouvre la transaction, COMMIT valide, ROLLBACK annule. Les points de sauvegarde (SAVEPOINT, ROLLBACK TO) permettent d'annuler une partie seulement du travail. Le niveau d'isolation par défaut est READ COMMITTED : une requête voit les données validées avant son début, et deux lectures successives peuvent différer.\n\nTRUNCATE vide une table entière beaucoup plus vite que DELETE, sans déclencher les triggers de ligne, mais il reste transactionnel dans openGauss : un ROLLBACK peut l'annuler. DELETE sans WHERE et UPDATE sans WHERE sont les deux erreurs les plus coûteuses en production ; un BEGIN préalable et une vérification avec SELECT sur le même WHERE sont des réflexes simples et efficaces.",
+      "bullets": [
+        "INSERT multi-lignes et upsert ON CONFLICT / ON DUPLICATE KEY",
+        "UPDATE et DELETE sans WHERE touchent toute la table",
+        "BEGIN, COMMIT, ROLLBACK, SAVEPOINT et ROLLBACK TO",
+        "READ COMMITTED par défaut ; TRUNCATE rapide mais transactionnel"
+      ],
+      "code": [
+        "BEGIN;",
+        "UPDATE app.accounts SET balance = balance - 100 WHERE id = 1;",
+        "UPDATE app.accounts SET balance = balance + 100 WHERE id = 2;",
+        "COMMIT;",
+        "INSERT INTO app.orders (customer_id, amount) VALUES (10, 99.90) ON CONFLICT (id) DO NOTHING;"
+      ],
+      "exercises": [
+        {
+          "prompt": "Écris une transaction qui transfère 250 euros du compte 1 vers le compte 2, en vérifiant que le solde du compte 1 reste positif.",
+          "correction": "BEGIN; UPDATE app.accounts SET balance = balance - 250 WHERE id = 1 AND balance >= 250; Si le nombre de lignes affectées vaut 0, il faut ROLLBACK, car le solde était insuffisant. Sinon, on exécute UPDATE app.accounts SET balance = balance + 250 WHERE id = 2; puis COMMIT. Les deux écritures forment une unité atomique : une panne entre les deux ne peut pas laisser un débit sans crédit."
+        }
+      ],
+      "tip": "Un UPDATE ou un DELETE sans WHERE n'est pas annulé par le simple fait d'être en autocommit. Vérifie toujours la clause avec un SELECT équivalent avant de valider."
+    },
+    {
+      "heading": "4. SELECT : filtres, tri et pagination",
+      "body": "SELECT décrit ce que l'on veut lire. La clause WHERE filtre les lignes avant tout calcul d'agrégat. Les opérateurs classiques sont =, <>, <, >, BETWEEN, IN, LIKE et ILIKE, ce dernier étant insensible à la casse. Attention au NULL : NULL n'est égal à rien, même pas à lui-même. La condition col = NULL est toujours inconnue ; il faut écrire col IS NULL ou col IS NOT NULL.\n\nORDER BY trie le résultat, avec ASC par défaut et DESC pour l'ordre inverse. On peut trier sur plusieurs colonnes et sur une expression. LIMIT n retourne que les n premières lignes, OFFSET m saute les m premières ; ensemble, ils réalisent la pagination. DISTINCT élimine les doublons sur la liste de colonnes sélectionnée.\n\nPourquoi l'ordre logique importe-t-il ? Parce qu'il explique les erreurs de raisonnement : un alias défini dans SELECT n'est pas visible dans WHERE, et un filtre sur un agrégat doit passer par HAVING. L'ordre logique est FROM, WHERE, GROUP BY, HAVING, SELECT, ORDER BY, LIMIT. Le moteur peut réorganiser physiquement l'exécution, mais le résultat obéit à cet ordre.",
+      "bullets": [
+        "WHERE filtre les lignes ; IS NULL est obligatoire pour tester NULL",
+        "LIKE avec % et _ ; ILIKE insensible à la casse",
+        "ORDER BY multi-colonnes, LIMIT et OFFSET pour paginer",
+        "DISTINCT déduplique la projection, pas la table"
+      ],
+      "code": [
+        "SELECT id, amount FROM app.orders",
+        "WHERE status = 'open' AND amount BETWEEN 100 AND 500",
+        "ORDER BY amount DESC",
+        "LIMIT 10 OFFSET 20;",
+        "SELECT DISTINCT city FROM app.customers;"
+      ],
+      "tip": "Un alias de SELECT n'est pas utilisable dans WHERE. Écris WHERE amount > 100, pas WHERE total > 100 si total est l'alias de amount."
+    },
+    {
+      "heading": "5. Jointures",
+      "body": "Une jointure combine des lignes de deux tables selon une condition. INNER JOIN ne conserve que les paires qui satisfont la condition : les clients sans commande disparaissent. LEFT JOIN conserve toutes les lignes de la table de gauche, même sans correspondance, et remplit les colonnes de droite avec NULL. RIGHT JOIN fait l'inverse et FULL OUTER JOIN conserve les deux côtés.\n\nCROSS JOIN produit le produit cartésien : chaque ligne de gauche est associée à chaque ligne de droite. Un oubli de condition dans un ancien style de jointure produit le même effet et peut faire exploser le résultat. Le self-join joint une table à elle-même grâce à deux alias, par exemple pour comparer un employé à son manager.\n\nLe choix de la jointure est sémantique avant d'être technique. Si le besoin est « tous les clients, avec ou sans commande », LEFT JOIN est correct et INNER JOIN est faux, même si les deux fonctionnent syntaxiquement. Pour filtrer sur la table de droite dans un LEFT JOIN, il faut placer la condition dans la clause ON ; la mettre dans WHERE transforme souvent la jointure en jointure interne.",
+      "bullets": [
+        "INNER : seulement les correspondances ; LEFT : tout le côté gauche",
+        "RIGHT et FULL conservent l'autre côté ou les deux",
+        "CROSS JOIN = produit cartésien, à éviter par accident",
+        "Filtre sur la table de droite d'un LEFT JOIN : dans ON, pas WHERE"
+      ],
+      "code": [
+        "SELECT c.name, o.id, o.amount",
+        "FROM app.customers c",
+        "LEFT JOIN app.orders o ON o.customer_id = c.id",
+        "  AND o.status = 'open';"
+      ],
+      "diagram": "customers        orders\n   A  -----------  100\n   B  ------ (aucune)\n   C  -----------  200\n\nINNER JOIN  -> A/100, C/200\nLEFT  JOIN  -> A/100, B/NULL, C/200\nRIGHT JOIN  -> A/100, C/200 (aucune commande orpheline)\nFULL  JOIN  -> A/100, B/NULL, C/200 + orphelines",
+      "tip": "Dans un LEFT JOIN, une condition sur la table de droite écrite dans WHERE annule l'effet externe. Place-la dans ON pour conserver les lignes sans correspondance."
+    },
+    {
+      "heading": "6. Agrégats, groupes et sous-requêtes",
+      "body": "Les fonctions d'agrégat résument plusieurs lignes en une valeur : COUNT compte, SUM additionne, AVG moyenne, MIN et MAX encadrent. COUNT(*) compte toutes les lignes, tandis que COUNT(colonne) ignore les NULL : la différence surprend souvent. GROUP BY constitue des groupes sur une ou plusieurs colonnes, puis chaque agrégat est calculé par groupe.\n\nHAVING filtre après agrégation, alors que WHERE filtre avant. Un filtre sur SUM(amount) ne peut donc pas vivre dans WHERE. La requête type lit les commandes, les regroupe par client, calcule un total, puis ne garde que les groupes dépassant un seuil avec HAVING.\n\nAu-delà, openGauss propose les sous-requêtes scalaires, les sous-requêtes EXISTS, les CTE avec WITH et les fonctions de fenêtrage comme row_number() OVER (PARTITION BY ... ORDER BY ...). Une CTE améliore la lisibilité et peut être réutilisée dans la requête. UNION fusionne deux résultats en supprimant les doublons, UNION ALL les conserve et est généralement plus rapide car il évite le tri de déduplication.",
+      "bullets": [
+        "COUNT(*) compte les lignes ; COUNT(col) ignore les NULL",
+        "WHERE avant GROUP BY, HAVING après",
+        "GROUP BY peut porter sur plusieurs colonnes",
+        "WITH (CTE), sous-requêtes et window functions structurent les requêtes",
+        "UNION déduplique, UNION ALL conserve tout et coûte moins cher"
+      ],
+      "code": [
+        "SELECT c.name, COUNT(*) AS orders_count, SUM(o.amount) AS total",
+        "FROM app.customers c",
+        "JOIN app.orders o ON o.customer_id = c.id",
+        "WHERE o.status = 'paid'",
+        "GROUP BY c.name",
+        "HAVING SUM(o.amount) > 1000",
+        "ORDER BY total DESC;"
+      ],
+      "exercises": [
+        {
+          "prompt": "Écris une requête qui affiche, pour chaque client ayant au moins deux commandes payées, son nom et le montant total, trié du plus élevé au plus faible.",
+          "correction": "SELECT c.name, SUM(o.amount) AS total FROM app.customers c JOIN app.orders o ON o.customer_id = c.id WHERE o.status = 'paid' GROUP BY c.name HAVING COUNT(*) >= 2 ORDER BY total DESC; Le filtre sur le statut s'applique avant le regroupement, le seuil sur le nombre de commandes s'applique après avec HAVING, et l'alias total est utilisable dans ORDER BY car le tri intervient après la projection."
+        }
+      ],
+      "tip": "HAVING sans GROUP BY est autorisé et traite tout le résultat comme un seul groupe. Ce n'est pas une erreur, mais c'est rarement ce que l'on veut."
+    },
+    {
+      "heading": "7. Plans d'exécution et performance",
+      "body": "EXPLAIN affiche le plan estimé sans exécuter la requête. EXPLAIN ANALYZE exécute réellement et ajoute les temps mesurés. openGauss propose en plus EXPLAIN PERFORMANCE, qui détaille les métriques par opérateur : temps, lignes réelles, mémoire, threads. Ces informations révèlent les écarts entre estimation et réalité, souvent causés par des statistiques obsolètes.\n\nLes opérateurs à reconnaître sont Seq Scan (parcours complet), Index Scan (parcours d'index), Bitmap Scan (index puis lecture groupée), Nested Loop (boucle imbriquée, efficace sur petits volumes), Hash Join (hachage, efficace sur gros volumes) et Sort. Un Seq Scan n'est pas toujours mauvais : sur une petite table ou une requête qui lit une grande proportion des lignes, il est souvent plus rapide qu'un index.\n\nLes pièges de performance classiques : SELECT * sur de larges tables, LIKE '%mot%' qui empêche l'usage d'un index B-tree à cause du caractère générique en tête, fonctions appliquées sur la colonne filtrée, absence d'ANALYZE après un chargement massif, et index trop nombreux qui ralentissent les écritures. On corrige d'abord par les statistiques et la réécriture, ensuite par l'indexation.",
+      "bullets": [
+        "EXPLAIN estime ; EXPLAIN ANALYZE exécute ; EXPLAIN PERFORMANCE détaille",
+        "Seq Scan, Index Scan, Bitmap Scan, Hash Join, Nested Loop, Sort",
+        "ANALYZE met à jour les statistiques du planificateur",
+        "LIKE '%x%' et fonctions sur colonne empêchent l'index B-tree"
+      ],
+      "code": [
+        "ANALYZE app.orders;",
+        "EXPLAIN SELECT * FROM app.orders WHERE customer_id = 42;",
+        "EXPLAIN ANALYZE SELECT count(*) FROM app.orders WHERE status = 'open';",
+        "EXPLAIN PERFORMANCE SELECT * FROM app.orders WHERE amount > 1000;"
+      ],
+      "table": {
+        "headers": [
+          "Symptôme",
+          "Cause probable",
+          "Correction"
+        ],
+        "rows": [
+          [
+            "Estimation très inférieure au réel",
+            "Statistiques obsolètes",
+            "ANALYZE la table"
+          ],
+          [
+            "Seq Scan sur un filtre très sélectif",
+            "Absence d'index adapté",
+            "Créer un index B-tree"
+          ],
+          [
+            "Index ignoré malgré sa présence",
+            "LIKE '%mot%' ou fonction sur colonne",
+            "Réécrire le filtre ou indexer l'expression"
+          ],
+          [
+            "Écritures lentes",
+            "Trop d'index à maintenir",
+            "Supprimer les index inutiles"
+          ]
+        ]
+      },
+      "tip": "EXPLAIN PERFORMANCE est spécifique à openGauss : ne le confonds pas avec EXPLAIN ANALYZE de PostgreSQL. Les deux exécutent la requête, mais le premier fournit un rapport détaillé par opérateur."
+    }
+  ],
+  "key_points": [
+    "char(n) complète avec des espaces, varchar(n) non ; numeric est exact pour les montants.",
+    "DDL : CREATE, ALTER, DROP, TRUNCATE ; DML : INSERT, UPDATE, DELETE.",
+    "PRIMARY KEY implique UNIQUE et NOT NULL ; FOREIGN KEY protège l'intégrité référentielle.",
+    "WHERE filtre avant GROUP BY, HAVING filtre après ; l'ordre logique guide l'écriture.",
+    "LEFT JOIN conserve toutes les lignes de gauche ; INNER JOIN seulement les correspondances.",
+    "UNION déduplique, UNION ALL est plus rapide ; les CTE et window functions structurent les requêtes.",
+    "EXPLAIN estime, EXPLAIN ANALYZE exécute, EXPLAIN PERFORMANCE détaille les opérateurs."
+  ],
+  "traps": [
+    "Un alias de SELECT n'est pas visible dans WHERE, seulement dans ORDER BY et HAVING.",
+    "NULL n'est jamais égal à NULL : il faut IS NULL, sinon la condition est inconnue.",
+    "TRUNCATE est rapide et ne déclenche pas les triggers DELETE, mais il reste transactionnel dans openGauss.",
+    "Un LIKE '%mot%' empêche l'usage normal d'un index B-tree à cause du joker en tête.",
+    "Un index accélère les lectures mais ralentit INSERT, UPDATE et DELETE."
+  ],
+  "quiz": [
+    {
+      "id": "hcia-og-03-q01",
+      "type": "single",
+      "prompt": "Which data type is best suited to storing monetary amounts exactly?",
+      "options": [
+        "numeric(12,2)",
+        "double precision",
+        "varchar(20)",
+        "real"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "numeric(12,2) stocke une valeur décimale exacte avec deux chiffres après la virgule, ce qui convient à la comptabilité. real et double precision sont des flottants binaires sujets aux erreurs d'arrondi. varchar stocke du texte et empêcherait les calculs arithmétiques fiables.",
+      "topic": "Types de données"
+    },
+    {
+      "id": "hcia-og-03-q02",
+      "type": "single",
+      "prompt": "Which clause filters groups after aggregation?",
+      "options": [
+        "WHERE",
+        "HAVING",
+        "ORDER BY",
+        "GROUP BY"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "HAVING s'applique après GROUP BY et peut porter sur un agrégat comme SUM(amount). WHERE filtre les lignes avant le regroupement, ORDER BY trie le résultat et GROUP BY constitue les groupes. Mettre un agrégat dans WHERE provoque une erreur.",
+      "topic": "Agrégats"
+    },
+    {
+      "id": "hcia-og-03-q03",
+      "type": "single",
+      "prompt": "In the logical order of a SELECT statement, when is WHERE evaluated?",
+      "options": [
+        "After ORDER BY",
+        "After GROUP BY and before HAVING",
+        "Before GROUP BY",
+        "After HAVING but before SELECT"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "L'ordre logique est FROM, WHERE, GROUP BY, HAVING, SELECT, ORDER BY, LIMIT. WHERE intervient donc avant la constitution des groupes. C'est pourquoi il ne peut pas contenir d'agrégat : les groupes n'existent pas encore à ce stade.",
+      "topic": "Ordre logique"
+    },
+    {
+      "id": "hcia-og-03-q04",
+      "type": "single",
+      "prompt": "Which join returns every row of the left table, even when no matching row exists on the right?",
+      "options": [
+        "CROSS JOIN",
+        "SELF JOIN",
+        "INNER JOIN",
+        "LEFT OUTER JOIN"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "LEFT OUTER JOIN conserve toutes les lignes de gauche et remplit les colonnes de droite avec NULL en l'absence de correspondance. INNER JOIN élimine ces lignes, CROSS JOIN produit un produit cartésien et SELF JOIN désigne seulement une table jointe à elle-même.",
+      "topic": "Jointures"
+    },
+    {
+      "id": "hcia-og-03-q05",
+      "type": "single",
+      "prompt": "Which statement is true about TRUNCATE TABLE in openGauss?",
+      "options": [
+        "It removes all rows faster than DELETE and does not fire DELETE triggers",
+        "It removes the table definition as well",
+        "It can only be used on an empty table",
+        "It fires row-level DELETE triggers"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "TRUNCATE vide la table par une opération globale, bien plus rapide que le DELETE ligne à ligne, et ne déclenche pas les triggers de suppression de lignes. Il ne supprime pas la structure : c'est le rôle de DROP TABLE. Il fonctionne aussi sur une table non vide, c'est même son usage normal.",
+      "topic": "DDL et DML"
+    },
+    {
+      "id": "hcia-og-03-q06",
+      "type": "single",
+      "prompt": "What is the main difference between char(10) and varchar(10)?",
+      "options": [
+        "char stores only numbers",
+        "char pads values with spaces up to the declared length",
+        "varchar cannot store more than one character",
+        "varchar always uses more disk space"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "char(10) complète à droite avec des espaces pour atteindre exactement dix caractères, alors que varchar(10) stocke la longueur réelle. char n'est pas réservé aux nombres et varchar peut contenir jusqu'à dix caractères. varchar consomme généralement moins d'espace pour les chaînes courtes.",
+      "topic": "Types de données"
+    },
+    {
+      "id": "hcia-og-03-q07",
+      "type": "single",
+      "prompt": "Which predicate correctly finds rows where column note has no value?",
+      "options": [
+        "note == NULL",
+        "note = NULL",
+        "note IS NULL",
+        "note <> NULL"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "NULL représente une valeur inconnue : toute comparaison avec NULL renvoie un résultat inconnu, jamais vrai. Seul IS NULL (ou IS NOT NULL) teste correctement l'absence de valeur. Les trois autres formes ne retournent aucune ligne, même lorsqu'elles paraissent logiques.",
+      "topic": "NULL"
+    },
+    {
+      "id": "hcia-og-03-q08",
+      "type": "single",
+      "prompt": "Which clause combination returns rows 21 to 30 of an ordered result?",
+      "options": [
+        "LIMIT 20 OFFSET 10",
+        "LIMIT 30 OFFSET 20",
+        "OFFSET 10 LIMIT 30",
+        "LIMIT 10 OFFSET 20"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "LIMIT 10 OFFSET 20 saute les vingt premières lignes puis en retourne dix, soit les lignes 21 à 30. LIMIT 20 OFFSET 10 retourne les lignes 11 à 30, LIMIT 30 OFFSET 20 en retourne trente à partir de la 21, et la dernière forme n'est pas la syntaxe attendue.",
+      "topic": "Pagination"
+    },
+    {
+      "id": "hcia-og-03-q09",
+      "type": "single",
+      "prompt": "Which openGauss command executes a query and reports detailed per-operator runtime metrics?",
+      "options": [
+        "EXPLAIN PERFORMANCE",
+        "ANALYZE",
+        "EXPLAIN",
+        "EXPLAIN ANALYZE"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "EXPLAIN PERFORMANCE exécute la requête et produit un rapport détaillé par opérateur, avec temps et lignes réelles. EXPLAIN n'exécute rien, EXPLAIN ANALYZE exécute mais reste plus synthétique, et ANALYZE collecte les statistiques d'une table sans rapport avec un plan.",
+      "topic": "Performance"
+    },
+    {
+      "id": "hcia-og-03-q10",
+      "type": "single",
+      "prompt": "A PRIMARY KEY constraint implies which combination?",
+      "options": [
+        "FOREIGN KEY and CHECK",
+        "UNIQUE and NOT NULL",
+        "UNIQUE only",
+        "NOT NULL only"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Une clé primaire identifie chaque ligne : elle impose à la fois l'unicité et l'absence de NULL. Une contrainte UNIQUE seule autorise plusieurs NULL selon les règles du SGBD, et NOT NULL seul n'empêche pas les doublons. Une clé primaire n'implique ni clé étrangère ni CHECK.",
+      "topic": "Contraintes"
+    },
+    {
+      "id": "hcia-og-03-q11",
+      "type": "multi",
+      "prompt": "Which statements belong to DDL? (Choose three.)",
+      "options": [
+        "ALTER TABLE",
+        "DROP INDEX",
+        "UPDATE",
+        "CREATE TABLE"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "CREATE, ALTER et DROP modifient la définition des objets : ce sont des instructions DDL. UPDATE modifie le contenu des lignes et appartient aux DML. INSERT et DELETE sont également des DML, alors que TRUNCATE est généralement classé avec le DDL.",
+      "topic": "DDL et DML"
+    },
+    {
+      "id": "hcia-og-03-q12",
+      "type": "multi",
+      "prompt": "Which functions are aggregate functions? (Choose three.)",
+      "options": [
+        "UPPER",
+        "SUM",
+        "AVG",
+        "COUNT"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "SUM, AVG et COUNT résument un ensemble de lignes en une valeur et s'utilisent avec GROUP BY ou HAVING. UPPER est une fonction scalaire de chaîne : elle transforme chaque valeur individuellement et ne réalise aucune agrégation.",
+      "topic": "Agrégats"
+    },
+    {
+      "id": "hcia-og-03-q13",
+      "type": "multi",
+      "prompt": "Which joins can return a row with NULLs on one side when no match exists? (Choose two.)",
+      "options": [
+        "LEFT OUTER JOIN",
+        "FULL OUTER JOIN",
+        "INNER JOIN",
+        "CROSS JOIN"
+      ],
+      "answer": [
+        0,
+        1
+      ],
+      "explanation_fr": "LEFT OUTER JOIN complète avec NULL les lignes de gauche sans correspondance, et FULL OUTER JOIN fait de même des deux côtés. INNER JOIN ne renvoie que les correspondances, et CROSS JOIN génère toutes les combinaisons sans notion de correspondance manquante.",
+      "topic": "Jointures"
+    },
+    {
+      "id": "hcia-og-03-q14",
+      "type": "tf",
+      "prompt": "In SQL, WHERE is evaluated before GROUP BY.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai. L'ordre logique place FROM puis WHERE avant GROUP BY, HAVING, SELECT, ORDER BY et LIMIT. C'est pour cette raison qu'un agrégat ne peut pas être filtré dans WHERE : les groupes ne sont pas encore formés.",
+      "topic": "Ordre logique"
+    },
+    {
+      "id": "hcia-og-03-q15",
+      "type": "tf",
+      "prompt": "Creating an index speeds up reads without any cost on INSERT, UPDATE or DELETE.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux. Chaque écriture doit maintenir l'index, ce qui ajoute du travail et consomme de l'espace disque. Un index est donc un compromis : il accélère les lectures ciblées mais ralentit les modifications et peut nuire si les index sont trop nombreux.",
+      "topic": "Index"
+    },
+    {
+      "id": "hcia-og-03-q16",
+      "type": "tf",
+      "prompt": "COUNT(column_name) ignores NULL values, unlike COUNT(*).",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai. COUNT(*) compte toutes les lignes, y compris celles dont certaines colonnes sont NULL. COUNT(colonne) ne compte que les lignes où cette colonne possède une valeur non nulle, ce qui produit souvent un écart inattendu dans les rapports.",
+      "topic": "Agrégats"
+    },
+    {
+      "id": "hcia-og-03-q17",
+      "type": "text",
+      "prompt": "Write the SQL query that returns only the distinct values of column city from table t.",
+      "accept": [
+        "select distinct city from t",
+        "select distinct city from t;",
+        "SELECT DISTINCT city FROM t;",
+        "select distinct(city) from t"
+      ],
+      "sample_answer": "SELECT DISTINCT city FROM t;",
+      "explanation_fr": "DISTINCT s'applique à la liste de colonnes projetée et élimine les doublons. Sans DISTINCT, la requête retourne une ligne par enregistrement, donc plusieurs fois la même ville. Une alternative pour compter est GROUP BY city.",
+      "topic": "Requêtes"
+    },
+    {
+      "id": "hcia-og-03-q18",
+      "type": "text",
+      "prompt": "Which SQL keyword introduces the new column values in an UPDATE statement?",
+      "accept": [
+        "set",
+        "SET"
+      ],
+      "sample_answer": "SET",
+      "explanation_fr": "La syntaxe est UPDATE table SET colonne = expression WHERE condition. SET est obligatoire et précède la liste des affectations. WHERE est facultatif mais son omission modifie toutes les lignes de la table.",
+      "topic": "DML"
+    },
+    {
+      "id": "hcia-og-03-q19",
+      "type": "text",
+      "prompt": "Which SQL command previews an execution plan without running the query?",
+      "accept": [
+        "explain",
+        "EXPLAIN",
+        "explain select",
+        "explain plan"
+      ],
+      "sample_answer": "EXPLAIN",
+      "explanation_fr": "EXPLAIN affiche le plan estimé par l'optimiseur sans exécuter la requête. EXPLAIN ANALYZE et EXPLAIN PERFORMANCE exécutent réellement la requête pour mesurer les temps, ce qui les rend inadaptés à une simple estimation préalable.",
+      "topic": "Performance"
+    },
+    {
+      "id": "hcia-og-03-q20",
+      "type": "text",
+      "prompt": "Which keyword removes duplicate rows from the result of a SELECT?",
+      "accept": [
+        "distinct",
+        "DISTINCT"
+      ],
+      "sample_answer": "DISTINCT",
+      "explanation_fr": "DISTINCT placé après SELECT élimine les lignes identiques dans la projection. Il s'applique à l'ensemble des colonnes sélectionnées, pas à une seule. GROUP BY peut produire un effet comparable lorsqu'on veut aussi agréger.",
+      "topic": "Requêtes"
+    }
+  ]
+}

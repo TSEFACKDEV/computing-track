@@ -1,0 +1,675 @@
+{
+  "id": "hcie-oe-01",
+  "phase": "HCIE",
+  "subject": "openEuler",
+  "number": 1,
+  "title_fr": "Ceph : stockage distribué de niveau datacenter",
+  "title_en": "Ceph: Datacenter-Grade Distributed Storage",
+  "minutes": 90,
+  "source": "HCIE-openEuler V1.0 Training Material — Sessions 1-6 «Ceph : architecture, pools, cephx, RGW, block/CephFS, CRUSH Map» · Lab Guide",
+  "objectives": [
+    "Expliquer le rôle des MON, MGR, MDS et OSD dans l'architecture RADOS",
+    "Calculer le placement d'un objet : hash, PG, CRUSH et domaine de panne",
+    "Dimensionner un pool en réplication ou en erasure coding selon le besoin",
+    "Appliquer le moindre privilège avec CephX, les capabilities et les keyrings",
+    "Exploiter RBD, CephFS et RGW, puis diagnostiquer un cluster dégradé"
+  ],
+  "sections": [
+    {
+      "heading": "Architecture RADOS et rôle de chaque démon",
+      "body": "Ceph est un système de stockage défini par logiciel qui expose trois services — bloc, fichier et objet — sur un socle unique nommé RADOS. Chaque objet est découpé en morceaux et confié à des OSD, généralement un par disque brut en BlueStore. Les monitors (MON) maintiennent la carte du cluster : monmap, osdmap, pgmap, crushmap et mdsmap. Ils la valident en quorum grâce à Paxos ; on déploie donc trois ou cinq MON, jamais un nombre pair, car une majorité doit toujours se dégager. Le manager (MGR) ne sert pas les entrées-sorties : il agrège les métriques, alimente le tableau de bord et héberge les modules comme Prometheus ou l'orchestrateur. Le MDS ne concerne que CephFS et ne conserve que les métadonnées. Cette séparation évite un point chaud : le client télécharge la carte, calcule lui-même la position de l'objet avec CRUSH, puis dialogue directement avec l'OSD primaire, qui réplique vers les OSD secondaires. L'analogie est celle d'une carte routière mise à jour rarement : chaque véhicule calcule son trajet sans passer par un péage central saturé. Un MON perdu ne bloque pas les I/O déjà autorisées, mais gèle les changements de topologie.",
+      "bullets": [
+        "MON : carte du cluster et quorum Paxos, en nombre impair",
+        "OSD : stockage des objets, réplication et réparation des PG",
+        "MGR : métriques, dashboard et modules ; jamais de données",
+        "MDS : métadonnées CephFS uniquement, actif et standby",
+        "Le client calcule le placement, l'OSD primaire coordonne les copies"
+      ],
+      "code": [
+        "ceph -s",
+        "ceph mon dump",
+        "ceph osd tree",
+        "ceph orch ps"
+      ],
+      "diagram": "            +-------------------+        +-------------------+\n  Clients -->|  MON x3 (Paxos)   |        |  MGR (metrics/UI) |\n            +---------+---------+        +---------+---------+\n                      |  cluster map               |\n                      v                            v\n            +---------------------------------------------+\n            |                RADOS (objets)               |\n            |  OSD.0     OSD.1     OSD.2     OSD.3 ...    |\n            |   |          |          |          |        |\n            | disque     disque     disque     disque     |\n            +---------------------------------------------+\n  Client: 1) lit la carte  2) calcule PG/OSD via CRUSH\n          3) ecrit sur l'OSD primaire  4) replication des OSD\n  CephFS: MDS (metadonnees) + OSD (donnees)",
+      "tip": "Trois MON suffisent pour perdre un nœud ; cinq MON ne se justifient que si deux pannes simultanées sont dans le scénario. Un quorum perdu laisse parfois lire les données, mais toute modification de la carte échoue : commencez toujours par ceph mon quorum_status."
+    },
+    {
+      "heading": "Objets, placement groups et calcul CRUSH",
+      "body": "Un fichier n'est jamais stocké d'un bloc : le client le découpe en objets de taille fixe, calcule hash(objet) modulo pg_num, puis ajoute l'identifiant du pool pour former le PG ID. Le placement group (PG) est l'unité de distribution et de réparation : CRUSH transforme ce numéro en une liste d'OSD, en respectant le domaine de panne du pool (hôte, armoire, salle). Pourquoi ce détour par le PG ? Il réduit le nombre d'entrées à suivre : des millions d'objets se rangent dans quelques milliers de PG, et la reconstruction après panne se fait par PG, pas objet par objet. La règle empirique visait 100 à 200 PG par OSD, mais l'autoscaler de Ceph ajuste désormais pg_num selon l'occupation réelle ; pgp_num contrôle, lui, la distribution effective. Un pg_num trop faible concentre les données et déséquilibre les disques ; trop élevé, il multiplie les états à suivre et ralentit le peering. Le CRUSH map décrit la hiérarchie physique et les règles de réplication ; le modifier déplace des PG, donc génère du rebalancement. Enfin, le PG ID n'est pas un identifiant de disque : deux pools différents peuvent avoir le même numéro de PG sans partager les mêmes OSD.",
+      "bullets": [
+        "PG = hash(object_id) % pg_num, préfixé par l'identifiant du pool",
+        "Le PG est l'unité de placement, de réplication et de réparation",
+        "pg_num règle le découpage, pgp_num la distribution sur les OSD",
+        "100 à 200 PG par OSD reste une référence, l'autoscaler ajuste ensuite",
+        "Le domaine de panne CRUSH garantit des copies sur des hôtes distincts"
+      ],
+      "code": [
+        "ceph osd pool create app-data 128 128",
+        "ceph osd pool set app-data pg_autoscale_mode on",
+        "ceph pg dump pgs_brief",
+        "ceph osd map app-data objet-test"
+      ],
+      "table": {
+        "headers": [
+          "Élément",
+          "Rôle",
+          "Conséquence d'un mauvais réglage"
+        ],
+        "rows": [
+          [
+            "pg_num",
+            "Nombre de PG du pool",
+            "Trop faible : déséquilibre ; trop élevé : peering lent"
+          ],
+          [
+            "pgp_num",
+            "PG réellement distribués",
+            "Retard de distribution et espace mal utilisé"
+          ],
+          [
+            "CRUSH rule",
+            "Domaines de panne autorisés",
+            "Répliques sur le même hôte : perte de résilience"
+          ],
+          [
+            "Autoscaler",
+            "Ajustement selon l'occupation",
+            "Désactivé partout : dérive au fil de la croissance"
+          ]
+        ]
+      },
+      "diagram": "  objet  ->  hash  ->  % pg_num  ->  PG 2.4a\n                                      |\n                                   CRUSH rule\n                                      |\n              +-----------------------+-----------------------+\n              v                       v                       v\n          host-A / OSD.1        host-B / OSD.4        host-C / OSD.7\n          (primaire)             (replique)             (replique)\n\n  Le client calcule cette liste ; le primaire coordonne les ecritures.",
+      "exercises": [
+        {
+          "prompt": "Un cluster compte 12 OSD et doit héberger trois pools de même poids. En appliquant la règle de 150 PG par OSD, quel pg_num approximatif faut-il viser par pool ? Que se passe-t-il si l'on crée chaque pool avec 32 PG seulement ?",
+          "correction": "Le budget total est d'environ 12 × 150 = 1 800 PG. Réparti sur trois pools, cela donne 600 PG par pool, soit une valeur arrondie à une puissance de deux proche, par exemple 512 ou 1024. Avec 32 PG par pool, le cluster ne compte que 96 PG : chaque PG est très gros, les objets se concentrent sur un petit nombre d'OSD et la reconstruction après panne devient lente et déséquilibrée. Il vaut mieux laisser pg_autoscale_mode à on et vérifier avec ceph osd pool autoscale-status que chaque pool reste dans la plage recommandée."
+        }
+      ],
+      "tip": "Ne calculez pas pg_num à la main sur un cluster récent : activez l'autoscaler et vérifiez la colonne PG_NUM recommandée. En revanche, un pool qui reçoit un pic de données sans surveillance peut faire grimper le nombre de PG et déclencher un rebalancement massif."
+    },
+    {
+      "heading": "Pools : réplication, erasure coding et quotas",
+      "body": "Un pool est un espace logique doté d'une politique de protection. En réplication, size fixe le nombre de copies et min_size le nombre minimal de copies disponibles pour accepter les écritures : avec size=3 et min_size=2, le cluster survit à la perte d'un OSD et continue d'écrire, mais refuse les I/O si deux copies manquent. En erasure coding, l'objet est découpé en k fragments de données et m fragments de parité ; un profil 4+2 supporte la perte de deux fragments et n'occupe que 1,5 fois l'espace utile, contre trois fois en réplication. Le prix est triple : du CPU pour le calcul, du réseau pour la reconstruction, et une latence plus élevée sur les petites écritures. Un pool EC se déclare avec un profil (plugin jerasure, domaine de panne host) et ne peut plus changer de profil après affectation. Pour RBD, l'EC se combine à un pool de métadonnées répliqué via l'option data-pool, et toutes les fonctionnalités ne sont pas disponibles. Enfin, quotas, nodelete et autoscaler protègent la capacité et évitent les suppressions accidentelles : un pool sans quota peut consommer tout le cluster et déclencher HEALTH_ERR.",
+      "bullets": [
+        "size = nombre de copies, min_size = seuil minimal d'écriture",
+        "EC k+m : k données, m parités, tolérance de m pannes de fragments",
+        "Un profil EC est figé dès qu'il est utilisé par un pool",
+        "Quotas, nodelete et autoscaler limitent les accidents de capacité",
+        "RBD sur EC exige un pool de données EC et un pool de métadonnées répliqué"
+      ],
+      "code": [
+        "ceph osd pool create app-data 128 128 replicated",
+        "ceph osd pool application enable app-data rbd",
+        "ceph osd erasure-code-profile set ec42 k=4 m=2 crush-failure-domain=host",
+        "ceph osd pool create archive 64 64 erasure ec42",
+        "ceph osd pool set-quota archive max_bytes 50T",
+        "ceph osd pool set app-data nodelete true"
+      ],
+      "table": {
+        "headers": [
+          "Critère",
+          "Réplication (3 copies)",
+          "Erasure coding (4+2)"
+        ],
+        "rows": [
+          [
+            "Surcoût capacité",
+            "3x",
+            "1,5x"
+          ],
+          [
+            "Pannes tolérées",
+            "1 OSD (avec min_size=2)",
+            "2 fragments"
+          ],
+          [
+            "Coût CPU/réseau",
+            "Faible",
+            "Élevé à la reconstruction"
+          ],
+          [
+            "Latence petite écriture",
+            "Faible",
+            "Plus élevée"
+          ],
+          [
+            "Usage typique",
+            "Bases, RBD, CephFS",
+            "Archives, objets, gros volumes"
+          ]
+        ]
+      },
+      "tip": "Un pool EC ne se convertit pas en pool répliqué : la migration se fait par copie de données. Pour RBD, vérifiez allow_ec_overwrites et le data-pool avant de promettre des performances ; l'EC est rarement le bon choix pour une base de données transactionnelle."
+    },
+    {
+      "heading": "CephX : identités, capabilities et keyrings",
+      "body": "Chaque requête vers Ceph porte une identité de la forme $type.$id : client.admin pour un usage humain, osd.3 ou mgr.host pour un démon. CephX repose sur un secret partagé : le MON distribue les clés, émet un ticket de session, puis le client présente ce ticket aux OSD et aux MDS. Les capabilities (caps) limitent ce que l'identité peut faire par type de démon : mon 'allow r' pour lire l'état, osd 'allow rw pool=data' pour écrire dans un seul pool, mds 'allow rwps fsname=fs01' pour CephFS. Les profils prédéfinis, comme profile rbd ou profile rbd-read-only, évitent d'écrire des règles à la main et réduisent le risque d'erreur. Un keyring contient la clé et les caps ; il doit être protégé en 600 et jamais versionné. La configuration effective suit une cascade de priorité : valeurs compilées, base centralisée des MON, fichier local ceph.conf, variables d'environnement, ligne de commande, puis surcharge à chaud. Un réglage local écrase donc silencieusement ceph config set, piège classique lors d'un diagnostic. ceph auth get-or-create est idempotent et convient aux déploiements automatisés, tandis que ceph auth caps remplace l'ensemble des permissions : lisez toujours l'état final avec ceph auth get.",
+      "bullets": [
+        "Format d'identité obligatoire : $type.$id (client.app, osd.3)",
+        "Caps par démon : mon, osd, mds, mgr, avec restriction par pool",
+        "Les profils rbd et rbd-read-only simplifient le moindre privilège",
+        "Un keyring se protège en 600 et ne se stocke jamais dans Git",
+        "La priorité de configuration va du fichier local vers la ligne de commande"
+      ],
+      "code": [
+        "ceph auth get-or-create client.app mon 'allow r' osd 'allow rw pool=app-data' -o /etc/ceph/ceph.client.app.keyring",
+        "ceph auth caps client.app mon 'allow r' osd 'allow rw pool=app-data'",
+        "ceph auth get client.app",
+        "ceph fs authorize fs01 client.user01 / rwps",
+        "ceph config get osd osd_max_backfills"
+      ],
+      "exercises": [
+        {
+          "prompt": "Une application doit lire et écrire uniquement dans le pool app-data et consulter l'état du cluster, sans jamais toucher aux autres pools. Rédigez les commandes de création de l'utilisateur client.app, puis la commande de vérification des permissions.",
+          "correction": "On crée l'identité avec les capabilities minimales : ceph auth get-or-create client.app mon 'allow r' osd 'allow rw pool=app-data'. Le droit mon 'allow r' suffit pour lire la carte et l'état, sans permettre de modifier la configuration ; osd 'allow rw pool=app-data' limite les I/O à ce pool. On exporte ensuite le keyring avec -o /etc/ceph/ceph.client.app.keyring et on le protège par chmod 600. La vérification se fait avec ceph auth get client.app : la sortie doit montrer exactement ces deux lignes de caps. Tester avec ceph -s --id app --keyring ... permet de confirmer que l'identité fonctionne sans privilège admin."
+        }
+      ],
+      "tip": "Ne donnez jamais mon 'allow *' à une application : cela autorise la modification des pools et de la configuration. De même, ceph auth caps remplace les permissions existantes au lieu de les compléter ; une omission efface silencieusement un droit."
+    },
+    {
+      "heading": "RBD : volumes blocs, cache, snapshots et clones",
+      "body": "RBD expose un volume bloc finement provisionné, découpé en objets RADOS. Deux chemins d'accès coexistent : librbd, bibliothèque utilisateur privilégiée par QEMU et OpenStack, et krbd, module noyau qui crée /dev/rbdX et permet un montage classique. Un volume se crée avec rbd create, s'inspecte avec rbd info et se cartographie avec rbd map ; la suppression passe par la corbeille (rbd trash mv) pour éviter une perte immédiate. Les features ne sont pas décoratives : exclusive-lock protège l'écriture concurrente, object-map et fast-diff accélèrent les sauvegardes incrémentales, layering autorise les clones copy-on-write. Le cache client mérite une décision explicite : writethrough privilégie la durabilité, writeback améliore les performances mais peut perdre les dernières écritures en cas de crash. Une snapshot RBD est en lecture seule ; pour cloner, il faut la protéger, créer le clone, puis éventuellement le flatten pour le rendre autonome. Un clone reste dépendant de sa snapshot : supprimer la snapshot parente casse le clone. En production, testez la restauration, pas seulement la création, et surveillez rbd du pour distinguer capacité provisionnée et espace réellement consommé.",
+      "bullets": [
+        "librbd pour QEMU/OpenStack, krbd pour un montage noyau",
+        "Provisionnement fin : la capacité annoncée n'est pas consommée d'emblée",
+        "Le cache writeback gagne en performance mais expose à une perte",
+        "Snapshot en lecture seule, clone COW après protection de la snapshot",
+        "rbd trash mv évite une suppression définitive immédiate"
+      ],
+      "code": [
+        "ceph osd pool create rbd-prod 128 128",
+        "ceph osd pool application enable rbd-prod rbd",
+        "rbd create --size 100G rbd-prod/vol1",
+        "rbd map rbd-prod/vol1 --name client.app",
+        "rbd snap create rbd-prod/vol1@snap1",
+        "rbd snap protect rbd-prod/vol1@snap1",
+        "rbd clone rbd-prod/vol1@snap1 rbd-prod/clone1",
+        "rbd trash mv rbd-prod/vol1"
+      ],
+      "table": {
+        "headers": [
+          "Mode de cache",
+          "Durabilité",
+          "Usage recommandé"
+        ],
+        "rows": [
+          [
+            "writethrough",
+            "Écriture confirmée après l'OSD",
+            "Bases de données, journal, données critiques"
+          ],
+          [
+            "writearound",
+            "Contourne le cache pour les grosses écritures",
+            "Charges séquentielles, sauvegardes"
+          ],
+          [
+            "writeback",
+            "Écriture locale puis vidage différé",
+            "Tests, charges tolérantes à une faible perte"
+          ]
+        ]
+      },
+      "tip": "Un clone non flatten ne doit jamais être sauvegardé seul : il référence les objets du parent. Notez aussi que rbd map exige le nom du client et le keyring ; un échec de mapping vient souvent d'un pool non autorisé dans les caps, pas du module noyau."
+    },
+    {
+      "heading": "CephFS et RGW : fichier POSIX et objet S3",
+      "body": "CephFS ajoute une couche POSIX au-dessus de RADOS. Deux pools sont nécessaires : un pool de métadonnées, petit mais sensible à la latence, et un pool de données. Le MDS ne stocke pas les fichiers : il gère l'arborescence, les permissions, les verrous et le cache des clients, tandis que les données passent directement par les OSD. Un MDS actif et un MDS standby suffisent pour la haute disponibilité ; le multi-actif reste réservé à des usages particuliers. Le montage noyau est préférable au montage FUSE pour la performance, et les droits CephFS se résument à r, w, p (quotas) et s (snapshots). RGW, de son côté, expose une API REST compatible S3 et Swift. Sa hiérarchie est plus riche qu'elle n'y paraît : un realm contient des zonegroups, eux-mêmes composés de zones ; la zone maîtresse détient la configuration de référence et les zones secondaires synchronisent métadonnées et objets. Une erreur classique consiste à créer la zone sans committer le period : la configuration reste alors invisible. Les deux services partagent le même RADOS, mais pas les mêmes contraintes : CephFS exige une latence faible sur les métadonnées, RGW privilégie le débit et la compatibilité HTTP.",
+      "bullets": [
+        "CephFS : pool metadata + pool data, MDS actif et standby",
+        "Les données CephFS passent par les OSD, pas par le MDS",
+        "Droits CephFS : r, w, p pour les quotas, s pour les snapshots",
+        "RGW : API S3/Swift, hiérarchie realm > zonegroup > zone",
+        "Toute modification RGW multisite exige un period update --commit"
+      ],
+      "code": [
+        "ceph osd pool create cephfs-meta 32 32",
+        "ceph osd pool create cephfs-data 128 128",
+        "ceph fs new fs01 cephfs-meta cephfs-data",
+        "ceph orch apply mds fs01 --placement='2'",
+        "mount -t ceph 192.168.1.18:6789:/ /mnt/fs01 -o name=user01",
+        "radosgw-admin realm create --rgw-realm=prod --default",
+        "ceph orch apply rgw prod-rgw --realm=prod --zone=prod-zone --port=8080"
+      ],
+      "table": {
+        "headers": [
+          "Interface",
+          "Type exposé",
+          "Composant clé",
+          "Usage typique"
+        ],
+        "rows": [
+          [
+            "RBD",
+            "Bloc",
+            "librbd / krbd",
+            "Disques de VM, bases de données"
+          ],
+          [
+            "CephFS",
+            "Fichier POSIX",
+            "MDS",
+            "Répertoires partagés HPC, workflows"
+          ],
+          [
+            "RGW",
+            "Objet S3/Swift",
+            "RGW",
+            "Archives, sauvegardes, applications web"
+          ]
+        ]
+      },
+      "diagram": "  CephFS                              RGW multisite\n  ------                              -------------\n  client                              realm: prod\n    |  metadata                          +-- zonegroup: prod\n    v                                     +-- zone maitresse (site A)\n  MDS actif --- standby MDS              +-- zone secondaire (site B)\n    |                                         sync meta + objets\n    v\n  pool metadata (petit, SSD)          bucket -> objets -> OSD\n  pool data -> OSD\n\n  Dans les deux cas, les donnees finissent dans RADOS.",
+      "tip": "Un montage CephFS qui se fige pointe souvent vers un MDS saturé ou un pool de métadonnées trop lent, pas vers les OSD de données. Pour RGW, vérifiez toujours la présence du period commit : sans lui, les commandes semblent réussir mais la configuration n'est pas propagée."
+    },
+    {
+      "heading": "Exploitation quotidienne : santé, pannes et remplacement d'OSD",
+      "body": "Le premier réflexe est ceph -s, puis ceph health detail lorsqu'un warning apparaît. Les états de PG racontent l'histoire : active+clean signifie tout va bien ; degraded indique des copies manquantes mais des I/O possibles ; peering signale une négociation en cours ; inactive bloque les I/O ; stale suggère un OSD muet. Un cluster qui reste en peering après un redémarrage peut avoir un OSD lent ou un réseau instable. Les slow ops pointent vers des disques saturés, un cache plein ou une reconstruction trop agressive. Pour remplacer un disque, on marque l'OSD out, on attend que les PG reviennent à active+clean, puis on purge et on recrée l'OSD ; sauter l'attente provoque une double dégradation et peut faire tomber min_size. Le reweight corrige un déséquilibre sans déplacer immédiatement les données, alors que le rebalance les déplace réellement. Scrub vérifie les sommes de contrôle, deep-scrub lit les données : les deux consomment de l'I/O et doivent être planifiés. Enfin, ne lancez jamais une maintenance lourde sans sauvegarde etcd et sans marge de capacité : une reconstruction a besoin d'espace libre.",
+      "bullets": [
+        "ceph -s puis ceph health detail pour qualifier l'alerte",
+        "active+clean est l'état de référence avant toute maintenance",
+        "OSD out, attente du rebalance, purge, puis ajout du disque neuf",
+        "reweight corrige la distribution, le rebalance déplace les données",
+        "Scrub et deep-scrub se planifient hors des pics d'activité"
+      ],
+      "code": [
+        "ceph -s",
+        "ceph health detail",
+        "ceph osd tree",
+        "ceph osd out 3",
+        "ceph -w",
+        "ceph osd purge 3 --yes-i-really-mean-it",
+        "ceph orch daemon add osd ceph-node-02:/dev/sdc",
+        "ceph osd df tree"
+      ],
+      "table": {
+        "headers": [
+          "État PG",
+          "Signification",
+          "Action"
+        ],
+        "rows": [
+          [
+            "active+clean",
+            "Toutes les copies sont présentes",
+            "Aucune"
+          ],
+          [
+            "degraded",
+            "Copies manquantes, I/O possibles",
+            "Surveiller la reconstruction"
+          ],
+          [
+            "peering",
+            "Négociation des copies en cours",
+            "Vérifier OSD lents et réseau"
+          ],
+          [
+            "inactive",
+            "I/O bloquées faute de PG élu",
+            "Urgent : OSD, quorum, réseau"
+          ],
+          [
+            "stale",
+            "OSD muet, état non rafraîchi",
+            "Vérifier le démon et l'hôte"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "L'OSD 3 doit être remplacé. Le cluster est en HEALTH_WARN avec 8 PG degraded. Décrivez l'ordre des opérations et expliquez pourquoi il faut attendre entre chaque étape.",
+          "correction": "On commence par ceph health detail et ceph osd tree pour confirmer l'OSD et l'état des PG. On attend que les 8 PG reviennent à active+clean, car une reconstruction est déjà en cours. Ensuite : ceph osd out 3, puis ceph -w jusqu'à active+clean ; ceph osd purge 3 --yes-i-really-mean-it ; remplacement physique et ajout du nouvel OSD avec ceph orch daemon add osd. Attendre évite de dégrader une deuxième copie alors que min_size pourrait être atteint, ce qui bloquerait les écritures. Après l'ajout, surveillez la reconstruction et l'espace libre : un cluster trop plein refuse la réparation."
+        }
+      ],
+      "tip": "Un OSD « out » ne signifie pas « éteint » : il est exclu du placement mais continue de servir les PG qu'il détient jusqu'à migration. Inversement, un OSD « down and in » maintient les PG en dégradé et empêche parfois le retour à clean."
+    },
+    {
+      "heading": "CRUSH map, reprise après sinistre et sauvegardes",
+      "body": "Modifier le CRUSH map est une opération structurée : on exporte la carte binaire avec ceph osd getcrushmap, on la décompile avec crushtool -d, on édite le texte, on recompile avec crushtool -c, puis on réinjecte avec ceph osd setcrushmap. Chaque étape doit être validée par crushtool --test avant application : une règle qui place deux répliques sur le même hôte casse la tolérance de panne sans forcément produire d'alerte immédiate. Les tunables (straw2, chooseleaf_stable) influencent la stabilité du placement ; on ne les modifie pas sans raison. Pour la reprise après sinistre, deux approches se complètent : la réplication RGW multisite, qui synchronise objets et métadonnées entre zones, et les snapshots RBD exportés en incrémental (export-diff/import-diff) vers un site distant. Le RPO dépend de la fréquence de synchronisation, le RTO du temps de promotion et de remontage. Un plan de reprise n'a de valeur que s'il est testé : restaurez une snapshot dans un pool isolé, vérifiez les sommes de contrôle, mesurez la durée réelle. Enfin, distinguez sauvegarde et snapshot : une snapshot dans le même cluster ne protège ni d'une corruption logique propagée ni d'une perte de site.",
+      "bullets": [
+        "Workflow CRUSH : getcrushmap, crushtool -d, édition, -c, setcrushmap",
+        "crushtool --test valide une règle avant injection",
+        "RGW multisite synchronise métadonnées et objets entre zones",
+        "RBD export-diff/import-diff permet une réplication incrémentale",
+        "Une snapshot locale n'est pas une sauvegarde hors site"
+      ],
+      "code": [
+        "ceph osd getcrushmap -o crushmap.bin",
+        "crushtool -d crushmap.bin -o crushmap.txt",
+        "crushtool -c crushmap.txt -o crushmap-new.bin",
+        "crushtool --test -i crushmap-new.bin --rule 0 --num-rep 3",
+        "ceph osd setcrushmap -i crushmap-new.bin",
+        "rbd snap create rbd-prod/vol1@dr1",
+        "rbd export-diff rbd-prod/vol1@dr1 - | ssh site-b rbd import-diff - rbd-dr/vol1"
+      ],
+      "diagram": "  Site A (production)                 Site B (reprise)\n  -------------------                 -----------------\n  RGW zone maitresse  -- objets -->   RGW zone secondaire\n  RBD pool prod       -- diff ---->   RBD pool dr\n  MON x3                              MON x3 (quorum distinct)\n       |                                   |\n       +-------- periode de sync ----------+\n\n  RPO = frequence de sync | RTO = temps de promotion\n  Tester le restore vaut mieux que multiplier les snapshots.",
+      "tip": "Avant d'injecter un CRUSH map modifié, vérifiez le nombre de répliques par hôte avec crushtool --test : une règle correcte sur le papier peut, après édition, placer deux copies dans le même bucket. Conservez toujours la carte binaire d'origine pour revenir en arrière."
+    }
+  ],
+  "key_points": [
+    "RADOS s'appuie sur des OSD, un quorum de MON impairs et des clients qui calculent le placement",
+    "PG = hash(objet) % pg_num ; le PG est l'unité de distribution et de réparation",
+    "Réplication (size/min_size) et erasure coding (k+m) répondent à des compromis différents",
+    "CephX applique le moindre privilège via des caps par démon et des keyrings protégés",
+    "RBD expose du bloc avec cache, snapshots et clones copy-on-write",
+    "CephFS dépend du MDS et de deux pools ; RGW expose S3/Swift via realm, zonegroup et zone",
+    "active+clean est l'état de référence avant toute intervention",
+    "CRUSH map et réplication multisite se testent avant de les considérer comme un plan de reprise"
+  ],
+  "traps": [
+    "Un nombre pair de MON n'améliore pas la tolérance de panne : il complique le quorum",
+    "Un OSD « out » continue de servir ses PG jusqu'à migration ; « down » n'est pas synonyme de « out »",
+    "min_size=2 avec size=3 autorise les écritures avec deux copies, pas avec une seule",
+    "Un clone RBD non flatten reste dépendant de sa snapshot parente",
+    "Une snapshot locale ne protège ni d'une corruption logique ni de la perte du site"
+  ],
+  "quiz": [
+    {
+      "id": "hcie-oe-01-q01",
+      "type": "single",
+      "topic": "Architecture RADOS",
+      "prompt": "Which Ceph component maintains the cluster map and validates changes through a quorum?",
+      "options": [
+        "Monitor",
+        "MDS",
+        "RGW",
+        "OSD"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Les monitors conservent la carte du cluster (monmap, osdmap, pgmap, crushmap, mdsmap) et la valident en quorum Paxos. Les OSD stockent les objets, le MDS ne gère que les métadonnées CephFS et RGW expose l'API objet. Un monitor isolé ne peut donc pas modifier la carte, même s'il répond encore aux requêtes de lecture."
+    },
+    {
+      "id": "hcie-oe-01-q02",
+      "type": "single",
+      "topic": "CRUSH",
+      "prompt": "Which algorithm lets a Ceph client compute the OSD set for an object without contacting a central placement service?",
+      "options": [
+        "Consistent hashing table",
+        "CRUSH",
+        "Raft placement",
+        "Round-robin mapping"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "CRUSH (Controlled Replication Under Scalable Hashing) calcule le placement à partir de la topologie et de la règle du pool. Une table de hachage centralisée recréerait le point chaud que Ceph cherche à éviter, Raft sert au consensus et le round-robin ignore les domaines de panne. Le client n'a besoin que de la carte pour calculer le PG puis les OSD."
+    },
+    {
+      "id": "hcie-oe-01-q03",
+      "type": "single",
+      "topic": "Interfaces",
+      "prompt": "Which Ceph interface exposes an S3-compatible object API?",
+      "options": [
+        "RBD",
+        "CephFS",
+        "RGW",
+        "LIBRADOS"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "RGW (RADOS Gateway) expose une API REST compatible S3 et Swift. RBD fournit du stockage bloc, CephFS un système de fichiers POSIX et LIBRADOS une bibliothèque bas niveau. RGW traduit donc les requêtes HTTP en opérations RADOS."
+    },
+    {
+      "id": "hcie-oe-01-q04",
+      "type": "single",
+      "topic": "Erasure coding",
+      "prompt": "An erasure-coded pool uses a 4+2 profile with a host failure domain. How many fragment losses can it tolerate?",
+      "options": [
+        "4",
+        "0",
+        "1",
+        "2"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Avec k=4 fragments de données et m=2 fragments de parité, le pool tolère la perte de m fragments, soit deux. Perdre un seul fragment est déjà couvert, et perdre quatre fragments dépasserait la capacité de reconstruction. Le profil doit aussi utiliser un domaine de panne host pour que les fragments ne tombent pas sur la même machine."
+    },
+    {
+      "id": "hcie-oe-01-q05",
+      "type": "single",
+      "topic": "Réplication",
+      "prompt": "A replicated pool has size=3 and min_size=2. What happens when only two OSDs holding a PG remain available?",
+      "options": [
+        "Reads and writes continue in degraded mode",
+        "Writes are rejected but reads continue",
+        "The pool is automatically converted to erasure coding",
+        "All objects are deleted to restore consistency"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Avec min_size=2, deux copies suffisent pour continuer à lire et à écrire, même si le PG reste dégradé. Ceph reconstruira la troisième copie dès qu'un OSD redeviendra disponible. Les écritures ne sont bloquées que si le nombre de copies descend sous min_size, et aucun pool n'est converti automatiquement en erasure coding. Ceph ne supprime jamais les objets pour retrouver la cohérence."
+    },
+    {
+      "id": "hcie-oe-01-q06",
+      "type": "single",
+      "topic": "RBD",
+      "prompt": "Which command attaches an RBD image as a block device on an openEuler client?",
+      "options": [
+        "rbd attach",
+        "rbd map",
+        "rbd mount",
+        "rbd bind"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "rbd map crée un périphérique /dev/rbdX via le module krbd ; on le formate et le monte ensuite. rbd mount et rbd bind n'existent pas, et rbd attach n'est pas la syntaxe de mappage. Le mappage exige un keyring et des caps autorisant le pool concerné."
+    },
+    {
+      "id": "hcie-oe-01-q07",
+      "type": "single",
+      "topic": "CephFS",
+      "prompt": "What is the primary role of the CephFS MDS?",
+      "options": [
+        "Maintain the monitor quorum",
+        "Store file data on local disks",
+        "Manage metadata, directory hierarchy and client caches",
+        "Serve S3 buckets"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Le MDS gère l'arborescence, les permissions, les verrous et le cache des clients ; les données passent directement par les OSD. Il ne stocke donc pas les fichiers sur un disque local et ne participe pas au quorum des MON. RGW, et non le MDS, sert les buckets S3."
+    },
+    {
+      "id": "hcie-oe-01-q08",
+      "type": "single",
+      "topic": "Placement groups",
+      "prompt": "How is an object mapped to a placement group in Ceph?",
+      "options": [
+        "PG = object_size / pg_num",
+        "PG = OSD_id % replica_count",
+        "PG = random() at each write",
+        "PG = hash(object_id) % pg_num"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Ceph hache l'identifiant de l'objet puis applique un modulo sur pg_num pour obtenir le numéro de PG, auquel s'ajoute l'identifiant du pool. La taille de l'objet et le nombre de répliques n'entrent pas dans ce calcul. Un tirage aléatoire à chaque écriture rendrait le placement instable et impossible à recalculer."
+    },
+    {
+      "id": "hcie-oe-01-q09",
+      "type": "single",
+      "topic": "Pools",
+      "prompt": "Why should you run ceph osd pool application enable <pool> rbd after creating a pool for block storage?",
+      "options": [
+        "To declare the pool's intended application and enable related health checks",
+        "To increase the replication factor automatically",
+        "To mount the pool on every client",
+        "To format the pool as XFS"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "L'application type indique à Ceph l'usage du pool (rbd, cephfs ou rgw) et permet des contrôles de santé adaptés. Cela ne formate rien, ne change pas size et ne monte aucun client. Un pool sans application déclarée est signalé par un warning de santé."
+    },
+    {
+      "id": "hcie-oe-01-q10",
+      "type": "single",
+      "topic": "RGW multisite",
+      "prompt": "Which hierarchy correctly describes a Ceph RGW multisite deployment?",
+      "options": [
+        "Zone > realm > zonegroup",
+        "Realm > zonegroup > zone",
+        "Pool > realm > bucket",
+        "Zonegroup > bucket > realm"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un realm contient un ou plusieurs zonegroups, et chaque zonegroup contient une ou plusieurs zones. La zone maîtresse détient la configuration de référence et les zones secondaires synchronisent données et métadonnées. Les buckets sont des objets logiques créés dans une zone, pas un niveau de cette hiérarchie."
+    },
+    {
+      "id": "hcie-oe-01-q11",
+      "type": "multi",
+      "topic": "Résilience",
+      "prompt": "Which settings or practices improve the fault tolerance of a replicated pool? (Choose 3)",
+      "options": [
+        "CRUSH rule using the host failure domain",
+        "Regular scrub and deep-scrub to detect silent corruption",
+        "A single OSD per host to simplify operations",
+        "size=3 with min_size=2"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Trois copies avec min_size=2, des répliques sur des hôtes distincts et des scrubs réguliers augmentent la tolérance de panne et la détection des corruptions silencieuses. Un seul OSD par hôte ne protège pas mieux : il réduit la capacité et concentre les risques. La règle CRUSH doit réellement séparer les domaines de panne, sinon size=3 peut placer deux copies au même endroit. Un scrub ne répare pas une panne matérielle, mais il révèle une copie corrompue avant qu'elle ne devienne la seule disponible."
+    },
+    {
+      "id": "hcie-oe-01-q12",
+      "type": "multi",
+      "topic": "CephX",
+      "prompt": "Which capability strings follow the principle of least privilege for an application? (Choose 3)",
+      "options": [
+        "mon 'allow *'",
+        "mon 'allow r'",
+        "osd 'allow rw pool=app-data'",
+        "mds 'allow rwps fsname=fs01'"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "mon 'allow r' permet de lire l'état sans modifier la configuration, osd 'allow rw pool=app-data' limite les I/O à un pool et mds 'allow rwps fsname=fs01' restreint CephFS à un système de fichiers. mon 'allow *' donne au contraire tous les droits sur les monitors, y compris la modification des pools et de la configuration. Une application n'a presque jamais besoin de ce niveau."
+    },
+    {
+      "id": "hcie-oe-01-q13",
+      "type": "multi",
+      "topic": "Équilibrage",
+      "prompt": "Which actions help correct an uneven PG distribution across OSDs? (Choose 3)",
+      "options": [
+        "Using ceph osd reweight-by-utilization",
+        "Correcting inaccurate OSD weights in the CRUSH map",
+        "Disabling all scrubs permanently",
+        "Enabling the PG autoscaler"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "L'autoscaler ajuste le nombre de PG, reweight-by-utilization réduit le poids des OSD surchargés et des poids CRUSH corrects rétablissent une distribution proportionnelle. Désactiver les scrubs masque les erreurs de données sans rééquilibrer les PG. Un rééquilibrage sérieux se planifie, car il consomme réseau et I/O."
+    },
+    {
+      "id": "hcie-oe-01-q14",
+      "type": "tf",
+      "topic": "OSD",
+      "prompt": "An OSD marked out stops serving all of its placement groups immediately.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Un OSD out est retiré du placement, mais il continue de servir les PG qu'il détient jusqu'à leur migration. C'est pourquoi l'on attend le retour à active+clean avant de purger le disque. À l'inverse, un OSD down peut encore être in et maintenir des PG dégradés."
+    },
+    {
+      "id": "hcie-oe-01-q15",
+      "type": "tf",
+      "topic": "CephFS",
+      "prompt": "A CephFS deployment needs at least one MDS, and a standby MDS is recommended for high availability.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "CephFS ne peut pas fonctionner sans MDS, et un standby permet de reprendre le rôle actif en cas de panne. Le MDS ne stocke que les métadonnées ; les données restent sur les OSD. Le multi-actif existe mais n'est pas le mode de haute disponibilité standard recommandé en production."
+    },
+    {
+      "id": "hcie-oe-01-q16",
+      "type": "tf",
+      "topic": "Sauvegardes",
+      "prompt": "An RBD snapshot stored in the same Ceph cluster is sufficient protection against the loss of the entire site.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Une snapshot locale dépend du même cluster et du même site : elle ne survit pas à leur perte. Elle ne protège pas non plus contre une corruption logique propagée. Une vraie stratégie de reprise exige une copie hors site, par export-diff ou réplication RGW multisite, et des tests de restauration."
+    },
+    {
+      "id": "hcie-oe-01-q17",
+      "type": "text",
+      "topic": "Diagnostic",
+      "prompt": "Which short command displays the overall Ceph cluster status, including health, services and PG summary?",
+      "accept": [
+        "ceph -s",
+        "ceph status",
+        "ceph --status"
+      ],
+      "sample_answer": "ceph -s",
+      "explanation_fr": "ceph -s, équivalent de ceph status, affiche la santé, le quorum des MON, l'état des OSD et le résumé des PG. C'est le premier réflexe avant ceph health detail. La commande ne remplace pas l'analyse des PG, mais elle oriente immédiatement le diagnostic."
+    },
+    {
+      "id": "hcie-oe-01-q18",
+      "type": "text",
+      "topic": "RBD snapshots",
+      "prompt": "Which command creates a snapshot named snap1 of the image volume in the pool named pool?",
+      "accept": [
+        "rbd snap create pool/volume@snap1",
+        "rbd snap create --pool pool volume@snap1"
+      ],
+      "sample_answer": "rbd snap create pool/volume@snap1",
+      "explanation_fr": "La syntaxe pool/image@snapshot identifie à la fois l'image et le point de restauration. La snapshot est en lecture seule ; pour la supprimer, il faut d'abord la unprotect si un clone en dépend. Pensez à suspendre les I/O pour obtenir un instantané cohérent."
+    },
+    {
+      "id": "hcie-oe-01-q19",
+      "type": "text",
+      "topic": "Remplacement OSD",
+      "prompt": "Which command marks OSD 3 as out before replacing its disk?",
+      "accept": [
+        "ceph osd out 3",
+        "ceph osd out osd.3"
+      ],
+      "sample_answer": "ceph osd out 3",
+      "explanation_fr": "ceph osd out 3 retire l'OSD du placement et déclenche la migration de ses PG. Il faut ensuite attendre active+clean avant de purger l'OSD et de retirer le disque. La commande ne l'éteint pas : le démon peut continuer à servir les PG en cours de déplacement."
+    },
+    {
+      "id": "hcie-oe-01-q20",
+      "type": "text",
+      "topic": "Erasure coding",
+      "prompt": "Which command creates an erasure-code profile named ec42 with four data chunks, two coding chunks and the host failure domain?",
+      "accept": [
+        "ceph osd erasure-code-profile set ec42 k=4 m=2 crush-failure-domain=host",
+        "ceph osd erasure-code-profile set ec42 k=4 m=2 crush-failure-domain=host --force"
+      ],
+      "sample_answer": "ceph osd erasure-code-profile set ec42 k=4 m=2 crush-failure-domain=host",
+      "explanation_fr": "k=4 correspond aux fragments de données, m=2 aux fragments de parité et crush-failure-domain=host garantit que les fragments sont répartis sur des hôtes distincts. Le profil devient immuable dès qu'un pool l'utilise. Sans domaine de panne explicite, le défaut host s'applique, mais l'écrire évite toute ambiguïté."
+    }
+  ]
+}

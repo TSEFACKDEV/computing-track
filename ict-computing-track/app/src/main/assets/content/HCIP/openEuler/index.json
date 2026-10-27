@@ -1,0 +1,27 @@
+{
+  "phase": "HCIP",
+  "subject": "openEuler",
+  "name": "openEuler — services, stockage et automatisation",
+  "tagline": "LVS/Keepalived, stockage partagé, sécurité et automatisation",
+  "weight": 50,
+  "chapters": [
+    {
+      "id": "hcip-oe-01",
+      "file": "ch01.json",
+      "title": "Services réseau et haute disponibilité LVS/Keepalived",
+      "minutes": 50
+    },
+    {
+      "id": "hcip-oe-02",
+      "file": "ch02.json",
+      "title": "Stockage partagé : iSCSI, NFS et GlusterFS",
+      "minutes": 50
+    },
+    {
+      "id": "hcip-oe-03",
+      "file": "ch03.json",
+      "title": "Sécurité avancée et automatisation openEuler",
+      "minutes": 50
+    }
+  ]
+}

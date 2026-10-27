@@ -1,0 +1,570 @@
+{
+  "id": "hcia-kp-04",
+  "phase": "HCIA",
+  "subject": "Kunpeng",
+  "number": 4,
+  "title_fr": "Noyau, virtualisation et conteneurs sur Kunpeng",
+  "title_en": "Kernel, Virtualization and Containers on Kunpeng",
+  "minutes": 40,
+  "source": "HCIA-Kunpeng Application Developer V2.0 — Chapitre 2 (§2.3 iSula) + §1.4 openEuler · docs openEuler (noyau, iSula)",
+  "objectives": [
+    "Décrire la chaîne de démarrage d'openEuler sur ARM64",
+    "Expliquer le fonctionnement de KVM/QEMU et de virtio sur ARM64",
+    "Distinguer isolation par namespaces, cgroups et capabilities",
+    "Déployer une application avec iSula et Kubernetes sur Kunpeng",
+    "Appliquer les bases de la sécurité et du diagnostic système"
+  ],
+  "sections": [
+    {
+      "heading": "Le noyau Linux ARM64 et le démarrage d'openEuler",
+      "body": "Le démarrage d'un serveur Kunpeng suit une chaîne précise. Le firmware UEFI initialise le matériel, puis charge GRUB2 depuis la partition EFI. GRUB2 lit sa configuration, applique d'éventuels paramètres de ligne de commande et lance le noyau Linux ainsi que l'initramfs. Ce dernier contient les pilotes minimaux nécessaires pour monter la racine, après quoi systemd prend le relais et démarre les services.\n\nComprendre cette chaîne aide à diagnostiquer les pannes. Un serveur qui n'affiche rien peut avoir un problème UEFI ou de partition ESP ; un serveur qui démarre mais ne monte pas sa racine peut avoir un initramfs incomplet ; un service absent peut relever de systemd. Les commandes `dmesg` et `journalctl -b` racontent ces étapes avec des horodatages.\n\nopenEuler ajoute des outils de réglage. `tuned-adm` applique un profil cohérent (gouvernor CPU, paramètres vm, I/O) en une commande, tandis que des paramètres noyau comme `hugepages`, `vm.swappiness` ou `net.core.somaxconn` s'ajustent via la ligne de commande GRUB ou `sysctl`. Toute modification doit être testée : un réglage copié d'un autre serveur peut dégrader la charge réelle.",
+      "bullets": [
+        "Chaîne : UEFI → GRUB2 → noyau + initramfs → systemd",
+        "`dmesg` et `journalctl -b` tracent le démarrage",
+        "`tuned-adm` applique un profil de performance cohérent",
+        "Les paramètres noyau se règlent via GRUB ou `sysctl`"
+      ],
+      "code": [
+        "# Inspecter le démarrage courant\njournalctl -b -p err\ndmesg | grep -i -E 'error|fail|aarch64'\n\n# Régénérer l'initramfs et la configuration GRUB\ndracut -f --kver $(uname -r)\ngrub2-mkconfig -o /boot/grub2/grub.cfg\n\n# Appliquer un profil de performance\ntuned-adm list\ntuned-adm profile throughput-performance"
+      ],
+      "table": {
+        "headers": [
+          "Étape",
+          "Rôle",
+          "Outil de diagnostic"
+        ],
+        "rows": [
+          [
+            "UEFI",
+            "Initialisation matérielle, choix du disque",
+            "Console iBMC, écran série"
+          ],
+          [
+            "GRUB2",
+            "Chargement du noyau et des paramètres",
+            "/boot/grub2/grub.cfg"
+          ],
+          [
+            "initramfs",
+            "Pilotes nécessaires au montage de la racine",
+            "dracut"
+          ],
+          [
+            "systemd",
+            "Démarrage des services",
+            "systemctl, journalctl"
+          ]
+        ]
+      },
+      "tip": "`journalctl -b` limite la lecture au démarrage courant ; `-p err` filtre les erreurs. Sans `-b`, vous risquez de lire des messages d'anciens démarrages et de poursuivre une fausse piste."
+    },
+    {
+      "heading": "Virtualisation KVM/QEMU sur ARM64",
+      "body": "KVM est la solution de virtualisation intégrée au noyau Linux. Sur ARM64, il exploite l'exception level 2 (EL2) du processeur pour exécuter des machines virtuelles avec assistance matérielle. QEMU complète KVM : il émule les périphériques et gère le cycle de vie des VMs. KVM apporte la vitesse d'exécution du code invité, QEMU apporte la flexibilité du matériel virtuel.\n\nLes performances dépendent fortement des pilotes paravirtualisés. Virtio-net, virtio-blk et virtio-scsi évitent d'émuler fidèlement une carte physique coûteuse : le guest et l'hôte coopèrent via des files partagées. Pour les charges réseau intenses, vhost-net déporte une partie du traitement dans le noyau. Le passthrough PCI (VFIO) donne à une VM un accès direct à un périphérique, au prix de la perte de portabilité de la VM.\n\nSur un serveur bi-socket, le placement compte : réservez les vCPU sur des cœurs physiques, alignez la mémoire de la VM sur un nœud NUMA et utilisez des huge pages pour réduire les défauts de TLB. La migration à chaud exige des modèles de CPU compatibles entre hôtes ; migrer entre des Kunpeng de générations différentes peut échouer ou nécessiter un modèle de CPU virtuel plus conservateur.",
+      "bullets": [
+        "KVM utilise l'assistance matérielle ARM64 (EL2)",
+        "QEMU émule les périphériques et pilote la VM",
+        "Virtio et vhost réduisent le coût des I/O",
+        "Migration à chaud : modèles de CPU compatibles requis"
+      ],
+      "code": [
+        "# Installer la pile de virtualisation\ndnf install -y qemu-kvm libvirt virt-install\nsystemctl enable --now libvirtd\n\n# Créer une VM openEuler\nvirt-install --name vm1 --memory 8192 --vcpus 8 \\\n  --cpu host-passthrough --disk path=/var/lib/libvirt/images/vm1.qcow2,size=40 \\\n  --cdrom /iso/openEuler.iso --network network=default --graphics none\n\n# Vérifier les domaines et les performances\nvirsh list --all\nvirsh domstats vm1 | head -30"
+      ],
+      "diagram": "+----------------------------------------------+\n|              Hôte TaiShan / Kunpeng          |\n|  +----------------------------------------+  |\n|  | user space : QEMU (périphériques)      |  |\n|  +-------------------+--------------------+  |\n|                      | ioctl / shared mem   |\n|  +-------------------v--------------------+  |\n|  | noyau : KVM (EL2, vCPU, interruptions) |  |\n|  +-------------------+--------------------+  |\n|                      |                      |\n|  +-------------------v--------------------+  |\n|  | VM invitée : openEuler ARM64           |  |\n|  |  virtio-net / virtio-blk / vCPU        |  |\n|  +----------------------------------------+  |\n+----------------------------------------------+",
+      "tip": "QEMU n'est pas l'hyperviseur à lui seul : KVM fournit l'accélération matérielle et QEMU l'émulation des périphériques. Une question qui demande « l'hyperviseur natif de Linux » attend KVM."
+    },
+    {
+      "heading": "Conteneurs : namespaces, cgroups et iSula",
+      "body": "Un conteneur n'est pas une petite machine virtuelle. C'est un processus Linux ordinaire, isolé par plusieurs mécanismes du noyau. Les namespaces donnent au processus sa propre vue du système : PID, réseau, points de montage, hostname, IPC et identifiants utilisateur. Les cgroups limitent et comptabilisent les ressources : CPU, mémoire, I/O, nombre de processus. Les capabilities restreignent les privilèges root, et SELinux ou seccomp filtrent les opérations sensibles.\n\nComme tous les conteneurs partagent le noyau de l'hôte, ils démarrent vite et consomment peu, mais ils n'offrent pas la même frontière de sécurité qu'une VM. Une évasion de conteneur peut exposer l'hôte ; une évasion de VM doit d'abord franchir l'hyperviseur. C'est pourquoi les charges multitenant sensibles utilisent parfois des conteneurs sécurisés ou des VMs légères.\n\nopenEuler fournit iSulad, un moteur de conteneurs écrit en C/C++, conforme à l'OCI et exposant une API CRI pour Kubernetes. Il est plus léger que Docker et sépare le runtime de l'outil de build `isula-build`. iSula propose des conteneurs applicatifs classiques, des conteneurs sécurisés et des conteneurs système. Les commandes restent proches de Docker, ce qui facilite la transition.",
+      "bullets": [
+        "Namespaces : isolation de la vue du système",
+        "Cgroups : limitation et comptabilisation des ressources",
+        "Capabilities et SELinux : réduction des privilèges",
+        "iSulad : runtime OCI léger d'openEuler, compatible CRI"
+      ],
+      "code": [
+        "# Lancer un conteneur avec iSula\nsystemctl enable --now isulad\nisula pull nginx:latest\nisula run -itd --name web -p 80:80 nginx:latest\nisula ps\n\n# Inspecter les cgroups d'un conteneur\nsystemd-cgls | grep -A5 isulad\ncat /sys/fs/cgroup/system.slice/isulad.service/cgroup.controllers"
+      ],
+      "table": {
+        "headers": [
+          "Critère",
+          "Machine virtuelle",
+          "Conteneur"
+        ],
+        "rows": [
+          [
+            "Noyau",
+            "Propre à chaque VM",
+            "Partagé avec l'hôte"
+          ],
+          [
+            "Démarrage",
+            "Dizaines de secondes",
+            "Souvent moins d'une seconde"
+          ],
+          [
+            "Isolation",
+            "Forte (hyperviseur)",
+            "Plus faible (namespaces)"
+          ],
+          [
+            "Densité",
+            "Limitée par la mémoire",
+            "Élevée"
+          ],
+          [
+            "Image",
+            "Disque complet",
+            "Système de fichiers en couches"
+          ]
+        ]
+      },
+      "tip": "Un conteneur ne contient pas de noyau : il utilise celui de l'hôte. C'est pour cela qu'une image ARM64 ne peut pas être exécutée sur un hôte x86 sans émulation, et inversement."
+    },
+    {
+      "heading": "Kubernetes sur Kunpeng",
+      "body": "Kubernetes orchestre des conteneurs sur un cluster de machines. Le plan de contrôle (API server, etcd, scheduler, controller manager) décide où placer les charges ; les nœuds exécutent les pods via kubelet et un runtime compatible CRI, comme containerd ou iSulad. Sur Kunpeng, le cluster fonctionne comme sur x86, à condition que les images soient disponibles en ARM64 et que les composants système soient compilés pour aarch64.\n\nLes images multi-arch simplifient le déploiement : le même nom d'image pointe vers un manifeste qui sélectionne la variante amd64 ou arm64. Pour les charges sensibles à l'architecture, on peut ajouter des labels de nœud et des node selectors, ou des node affinities, afin de réserver certains pods à des machines Kunpeng dotées de caractéristiques particulières.\n\nLes applications avec état méritent une attention spéciale. Un Deployment convient aux services sans état, mais une base de données a besoin d'une identité réseau stable et d'un stockage persistant : on utilise un StatefulSet, un Service headless et des PersistentVolumeClaims. Les probes de liveness et readiness évitent d'envoyer du trafic à un pod bloqué, et les requests/limits permettent au scheduler de réserver les ressources nécessaires.",
+      "bullets": [
+        "Kubelet + runtime CRI (containerd ou iSulad) sur chaque nœud",
+        "Images multi-arch ou reconstruction ARM64 obligatoires",
+        "StatefulSet + PVC + Service headless pour les applications avec état",
+        "Probes, requests et limits pour la fiabilité et le placement"
+      ],
+      "code": [
+        "# Vérifier les nœuds et leurs étiquettes\nkubectl get nodes -o wide\nkubectl label node kunpeng1 arch=arm64\n\n# Inspecter les ressources allouables\ndescribe_output=$(kubectl describe node kunpeng1)\necho \"$describe_output\" | grep -i -A3 allocatable\n\n# Déployer une image ARM64\nkubectl set image deployment/web web=registry.example.com/web:arm64"
+      ],
+      "table": {
+        "headers": [
+          "Objet",
+          "Usage"
+        ],
+        "rows": [
+          [
+            "Deployment",
+            "Service sans état, replicas interchangeables"
+          ],
+          [
+            "StatefulSet",
+            "Identité réseau et stockage stables"
+          ],
+          [
+            "Service headless",
+            "Résolution DNS directe vers les pods"
+          ],
+          [
+            "PersistentVolumeClaim",
+            "Demande de stockage persistant"
+          ],
+          [
+            "ConfigMap / Secret",
+            "Configuration et données sensibles"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Une base de données conteneurisée est déployée avec un Deployment à trois replicas. Après un redémarrage, les pods perdent leurs données et les clients ne retrouvent plus le nœud primaire. Expliquez pourquoi et proposez une correction Kubernetes.",
+          "correction": "Un Deployment traite les pods comme interchangeables : les noms et adresses changent, et le stockage local au pod disparaît avec lui. Pour une base de données, il faut un StatefulSet avec une identité réseau stable (Service headless), un volume persistant par replica via volumeClaimTemplates, et une logique applicative de réplication et d'élection du primaire. Les probes doivent distinguer readiness et liveness pour ne pas casser le quorum."
+        }
+      ],
+      "tip": "StatefulSet ne rend pas une base automatiquement hautement disponible : il fournit une identité et du stockage stables. La réplication, le failover et la sauvegarde restent des responsabilités de l'application ou de l'opérateur."
+    },
+    {
+      "heading": "Sécurité : SELinux, capabilities et chiffrement",
+      "body": "La sécurité d'un serveur Kunpeng repose sur plusieurs couches. SELinux applique une politique de contrôle d'accès obligatoire : même root ne peut pas faire tout ce que la politique interdit. Les modes `enforcing`, `permissive` et `disabled` déterminent si les violations sont bloquées, seulement journalisées ou ignorées. En production, `enforcing` est la norme, et les contextes des fichiers doivent être corrects, sinon un service légitime échoue.\n\nLes capabilities découpent les pouvoirs de root en unités fines. Un serveur web n'a pas besoin de `CAP_SYS_ADMIN` ni de `CAP_NET_RAW` ; il suffit souvent de `CAP_NET_BIND_SERVICE` pour écouter sur un port privilégié. Les options `--cap-drop=ALL` puis `--cap-add` ciblé réduisent fortement la surface d'attaque. seccomp ajoute un filtre de syscalls, et les profils d'AppArmor ou SELinux limitent les accès aux fichiers et au réseau.\n\nLe chiffrement protège les données au repos. LUKS/dm-crypt chiffre un volume bloc ; la clé peut être stockée dans un TPM 2.0 ou dérivée d'une passphrase. Le chiffrement ne remplace ni les sauvegardes ni le contrôle d'accès : un volume chiffré monté et compromis reste lisible par l'attaquant. `auditd` complète le dispositif en traçant les événements sensibles.",
+      "bullets": [
+        "SELinux : contrôle d'accès obligatoire, mode `enforcing` en production",
+        "Capabilities : donner uniquement les privilèges nécessaires",
+        "seccomp et profils SELinux limitent les syscalls et accès",
+        "LUKS/dm-crypt chiffre les données au repos, avec TPM ou passphrase"
+      ],
+      "code": [
+        "# Vérifier et changer le mode SELinux\ngetenforce\nsetenforce 1\n\n# Lancer un conteneur avec des privilèges minimaux\nisula run -d --name web --cap-drop=ALL --cap-add=NET_BIND_SERVICE nginx\n\n# Chiffrer un volume (attention : efface les données)\ncryptsetup luksFormat /dev/sdc\ncryptsetup open /dev/sdc data_crypt\nmkfs.xfs /dev/mapper/data_crypt\nmount /dev/mapper/data_crypt /data"
+      ],
+      "table": {
+        "headers": [
+          "Mécanisme",
+          "Protège contre",
+          "Ne protège pas contre"
+        ],
+        "rows": [
+          [
+            "SELinux",
+            "Accès non autorisé aux ressources",
+            "Faille dans un processus autorisé"
+          ],
+          [
+            "Capabilities",
+            "Usage excessif des privilèges root",
+            "Élévation via un binaire vulnérable"
+          ],
+          [
+            "LUKS",
+            "Vol physique du disque",
+            "Accès logique une fois monté"
+          ],
+          [
+            "Sauvegarde",
+            "Perte ou corruption de données",
+            "Fuite de données"
+          ],
+          [
+            "auditd",
+            "Anonymat des actions",
+            "Action malveillante autorisée"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Remettez dans l'ordre les opérations de chiffrement d'un nouveau disque `/dev/sdc` avec LUKS, puis indiquez à quel moment le système de fichiers est créé.",
+          "correction": "1) `cryptsetup luksFormat /dev/sdc` formate le conteneur LUKS et détruit les données existantes. 2) `cryptsetup open /dev/sdc data_crypt` crée le mapping `/dev/mapper/data_crypt`. 3) `mkfs.xfs /dev/mapper/data_crypt` crée le système de fichiers sur le volume déchiffré. 4) `mount /dev/mapper/data_crypt /data` monte le volume. Le système de fichiers est donc créé après l'ouverture LUKS, jamais avant."
+        }
+      ],
+      "tip": "`--cap-drop=ALL` seul peut empêcher un conteneur de démarrer : ajoutez ensuite uniquement les capabilities nécessaires. En examen, « supprimer tous les privilèges » n'est pas synonyme de « configuration fonctionnelle »."
+    },
+    {
+      "heading": "Exploitation, diagnostic et capacité",
+      "body": "Un système stable se surveille avant de tomber. Les métriques de base sont la charge CPU, la pression mémoire, l'utilisation disque, les erreurs réseau et la latence des services. Prometheus avec node_exporter collecte ces indicateurs, Grafana les visualise, et des alertes préviennent avant la saturation. Pour les conteneurs, les métriques cgroup et les événements Kubernetes complètent la vue applicative.\n\nLe diagnostic suit une démarche du général au particulier. `journalctl` et `dmesg` pour les messages système, `systemctl status` pour un service, `ss -lntp` pour les ports en écoute, `df -h` et `df -i` pour le stockage, `free -m` et `vmstat` pour la mémoire. Un problème réseau se traque avec `ip`, `ss`, `tcpdump` et les compteurs de la carte. Un processus bloqué se diagnostique avec `ps`, `top`, `perf` ou `gdb`.\n\nLa gestion de capacité relie les tendances aux décisions. Ajouter de la mémoire ne règle pas une fuite ; ajouter des cœurs ne règle pas un verrou. Il faut comprendre le facteur limitant et prévoir la marge. Un bon runbook documente les symptômes, les commandes de vérification, les seuils d'alerte et les procédures de retour arrière.",
+      "bullets": [
+        "Surveiller CPU, mémoire, disque, réseau et latence des services",
+        "Prometheus/Grafana pour les métriques, alertes sur seuils",
+        "Diagnostic : journalctl, systemctl, ss, df, vmstat, tcpdump",
+        "Runbook : symptômes, vérifications, seuils et rollback"
+      ],
+      "code": [
+        "# Diagnostic rapide d'un service\nsystemctl status nginx --no-pager\njournalctl -u nginx -b --no-pager | tail -50\nss -lntp | grep ':80'\n\n# Espace disque et inodes\ndf -hT\ndf -i\n\n# Capture réseau ciblée\ntcpdump -i ens3 -nn port 8080 -w /tmp/trafic.pcap"
+      ],
+      "exercises": [
+        {
+          "prompt": "Un nœud Kubernetes passe en `NotReady`, les pods sont expulsés et `df -h` montre 100 % sur `/var/lib/containers`. Décrivez votre diagnostic et les précautions à prendre avant de supprimer des fichiers.",
+          "correction": "Identifier les gros consommateurs avec `du -xhd1 /var/lib/containers` et les images orphelines avec `isula images` ou `crictl images`. Vérifier les logs et l'état de kubelet avec `journalctl -u kubelet`. Supprimer uniquement les images et conteneurs inutilisés via les outils du runtime, pas avec `rm` sur des fichiers internes. Vérifier ensuite l'espace libéré, redémarrer kubelet si nécessaire et planifier une rotation des logs et un monitoring de l'espace disque."
+        }
+      ],
+      "tip": "`df -h` peut afficher de l'espace libre alors que `df -i` signale 100 % d'inodes : un grand nombre de petits fichiers peut saturer un système de fichiers sans consommer beaucoup d'octets."
+    }
+  ],
+  "key_points": [
+    "Le démarrage ARM64 suit UEFI → GRUB2 → noyau + initramfs → systemd.",
+    "KVM assure l'accélération matérielle ARM64 et QEMU l'émulation des périphériques.",
+    "Virtio et vhost réduisent le coût des I/O virtualisées.",
+    "Un conteneur partage le noyau de l'hôte ; la VM possède son propre noyau.",
+    "Namespaces, cgroups et capabilities forment la base de l'isolation des conteneurs.",
+    "iSulad est un runtime OCI léger d'openEuler, compatible CRI pour Kubernetes.",
+    "StatefulSet, PVC et Service headless répondent aux besoins des applications avec état.",
+    "SELinux, capabilities, seccomp et LUKS renforcent la sécurité à plusieurs niveaux."
+  ],
+  "traps": [
+    "Un conteneur n'est pas une VM : il n'a pas de noyau propre et son isolation est plus faible.",
+    "Les cgroups limitent les ressources mais ne garantissent pas qu'un processus ne sera jamais tué par l'OOM killer.",
+    "La migration à chaud exige des modèles de CPU compatibles entre hôtes.",
+    "`/boot/grub2/grub.cfg` est généré : modifiez la configuration source puis exécutez `grub2-mkconfig`.",
+    "Un volume LUKS monté est lisible par un processus compromis : le chiffrement au repos ne protège pas l'accès logique."
+  ],
+  "quiz": [
+    {
+      "id": "hcia-kp-04-q01",
+      "type": "single",
+      "prompt": "Which hypervisor is integrated into the Linux kernel and provides hardware-assisted virtualization on ARM64?",
+      "options": [
+        "KVM",
+        "VirtualBox",
+        "VMware Workstation",
+        "Xen only"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "KVM fait partie du noyau Linux et exploite les extensions de virtualisation ARM64 (EL2). VirtualBox et VMware Workstation sont des produits externes, et Xen n'est pas le mécanisme intégré décrit ici.",
+      "topic": "Virtualisation"
+    },
+    {
+      "id": "hcia-kp-04-q02",
+      "type": "single",
+      "prompt": "Which command displays the NUMA topology and memory of a Kunpeng host?",
+      "options": [
+        "systemctl status",
+        "numactl --hardware",
+        "df -h",
+        "ss -lntp"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "`numactl --hardware` affiche les nœuds, les CPU associés et la mémoire de chacun. `df -h` concerne le stockage, `ss -lntp` les ports réseau et `systemctl status` l'état d'un service.",
+      "topic": "NUMA"
+    },
+    {
+      "id": "hcia-kp-04-q03",
+      "type": "single",
+      "prompt": "In Kubernetes, which object is best suited to a database requiring stable network identity and persistent storage?",
+      "options": [
+        "DaemonSet",
+        "CronJob",
+        "StatefulSet",
+        "Deployment"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "StatefulSet fournit des noms de pods stables, un ordre de démarrage et des volumes persistants par replica. Deployment traite les pods comme interchangeables, DaemonSet cible tous les nœuds et CronJob exécute des tâches planifiées.",
+      "topic": "Kubernetes"
+    },
+    {
+      "id": "hcia-kp-04-q04",
+      "type": "single",
+      "prompt": "Which storage interface provides paravirtualized block devices to KVM guests?",
+      "options": [
+        "IDE",
+        "USB mass storage",
+        "NFS",
+        "virtio-blk"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Virtio-blk est un pilote paravirtualisé conçu pour réduire le coût des I/O de disque. IDE et USB mass storage sont émulés de manière plus coûteuse, et NFS est un protocole de fichiers réseau, pas une interface de bloc locale.",
+      "topic": "Virtualisation"
+    },
+    {
+      "id": "hcia-kp-04-q05",
+      "type": "single",
+      "prompt": "Which journalctl option restricts output to the current boot?",
+      "options": [
+        "-b",
+        "-u",
+        "-p",
+        "-f"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "`journalctl -b` affiche les messages du démarrage courant. `-u` filtre par unité, `-p` par priorité et `-f` suit les logs en temps réel : aucune de ces options ne limite au boot courant.",
+      "topic": "Diagnostic"
+    },
+    {
+      "id": "hcia-kp-04-q06",
+      "type": "single",
+      "prompt": "Which SELinux mode blocks policy violations and logs them?",
+      "options": [
+        "Audit-only",
+        "Enforcing",
+        "Permissive",
+        "Disabled"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "En mode `enforcing`, SELinux applique la politique et bloque les accès non autorisés tout en les journalisant. `permissive` journalise sans bloquer, et `disabled` désactive complètement le mécanisme.",
+      "topic": "Sécurité"
+    },
+    {
+      "id": "hcia-kp-04-q07",
+      "type": "single",
+      "prompt": "What is the primary function of Linux cgroups?",
+      "options": [
+        "Resolve DNS names",
+        "Compile kernel modules",
+        "Limit and account for resource usage of processes",
+        "Encrypt block devices"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Les cgroups organisent les processus et contrôlent l'allocation de CPU, mémoire, I/O et autres ressources. Le chiffrement relève de LUKS/dm-crypt, la résolution DNS du réseau et la compilation du toolchain.",
+      "topic": "Conteneurs"
+    },
+    {
+      "id": "hcia-kp-04-q08",
+      "type": "multi",
+      "prompt": "Which mechanisms contribute to container isolation on Linux? (Choose three.)",
+      "options": [
+        "GRUB2",
+        "Namespaces",
+        "Cgroups",
+        "Capabilities"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "Les namespaces isolent la vue du système, les cgroups limitent les ressources et les capabilities restreignent les privilèges. GRUB2 est un chargeur d'amorçage et n'intervient pas dans l'isolation d'un conteneur.",
+      "topic": "Conteneurs"
+    },
+    {
+      "id": "hcia-kp-04-q09",
+      "type": "multi",
+      "prompt": "Which technologies can encrypt data at rest on Linux? (Choose two.)",
+      "options": [
+        "LUKS",
+        "dm-crypt",
+        "SELinux",
+        "cgroups"
+      ],
+      "answer": [
+        0,
+        1
+      ],
+      "explanation_fr": "LUKS et dm-crypt chiffrent des volumes bloc ; LUKS est le format de conteneur de clés utilisé au-dessus de dm-crypt. SELinux contrôle les accès et cgroups limite les ressources, mais aucun des deux ne chiffre les données.",
+      "topic": "Sécurité"
+    },
+    {
+      "id": "hcia-kp-04-q10",
+      "type": "multi",
+      "prompt": "Which Kubernetes resources are typically required by a stateful database? (Choose three.)",
+      "options": [
+        "Headless Service",
+        "CronJob",
+        "StatefulSet",
+        "PersistentVolumeClaim"
+      ],
+      "answer": [
+        0,
+        2,
+        3
+      ],
+      "explanation_fr": "StatefulSet apporte l'identité stable, le PVC le stockage persistant et le Service headless la résolution DNS directe vers chaque pod. Un CronJob sert à planifier des tâches ponctuelles et ne fournit ni identité ni stockage.",
+      "topic": "Kubernetes"
+    },
+    {
+      "id": "hcia-kp-04-q11",
+      "type": "tf",
+      "prompt": "grub2-mkconfig regenerates the GRUB configuration file from the source configuration.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : `grub2-mkconfig -o /boot/grub2/grub.cfg` reconstruit le fichier final à partir des scripts et paramètres sources. Modifier directement `grub.cfg` est une mauvaise pratique, car la prochaine régénération écrasera les changements.",
+      "topic": "Démarrage"
+    },
+    {
+      "id": "hcia-kp-04-q12",
+      "type": "tf",
+      "prompt": "tuned profiles can adjust CPU governor, memory parameters and I/O settings together.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : un profil tuned regroupe un ensemble cohérent de réglages système adaptés à un type de charge. Cela évite de modifier manuellement chaque paramètre et limite les incohérences.",
+      "topic": "Tuning système"
+    },
+    {
+      "id": "hcia-kp-04-q13",
+      "type": "tf",
+      "prompt": "Containers share the host kernel, unlike virtual machines which run their own kernel.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : c'est la différence architecturale fondamentale. Un conteneur est un processus isolé sur le noyau de l'hôte ; une VM exécute un noyau invité complet au-dessus de l'hyperviseur.",
+      "topic": "Conteneurs"
+    },
+    {
+      "id": "hcia-kp-04-q14",
+      "type": "tf",
+      "prompt": "Live migration of KVM virtual machines works between hosts with completely different CPU models without any compatibility configuration.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : le CPU virtuel doit présenter les mêmes fonctionnalités sur les deux hôtes, sinon la migration échoue ou nécessite un modèle de CPU plus conservateur. Migrer entre générations de Kunpeng demande donc une vérification préalable.",
+      "topic": "Virtualisation"
+    },
+    {
+      "id": "hcia-kp-04-q15",
+      "type": "tf",
+      "prompt": "Cgroups guarantee that a process will never be killed by the OOM killer.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : les cgroups limitent et comptabilisent la mémoire, mais si un groupe dépasse sa limite, l'OOM killer peut tuer un processus. La limitation ne remplace pas un dimensionnement correct ni une gestion applicative de la pression mémoire.",
+      "topic": "Conteneurs"
+    },
+    {
+      "id": "hcia-kp-04-q16",
+      "type": "text",
+      "prompt": "Which kubectl command lists all nodes in a cluster? (Enter the full command.)",
+      "accept": [
+        "kubectl get nodes",
+        "kubectl get node"
+      ],
+      "sample_answer": "kubectl get nodes",
+      "explanation_fr": "`kubectl get nodes` interroge l'API Kubernetes et affiche l'état des nœuds. L'option `-o wide` ajoute l'adresse et la version, mais la commande de base reste `kubectl get nodes`.",
+      "topic": "Kubernetes"
+    },
+    {
+      "id": "hcia-kp-04-q17",
+      "type": "text",
+      "prompt": "Which journalctl flag selects only the current boot? (Enter the flag.)",
+      "accept": [
+        "-b",
+        "--boot"
+      ],
+      "sample_answer": "-b",
+      "explanation_fr": "`-b` est l'abréviation de `--boot`. Sans argument, elle sélectionne le démarrage courant ; `-b -1` sélectionne le démarrage précédent.",
+      "topic": "Diagnostic"
+    },
+    {
+      "id": "hcia-kp-04-q18",
+      "type": "text",
+      "prompt": "What is the name of the iSula container runtime daemon? (Enter the service name.)",
+      "accept": [
+        "isulad",
+        "iSulad",
+        "isula"
+      ],
+      "sample_answer": "isulad",
+      "explanation_fr": "Le démon s'appelle `isulad` et le service systemd `isulad.service`. L'outil en ligne de commande est `isula`, tandis que `isula-build` sert à construire des images.",
+      "topic": "Conteneurs"
+    },
+    {
+      "id": "hcia-kp-04-q19",
+      "type": "single",
+      "prompt": "Which option drops all Linux capabilities before adding only the required ones?",
+      "options": [
+        "--privileged",
+        "--net=host",
+        "--read-only",
+        "--cap-drop=ALL"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "`--cap-drop=ALL` retire toutes les capabilities, puis `--cap-add` en réintroduit uniquement celles nécessaires. `--privileged` fait l'inverse en accordant presque tous les privilèges, `--net=host` partage le réseau de l'hôte et `--read-only` rend le système de fichiers en lecture seule.",
+      "topic": "Sécurité"
+    },
+    {
+      "id": "hcia-kp-04-q20",
+      "type": "single",
+      "prompt": "Which command shows kernel messages and is useful for diagnosing hardware or driver errors?",
+      "options": [
+        "dmesg",
+        "df -h",
+        "useradd",
+        "curl"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "`dmesg` affiche le tampon de messages du noyau, où apparaissent les erreurs matérielles, les pilotes et les événements de démarrage. `df` concerne les systèmes de fichiers, `useradd` les comptes et `curl` les requêtes HTTP.",
+      "topic": "Diagnostic"
+    }
+  ]
+}

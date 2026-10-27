@@ -1,0 +1,547 @@
+{
+  "id": "hcia-og-04",
+  "phase": "HCIA",
+  "subject": "openGauss",
+  "number": 4,
+  "title_fr": "Bases, schémas, tablespaces et objets",
+  "title_en": "Databases, Schemas, Tablespaces and Objects",
+  "minutes": 45,
+  "source": "HCIA-openGauss V2.0 Training Material — Sessions 3-4 «System Architecture · Logical Structure · Storage Engine · Tablespace»",
+  "objectives": [
+    "Créer et gérer des bases de données et des schémas",
+    "Organiser le stockage physique avec les tablespaces",
+    "Maîtriser séquences, vues, vues matérialisées, index et déclencheurs",
+    "Comprendre le partitionnement et l'élagage des partitions",
+    "Interroger les catalogues système et les vues de statistiques"
+  ],
+  "sections": [
+    {
+      "heading": "1. Bases de données et modèles",
+      "body": "Un cluster openGauss héberge plusieurs bases de données indépendantes. Chaque base possède ses schémas, ses objets, ses connexions et ses droits. On crée une base avec CREATE DATABASE, depuis une autre base, généralement postgres, car on ne peut pas créer une base dans laquelle on est déjà connecté. La commande ne peut pas non plus s'exécuter dans un bloc de transaction.\n\nLors de la création, openGauss clone un modèle. template1 est le modèle par défaut : tout objet ajouté dedans se retrouve dans les futures bases. template0 est une copie vierge, utilisée lorsqu'on veut un encodage ou une locale différents. Modifier template1 pour y installer des extensions est une pratique courante, mais il faut en mesurer l'impact sur toutes les créations ultérieures.\n\nopenGauss ajoute le paramètre DBCOMPATIBILITY, qui adapte le comportement SQL : A pour Oracle, B pour MySQL, C pour Teradata et PG pour PostgreSQL. La valeur par défaut est A, ce qui surprend les habitués de PostgreSQL. Ce choix influe sur les types, les fonctions et certaines règles de conversion : il se décide à la création et ne se change pas à la légère.",
+      "bullets": [
+        "CREATE DATABASE depuis une autre base, hors bloc de transaction",
+        "template1 : modèle par défaut ; template0 : copie vierge",
+        "DBCOMPATIBILITY : A (Oracle), B (MySQL), C (Teradata), PG",
+        "Une base est isolée : ses schémas et objets ne sont pas visibles ailleurs"
+      ],
+      "code": [
+        "CREATE DATABASE sales WITH ENCODING = 'UTF8' DBCOMPATIBILITY = 'PG' TEMPLATE = template0;",
+        "\\l",
+        "\\c sales",
+        "SELECT datname, pg_encoding_to_char(encoding) FROM pg_database;"
+      ],
+      "tip": "On ne peut pas exécuter CREATE DATABASE ou DROP DATABASE dans un bloc BEGIN...COMMIT. Ces commandes doivent être lancées en autocommit depuis une autre base."
+    },
+    {
+      "heading": "2. Schémas et search_path",
+      "body": "Un schéma est un espace de noms à l'intérieur d'une base. Il regroupe des tables, vues, index, séquences et fonctions, et permet de séparer les domaines fonctionnels : app, audit, staging, reporting. Le schéma public existe par défaut et sert de namespace commun, mais le laisser tout recevoir est une mauvaise pratique sur un système volumineux.\n\nopenGauss résout les noms non qualifiés grâce au search_path. Par défaut, il vaut \"$user\", public : le moteur cherche d'abord un schéma portant le nom de l'utilisateur connecté, puis public. Si l'on crée le schéma app et qu'on exécute SET search_path TO app, public, alors SELECT * FROM orders cherche app.orders avant public.orders.\n\nPourquoi qualifier les noms ? Parce que la résolution implicite dépend d'un paramètre de session : un changement de search_path peut faire pointer une requête vers un autre objet, avec des conséquences graves. Dans les scripts et les applications, il vaut mieux écrire app.orders explicitement. Le search_path reste utile pour le confort en session interactive et pour les outils qui génèrent du SQL.",
+      "bullets": [
+        "Schéma = namespace d'objets dans une base ; public par défaut",
+        "search_path = ordre de résolution des noms non qualifiés",
+        "Valeur par défaut : \"$user\", public",
+        "Qualifier app.orders dans les scripts pour éviter toute ambiguïté"
+      ],
+      "code": [
+        "CREATE SCHEMA app;",
+        "SET search_path TO app, public;",
+        "SHOW search_path;",
+        "SELECT current_schema();",
+        "CREATE TABLE app.orders (id bigserial PRIMARY KEY, amount numeric(12,2));"
+      ],
+      "diagram": "Cluster openGauss\n +-- base postgres\n |    +-- schema public\n |    +-- schema pg_catalog (systeme)\n +-- base sales\n      +-- schema public\n      +-- schema app\n      |    +-- table orders\n      |    +-- view v_open_orders\n      +-- schema audit\n           +-- table login_log\n\nsearch_path = app, public\n  -> orders  se resout en  app.orders",
+      "exercises": [
+        {
+          "prompt": "Deux schémas app et archive contiennent chacun une table orders. Une requête non qualifiée renvoie des données inattendues. Explique et corrige.",
+          "correction": "La requête utilise un nom non qualifié et le search_path place un schéma avant l'autre, probablement archive ou public. Il faut vérifier avec SHOW search_path et current_schema(), puis qualifier explicitement la table voulue, par exemple SELECT * FROM app.orders. Pour un correctif durable, on fixe le search_path au niveau du rôle avec ALTER ROLE ou on qualifie systématiquement les objets dans le code applicatif."
+        }
+      ],
+      "tip": "Le schéma public n'est pas un schéma système : il est créé par défaut et accessible à tous. Le schéma système réel s'appelle pg_catalog et contient les catalogues."
+    },
+    {
+      "heading": "3. Tablespaces et stockage physique",
+      "body": "Un tablespace est une correspondance entre un nom logique et un répertoire du système de fichiers. Il permet de placer les objets sur un disque différent : données chaudes sur SSD, archives sur disque lent, index séparés des tables. La commande CREATE TABLESPACE big_space LOCATION '/data/tbs' exige un répertoire vide, appartenant au compte omm, et un chemin absolu.\n\nDeux tablespaces existent toujours : pg_default, qui accueille les objets utilisateur par défaut, et pg_global, qui contient les catalogues partagés par tout le cluster. On rattache un objet avec la clause TABLESPACE lors du CREATE, ou on le déplace ensuite avec ALTER TABLE ... SET TABLESPACE, opération qui réécrit les fichiers et peut être longue. ALTER DATABASE ... SET TABLESPACE déplace l'ensemble des objets de la base.\n\nIl ne faut pas confondre tablespace et schéma. Le schéma est logique : il organise les noms et les privilèges. Le tablespace est physique : il choisit l'emplacement des fichiers. Déplacer une table vers un tablespace ne change ni son nom qualifié ni les requêtes qui la ciblent ; cela change seulement l'endroit où le système de fichiers stocke ses pages.",
+      "bullets": [
+        "Tablespace = nom logique associé à un répertoire physique",
+        "pg_default pour les objets utilisateur, pg_global pour les catalogues",
+        "CREATE TABLESPACE ... LOCATION, répertoire vide et propriétaire omm",
+        "ALTER TABLE ... SET TABLESPACE déplace et réécrit les données"
+      ],
+      "code": [
+        "CREATE TABLESPACE big_space LOCATION '/data/tbs';",
+        "CREATE TABLE app.orders (id bigint) TABLESPACE big_space;",
+        "ALTER TABLE app.orders SET TABLESPACE big_space;",
+        "\\db",
+        "SELECT spcname, pg_tablespace_location(oid) FROM pg_tablespace;"
+      ],
+      "table": {
+        "headers": [
+          "Concept",
+          "Nature",
+          "Rôle"
+        ],
+        "rows": [
+          [
+            "Base de données",
+            "Logique",
+            "Isolation des données et des connexions"
+          ],
+          [
+            "Schéma",
+            "Logique",
+            "Espace de noms et privilèges"
+          ],
+          [
+            "Tablespace",
+            "Physique",
+            "Emplacement des fichiers sur disque"
+          ],
+          [
+            "Table",
+            "Logique et physique",
+            "Structure déclarée et fichiers de pages"
+          ]
+        ]
+      },
+      "tip": "Un tablespace ne se crée pas avec CREATE TABLESPACE ... AT ou ... PATH, mais avec LOCATION. Cette erreur de syntaxe est un distracteur fréquent."
+    },
+    {
+      "heading": "4. Tables, contraintes et partitionnement",
+      "body": "Une table est définie par ses colonnes, ses types et ses contraintes. Les contraintes protègent l'intégrité au niveau du moteur : PRIMARY KEY, UNIQUE, NOT NULL, CHECK, FOREIGN KEY. La clé étrangère accepte des actions en cascade : ON DELETE CASCADE supprime les enfants avec le parent, ON DELETE SET NULL les détache, ON DELETE RESTRICT ou NO ACTION refuse la suppression tant qu'un enfant existe. Le choix dépend du métier, pas du hasard.\n\nLe partitionnement découpe une grande table en partitions selon une clé. RANGE convient aux dates, LIST aux valeurs énumérées, HASH à une répartition uniforme. Une table de commandes peut être partitionnée par mois : les requêtes qui filtrent sur la date ne lisent que les partitions concernées, grâce à l'élagage de partitions. La maintenance devient plus simple : on peut détacher ou archiver une partition ancienne sans toucher au reste.\n\nLe partitionnement n'est pas gratuit. Il faut choisir une clé présente dans les requêtes fréquentes, sinon l'élagage ne sert à rien. Un trop grand nombre de partitions alourdit le catalogue et la planification. Enfin, les contraintes et index doivent être déclarés au bon niveau pour couvrir les partitions.",
+      "bullets": [
+        "Contraintes : PK, UNIQUE, NOT NULL, CHECK, FOREIGN KEY",
+        "ON DELETE CASCADE, SET NULL, RESTRICT : choisir selon le métier",
+        "Partitionnement RANGE, LIST ou HASH",
+        "L'élagage ne fonctionne que si la requête filtre sur la clé de partition"
+      ],
+      "code": [
+        "CREATE TABLE app.orders (",
+        "  id bigint NOT NULL,",
+        "  created_at date NOT NULL,",
+        "  amount numeric(12,2)",
+        ") PARTITION BY RANGE (created_at) (",
+        "  PARTITION p2025 VALUES LESS THAN ('2026-01-01'),",
+        "  PARTITION p2026 VALUES LESS THAN ('2027-01-01')",
+        ");"
+      ],
+      "diagram": "Table logique app.orders (PARTITION BY RANGE created_at)\n        |\n        +--> p2025  (donnees < 2026-01-01)\n        +--> p2026  (2026-01-01 .. 2027-01-01)\n        +--> pmax   (valeurs restantes)\n\nSELECT ... WHERE created_at >= '2026-03-01'\n        -> elagage : seule p2026 est lue",
+      "tip": "Partitionner sur une colonne que les requêtes ne filtrent jamais est inutile : le planificateur ne pourra pas élaguer et devra lire toutes les partitions."
+    },
+    {
+      "heading": "5. Séquences, vues, vues matérialisées et déclencheurs",
+      "body": "Une séquence produit des nombres uniques, généralement pour les identifiants. CREATE SEQUENCE seq START 1 INCREMENT 1 crée l'objet ; nextval('seq') avance et renvoie la valeur, currval lit la dernière valeur de la session, setval fixe la position. Le type serial est un raccourci : il crée la séquence, attache la valeur par défaut et définit NOT NULL.\n\nUne vue est une requête nommée. Elle ne stocke pas les données : chaque SELECT sur la vue réexécute la requête sous-jacente. Elle sert à simplifier les accès, à masquer des colonnes sensibles et à stabiliser une interface pour les applications. Une vue matérialisée, au contraire, stocke le résultat : elle est très rapide en lecture mais devient obsolète jusqu'à un REFRESH MATERIALIZED VIEW. C'est un bon compromis pour des tableaux de bord, à condition de piloter la fréquence de rafraîchissement.\n\nLes déclencheurs exécutent une fonction avant ou après un INSERT, UPDATE ou DELETE, ou à la place d'une opération sur une vue. Ils sont utiles pour l'audit et la dénormalisation, mais coûteux et difficiles à déboguer lorsqu'ils s'enchaînent. Une contrainte déclarative est souvent préférable à un trigger pour garantir une règle simple.",
+      "bullets": [
+        "Séquence : nextval, currval, setval ; serial crée la séquence automatiquement",
+        "Vue = requête stockée, données recalculées à chaque lecture",
+        "Vue matérialisée = résultat stocké, à rafraîchir manuellement",
+        "Trigger BEFORE/AFTER/INSTEAD OF, FOR EACH ROW, fonction plpgsql"
+      ],
+      "code": [
+        "CREATE SEQUENCE app.seq_order START 1000 INCREMENT 1;",
+        "SELECT nextval('app.seq_order');",
+        "CREATE VIEW app.v_open_orders AS SELECT id, amount FROM app.orders WHERE status = 'open';",
+        "CREATE MATERIALIZED VIEW app.mv_daily AS SELECT created_at, sum(amount) FROM app.orders GROUP BY created_at;",
+        "REFRESH MATERIALIZED VIEW app.mv_daily;"
+      ],
+      "exercises": [
+        {
+          "prompt": "Un tableau de bord interroge chaque seconde une agrégation coûteuse sur des millions de lignes. Comment réduire la charge sans changer l'interface de lecture ?",
+          "correction": "Créer une vue matérialisée qui stocke le résultat agrégé, puis faire lire le tableau de bord sur cette vue. On planifie un REFRESH MATERIALIZED VIEW à une fréquence acceptable, par exemple toutes les cinq minutes, ou après chaque chargement batch. La lecture devient très rapide, au prix d'une légère obsolescence. Une vue simple ne résoudrait rien : elle réexécuterait l'agrégation à chaque appel."
+        }
+      ],
+      "tip": "Une vue ne stocke rien ; une vue matérialisée stocke un instantané. Si une question demande pourquoi les données affichées sont anciennes, la réponse est l'absence de REFRESH."
+    },
+    {
+      "heading": "6. Index et catalogues système",
+      "body": "Un index est une structure auxiliaire qui accélère l'accès aux lignes. Le type B-tree est le plus courant : il gère l'égalité, les plages et le tri. Les index Hash conviennent aux égalités simples, GIN aux tableaux et documents, GiST aux données géométriques. Un index peut être unique, partiel avec une clause WHERE, multi-colonnes ou calculé sur une expression.\n\nUn index partiel est précieux lorsque les requêtes ne concernent qu'une minorité de lignes : CREATE INDEX ... ON orders(status) WHERE status = 'open' ne stocke que les commandes ouvertes, ce qui réduit sa taille et son coût de maintenance. Un index multi-colonnes n'aide que si les filtres commencent par ses premières colonnes : l'ordre des colonnes compte.\n\nLes catalogues système décrivent tous ces objets. pg_database liste les bases, pg_namespace les schémas, pg_class les tables et index, pg_attribute les colonnes, pg_index les index, pg_tablespace les tablespaces. Des vues plus lisibles comme pg_indexes, pg_tables et pg_views exposent le SQL de création. Les vues pg_stat_* ajoutent l'activité : pg_stat_activity pour les sessions, pg_stat_user_tables pour les accès et les lignes mortes, pg_stat_replication pour la réplication.",
+      "bullets": [
+        "B-tree par défaut ; Hash, GIN et GiST selon les données",
+        "Index partiel WHERE, multi-colonnes et sur expression",
+        "Catalogues : pg_database, pg_namespace, pg_class, pg_attribute, pg_index",
+        "pg_stat_activity, pg_stat_user_tables et pg_stat_replication pour l'activité"
+      ],
+      "code": [
+        "CREATE INDEX idx_open_orders ON app.orders(status) WHERE status = 'open';",
+        "SELECT schemaname, tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = 'app';",
+        "SELECT relname, n_live_tup, n_dead_tup FROM pg_stat_user_tables;",
+        "SELECT pid, state, query FROM pg_stat_activity;"
+      ],
+      "table": {
+        "headers": [
+          "Vue ou catalogue",
+          "Contenu"
+        ],
+        "rows": [
+          [
+            "pg_database",
+            "Bases de données du cluster"
+          ],
+          [
+            "pg_namespace",
+            "Schémas"
+          ],
+          [
+            "pg_class",
+            "Tables, index, séquences, vues"
+          ],
+          [
+            "pg_attribute",
+            "Colonnes des objets"
+          ],
+          [
+            "pg_indexes",
+            "Définition SQL des index"
+          ],
+          [
+            "pg_stat_activity",
+            "Sessions et requêtes en cours"
+          ]
+        ]
+      },
+      "tip": "pg_class contient aussi les index, les séquences et les vues. Ne crois pas qu'il ne liste que les tables : filtre sur relkind si nécessaire (r pour table, i pour index)."
+    },
+    {
+      "heading": "7. Tailles, maintenance et bonnes pratiques",
+      "body": "Surveiller la taille est indispensable pour anticiper la saturation. pg_database_size('sales') renvoie la taille d'une base en octets, pg_relation_size('app.orders') celle d'un objet, pg_total_relation_size ajoute les index et les objets annexes. pg_size_pretty convertit ces octets en unités lisibles. Un rapport régulier évite la découverte tardive d'un disque plein, qui bloque les écritures et peut empêcher le WAL de tourner.\n\nLa maintenance repose sur VACUUM et ANALYZE. VACUUM récupère l'espace des lignes mortes et limite le gonflement ; VACUUM FULL réécrit la table et rend l'espace au système, mais verrouille fortement. ANALYZE met à jour les statistiques utilisées par l'optimiseur. L'autovacuum automatise ces tâches, mais un chargement massif ou une table très modifiée justifie une exécution manuelle.\n\nEnfin, la conception des objets doit rester lisible : un schéma par domaine, des noms explicites, des contraintes plutôt que des triggers pour les règles simples, des index justifiés par des requêtes réelles et des vues matérialisées documentées. La documentation des objets se retrouve dans les catalogues, mais un COMMENT sur les tables sensibles aide beaucoup les équipes.",
+      "bullets": [
+        "pg_database_size, pg_relation_size, pg_total_relation_size et pg_size_pretty",
+        "VACUUM récupère l'espace mort ; VACUUM FULL réécrit et verrouille",
+        "ANALYZE met à jour les statistiques du planificateur",
+        "Un schéma par domaine, des contraintes explicites, des index justifiés"
+      ],
+      "code": [
+        "SELECT datname, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database ORDER BY pg_database_size(datname) DESC;",
+        "SELECT pg_size_pretty(pg_total_relation_size('app.orders'));",
+        "VACUUM (ANALYZE) app.orders;",
+        "COMMENT ON TABLE app.orders IS 'Commandes clients, une ligne par commande';"
+      ],
+      "tip": "pg_relation_size ne compte que la table ; pg_total_relation_size ajoute les index et la TOAST. Pour un rapport de capacité, utilise la seconde, sinon tu sous-estimes fortement l'espace occupé."
+    }
+  ],
+  "key_points": [
+    "Une base est créée depuis une autre base et clone template1 par défaut ; template0 sert de modèle vierge.",
+    "DBCOMPATIBILITY vaut A par défaut dans openGauss, avec B pour MySQL et PG pour PostgreSQL.",
+    "Le schéma est logique, le tablespace est physique : ne pas confondre les deux.",
+    "search_path détermine l'ordre de résolution des noms non qualifiés.",
+    "Les vues matérialisées stockent un résultat et exigent un REFRESH.",
+    "Les index B-tree, partiels et multi-colonnes accélèrent les lectures au prix des écritures.",
+    "Les catalogues pg_* et les vues pg_stat_* décrivent les objets et l'activité."
+  ],
+  "traps": [
+    "CREATE DATABASE et DROP DATABASE ne peuvent pas s'exécuter dans un bloc de transaction.",
+    "Un tablespace n'est pas un schéma : l'un choisit l'emplacement physique, l'autre l'espace de noms.",
+    "Une vue matérialisée ne se rafraîchit pas automatiquement : REFRESH est nécessaire.",
+    "ON DELETE RESTRICT refuse la suppression d'un parent encore référencé ; CASCADE la propage.",
+    "pg_relation_size sous-estime l'espace réel : pg_total_relation_size inclut les index."
+  ],
+  "quiz": [
+    {
+      "id": "hcia-og-04-q01",
+      "type": "single",
+      "prompt": "Which system view shows the SQL definition of indexes?",
+      "options": [
+        "pg_indexes",
+        "pg_tables",
+        "pg_stat_activity",
+        "pg_namespace"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "pg_indexes expose le schéma, la table, le nom de l'index et sa définition SQL. pg_tables liste les tables, pg_stat_activity les sessions et pg_namespace les schémas. Pour les métadonnées brutes, le catalogue pg_index reste disponible.",
+      "topic": "Catalogues"
+    },
+    {
+      "id": "hcia-og-04-q02",
+      "type": "single",
+      "prompt": "Which view lists currently connected sessions and their running queries?",
+      "options": [
+        "pg_attribute",
+        "pg_stat_activity",
+        "pg_stat_database",
+        "pg_class"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "pg_stat_activity décrit chaque session : PID, utilisateur, base, état et requête en cours. pg_stat_database agrège les statistiques par base, pg_class décrit les objets et pg_attribute les colonnes. Aucune de ces trois vues ne montre le détail des sessions.",
+      "topic": "Catalogues"
+    },
+    {
+      "id": "hcia-og-04-q03",
+      "type": "single",
+      "prompt": "Which foreign-key action prevents deleting a parent row while child rows still reference it?",
+      "options": [
+        "ON DELETE SET DEFAULT",
+        "ON DELETE CASCADE",
+        "ON DELETE RESTRICT",
+        "ON DELETE SET NULL"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "RESTRICT refuse la suppression du parent tant qu'un enfant le référence. CASCADE supprime les enfants, SET NULL met la clé étrangère à NULL et SET DEFAULT applique la valeur par défaut. Seul RESTRICT bloque l'opération.",
+      "topic": "Contraintes"
+    },
+    {
+      "id": "hcia-og-04-q04",
+      "type": "single",
+      "prompt": "Which statement correctly creates a tablespace named big_space?",
+      "options": [
+        "CREATE TABLESPACE big_space AT '/data/tbs';",
+        "CREATE TABLESPACE big_space PATH '/data/tbs';",
+        "ALTER SCHEMA big_space SET TABLESPACE '/data/tbs';",
+        "CREATE TABLESPACE big_space LOCATION '/data/tbs';"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "La syntaxe correcte utilise LOCATION suivi d'un chemin absolu. AT et PATH ne sont pas les mots-clés attendus. La dernière instruction tente de déplacer un schéma, ce qui n'a aucun sens : un tablespace est un objet physique distinct.",
+      "topic": "Tablespaces"
+    },
+    {
+      "id": "hcia-og-04-q05",
+      "type": "single",
+      "prompt": "Which schema is used by default for user objects in a new openGauss database?",
+      "options": [
+        "public",
+        "main",
+        "dbo",
+        "app"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le schéma public est créé par défaut et figure dans le search_path initial. main est une notion Oracle, dbo vient de SQL Server et app n'existe que si on le crée. Le schéma système, lui, s'appelle pg_catalog.",
+      "topic": "Schémas"
+    },
+    {
+      "id": "hcia-og-04-q06",
+      "type": "single",
+      "prompt": "Which template database is used by default when CREATE DATABASE is executed without TEMPLATE?",
+      "options": [
+        "template0",
+        "template1",
+        "postgres",
+        "pg_default"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "template1 est le modèle par défaut : les objets qu'on y ajoute se retrouvent dans les nouvelles bases. template0 est une copie vierge utilisée pour changer d'encodage ou de locale. postgres est une base de travail et pg_default est un tablespace, pas un modèle.",
+      "topic": "Bases de données"
+    },
+    {
+      "id": "hcia-og-04-q07",
+      "type": "single",
+      "prompt": "What must be done to make a materialized view reflect recent changes?",
+      "options": [
+        "Run ANALYZE on the view",
+        "Recreate the database",
+        "Run REFRESH MATERIALIZED VIEW",
+        "Restart the instance"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Une vue matérialisée stocke un instantané : REFRESH MATERIALIZED VIEW réexécute la requête et remplace le contenu. Un redémarrage ne rafraîchit rien, ANALYZE ne fait que collecter des statistiques et recréer la base serait une opération disproportionnée et destructrice.",
+      "topic": "Vues"
+    },
+    {
+      "id": "hcia-og-04-q08",
+      "type": "single",
+      "prompt": "Which parameter determines the order in which schemas are searched for unqualified object names?",
+      "options": [
+        "schema_order",
+        "default_tablespace",
+        "current_schema",
+        "search_path"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "search_path liste les schémas dans l'ordre de résolution, par exemple app, public. schema_order n'existe pas comme paramètre de résolution, default_tablespace choisit un emplacement physique et current_schema est une fonction qui renvoie le premier schéma du chemin.",
+      "topic": "Schémas"
+    },
+    {
+      "id": "hcia-og-04-q09",
+      "type": "single",
+      "prompt": "Which partitioning strategy is most natural for a table partitioned by month?",
+      "options": [
+        "RANGE",
+        "LIST",
+        "HASH",
+        "ROUND ROBIN"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Le partitionnement RANGE découpe selon des intervalles ordonnés, ce qui correspond aux mois ou aux années. LIST convient à des valeurs énumérées, HASH à une répartition uniforme sans ordre temporel, et ROUND ROBIN n'est pas une stratégie de partitionnement SQL standard.",
+      "topic": "Partitionnement"
+    },
+    {
+      "id": "hcia-og-04-q10",
+      "type": "single",
+      "prompt": "Which function returns the total disk space used by a table including its indexes?",
+      "options": [
+        "pg_relation_size",
+        "pg_total_relation_size",
+        "pg_database_size",
+        "pg_table_size"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "pg_total_relation_size additionne la table, ses index et ses objets annexes. pg_relation_size ne mesure que le fichier principal de la table, pg_database_size mesure toute la base et pg_table_size exclut les index. Pour un rapport de capacité, la deuxième réponse est la plus complète.",
+      "topic": "Maintenance"
+    },
+    {
+      "id": "hcia-og-04-q11",
+      "type": "multi",
+      "prompt": "Which objects belong to a schema namespace? (Choose three.)",
+      "options": [
+        "FUNCTION",
+        "INDEX",
+        "DATABASE",
+        "VIEW"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Les vues, fonctions et index sont qualifiés par un schéma et apparaissent dans pg_namespace. Une base de données est un niveau supérieur du cluster : elle contient les schémas et n'appartient elle-même à aucun schéma.",
+      "topic": "Schémas"
+    },
+    {
+      "id": "hcia-og-04-q12",
+      "type": "multi",
+      "prompt": "Which statements correctly manage tablespaces? (Choose two.)",
+      "options": [
+        "CREATE TABLESPACE sp AT '/data/sp';",
+        "ALTER SCHEMA s SET TABLESPACE sp;",
+        "CREATE TABLESPACE sp LOCATION '/data/sp';",
+        "ALTER TABLE t SET TABLESPACE sp;"
+      ],
+      "answer": [
+        2,
+        3
+      ],
+      "explanation_fr": "On crée un tablespace avec LOCATION, puis on déplace une table avec ALTER TABLE ... SET TABLESPACE, qui réécrit les fichiers. AT n'est pas la syntaxe correcte et un schéma n'a pas d'emplacement physique : il ne peut donc pas être déplacé dans un tablespace.",
+      "topic": "Tablespaces"
+    },
+    {
+      "id": "hcia-og-04-q13",
+      "type": "multi",
+      "prompt": "Which catalogs store metadata about tables, columns and schemas? (Choose three.)",
+      "options": [
+        "pg_class",
+        "pg_attribute",
+        "pg_namespace",
+        "pg_stat_activity"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "pg_class décrit les objets relationnels, pg_attribute leurs colonnes et pg_namespace les schémas. pg_stat_activity est une vue d'activité des sessions, pas un catalogue de définition : elle ne contient pas la structure des objets.",
+      "topic": "Catalogues"
+    },
+    {
+      "id": "hcia-og-04-q14",
+      "type": "tf",
+      "prompt": "A materialized view keeps its data frozen until it is explicitly refreshed.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai. Une vue matérialisée stocke le résultat de sa requête et ne se met pas à jour toute seule. Il faut exécuter REFRESH MATERIALIZED VIEW, éventuellement de façon planifiée, pour refléter les changements des tables sources.",
+      "topic": "Vues"
+    },
+    {
+      "id": "hcia-og-04-q15",
+      "type": "tf",
+      "prompt": "The search_path parameter determines which schemas are searched to resolve unqualified object names.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai. search_path liste les schémas dans l'ordre de recherche. Si app précède public, orders se résout en app.orders lorsqu'il existe. C'est aussi pourquoi un mauvais search_path peut faire lire la mauvaise table.",
+      "topic": "Schémas"
+    },
+    {
+      "id": "hcia-og-04-q16",
+      "type": "tf",
+      "prompt": "A tablespace is a logical namespace that groups tables in the same way as a schema.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux. Un tablespace désigne un emplacement physique, un répertoire du système de fichiers. Le schéma est le namespace logique qui organise les noms et les privilèges. Les deux notions sont complémentaires mais ne se confondent pas.",
+      "topic": "Tablespaces"
+    },
+    {
+      "id": "hcia-og-04-q17",
+      "type": "text",
+      "prompt": "Write the DDL statement that creates a schema named app in the current database.",
+      "accept": [
+        "create schema app",
+        "create schema app;",
+        "CREATE SCHEMA app;",
+        "create schema app authorization omm"
+      ],
+      "sample_answer": "CREATE SCHEMA app;",
+      "explanation_fr": "CREATE SCHEMA app crée un namespace dans la base courante et l'enregistre dans pg_namespace. Il faut ensuite un USAGE sur ce schéma pour que les autres rôles puissent y accéder, et éventuellement l'ajouter au search_path.",
+      "topic": "Schémas"
+    },
+    {
+      "id": "hcia-og-04-q18",
+      "type": "text",
+      "prompt": "Write the expression that returns the size of database postgres as a readable string.",
+      "accept": [
+        "pg_size_pretty(pg_database_size('postgres'))",
+        "select pg_size_pretty(pg_database_size('postgres'));",
+        "pg_size_pretty(pg_database_size(postgres))"
+      ],
+      "sample_answer": "SELECT pg_size_pretty(pg_database_size('postgres'));",
+      "explanation_fr": "pg_database_size renvoie un nombre d'octets, et pg_size_pretty le convertit en Ko, Mo ou Go. La combinaison des deux fonctions produit une valeur lisible. pg_relation_size ne mesurerait qu'un seul objet, pas la base entière.",
+      "topic": "Maintenance"
+    },
+    {
+      "id": "hcia-og-04-q19",
+      "type": "text",
+      "prompt": "Which catalog view gives the definition of every index in a schema?",
+      "accept": [
+        "pg_indexes",
+        "pg_index",
+        "pg_indexes view"
+      ],
+      "sample_answer": "pg_indexes",
+      "explanation_fr": "pg_indexes est la vue lisible qui expose schemaname, tablename, indexname et indexdef. Le catalogue bas niveau pg_index contient les liens entre table et index, mais pas la définition SQL complète sous une forme aussi pratique.",
+      "topic": "Catalogues"
+    },
+    {
+      "id": "hcia-og-04-q20",
+      "type": "text",
+      "prompt": "Which DBCOMPATIBILITY value gives Oracle-compatible behavior in openGauss?",
+      "accept": [
+        "a",
+        "A",
+        "'A'",
+        "A (Oracle)"
+      ],
+      "sample_answer": "A",
+      "explanation_fr": "La valeur A active la compatibilité Oracle, B la compatibilité MySQL, C la compatibilité Teradata et PG le comportement PostgreSQL. openGauss utilise A par défaut, ce qui explique certains comportements de types et de fonctions.",
+      "topic": "Bases de données"
+    }
+  ]
+}

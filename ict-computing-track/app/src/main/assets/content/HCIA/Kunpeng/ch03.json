@@ -1,0 +1,601 @@
+{
+  "id": "hcia-kp-03",
+  "phase": "HCIA",
+  "subject": "Kunpeng",
+  "number": 3,
+  "title_fr": "Optimisation des performances sur Kunpeng",
+  "title_en": "Performance Optimization on Kunpeng",
+  "minutes": 40,
+  "source": "HCIA-Kunpeng Application Developer V2.0 — Chapitre 3 «Application Performance Testing and Tuning» · Lab Guide (tuning)",
+  "objectives": [
+    "Définir les métriques de performance pertinentes et une méthodologie de mesure",
+    "Utiliser les outils de profiling système et applicatif sur Linux ARM64",
+    "Optimiser la compilation : niveaux, LTO, PGO et vectorisation NEON",
+    "Expliquer et corriger les effets NUMA, cache et I/O",
+    "Tuner une application Java avec BiSheng JDK et valider par benchmark"
+  ],
+  "sections": [
+    {
+      "heading": "Mesurer avant d'optimiser : métriques et méthode",
+      "body": "Optimiser sans mesurer revient à réparer une voiture au hasard. La première étape consiste à définir ce que signifie « rapide » pour l'utilisateur : temps de réponse moyen, latence au 99e percentile (p99), débit en requêtes par seconde, taux d'erreur et consommation de ressources. Le p99 est souvent plus révélateur que la moyenne, car il capture les expériences dégradées que subissent les utilisateurs les plus malchanceux.\n\nUne méthode simple consiste à appliquer le triptyque USE : pour chaque ressource (CPU, mémoire, disque, réseau), examiner l'utilisation, la saturation et les erreurs. Un CPU à 100 % n'est pas forcément le goulot : il peut attendre le disque, un verrou ou le réseau. À l'inverse, un CPU à 30 % avec une latence élevée indique souvent une attente, pas un manque de calcul.\n\nAvant toute modification, établissez une référence (baseline) dans un environnement stable : mêmes versions, même charge, même réseau. Répétez les mesures au moins trois fois et conservez la médiane. Sans cette rigueur, il est impossible de distinguer un vrai gain d'une variation aléatoire due au cache, au scheduling ou à un voisin bruyant.",
+      "bullets": [
+        "Mesurer latence moyenne, p99, débit, erreurs et ressources",
+        "Appliquer le modèle USE : utilisation, saturation, erreurs",
+        "Établir une baseline dans un environnement contrôlé",
+        "Répéter les mesures et raisonner sur la médiane"
+      ],
+      "code": [
+        "# Mesures système de base\nuptime\nvmstat 1 5\nmpstat -P ALL 1 5\npidstat -u -r -d 1 5\n\n# Tester une API et observer la distribution des latences\nab -n 10000 -c 100 http://127.0.0.1:8080/api/ping"
+      ],
+      "table": {
+        "headers": [
+          "Métrique",
+          "Question à laquelle elle répond"
+        ],
+        "rows": [
+          [
+            "Latence p50 / p99",
+            "Quelle expérience pour l'utilisateur typique et le pire cas ?"
+          ],
+          [
+            "Débit",
+            "Combien de requêtes le système absorbe-t-il ?"
+          ],
+          [
+            "Taux d'erreur",
+            "Le système reste-t-il fiable sous charge ?"
+          ],
+          [
+            "CPU / mémoire",
+            "Où partent les ressources ?"
+          ],
+          [
+            "I/O wait / %util",
+            "Le stockage est-il saturé ?"
+          ]
+        ]
+      },
+      "tip": "Une moyenne flatteuse peut cacher un p99 catastrophique. À l'examen, « temps de réponse moyen » n'est pas synonyme de « latence perçue » : privilégiez le percentile pour juger la qualité de service."
+    },
+    {
+      "heading": "Profiling système : perf et les outils Linux",
+      "body": "Le profiling répond à la question « où le temps est-il réellement passé ? ». `perf` exploite les compteurs matériels et les échantillonnages du noyau. `perf stat` donne une vue synthétique : cycles, instructions, branches manquées, défauts de cache. Le rapport instructions/cycles donne l'IPC, un indicateur utile pour savoir si le CPU travaille efficacement ou s'il est bloqué en attente mémoire. `perf record -g` échantillonne les piles d'appels, puis `perf report` ou un flame graph montre les fonctions chaudes.\n\nLes outils classiques complètent cette vue. `top` et `pidstat` montrent la consommation par processus, `vmstat` l'activité mémoire et le swap, `iostat` les débits et les temps d'attente par disque, `sar` l'historique. Le choix de l'outil dépend de la question : inutile de lancer un profileur complexe si `iostat` révèle déjà un disque saturé.\n\nHuawei fournit aussi l'outil d'analyse de performance Kunpeng, structuré en AnalysisServer et Agent. L'Agent collecte les données sur le serveur, l'AnalysisServer les analyse et les présente dans un navigateur. Il couvre l'analyse système, l'analyse Java, le diagnostic et l'assistant de tuning, avec des recommandations adaptées à la plateforme.",
+      "bullets": [
+        "`perf stat` : cycles, instructions, IPC, cache et branches",
+        "`perf record -g` + flame graph : localiser les fonctions chaudes",
+        "`pidstat`, `vmstat`, `iostat`, `sar` : vue par processus et par ressource",
+        "Outil Kunpeng : Agent de collecte + AnalysisServer d'analyse"
+      ],
+      "code": [
+        "# Statistiques matérielles et profile avec piles d'appels\nperf stat -e cycles,instructions,cache-misses ./app\nperf record -F 99 -g -- ./app\nperf report --stdio | head -40\n\n# Flame graph (outils à installer)\nperf script | stackcollapse-perf.pl | flamegraph.pl > flame.svg\n\n# Observer un processus précis\npidstat -p $(pgrep -f monapp) -u -r -d 1 10"
+      ],
+      "table": {
+        "headers": [
+          "Outil",
+          "Usage typique"
+        ],
+        "rows": [
+          [
+            "perf",
+            "Échantillonnage CPU, compteurs, piles d'appels"
+          ],
+          [
+            "pidstat",
+            "CPU, mémoire et I/O par processus"
+          ],
+          [
+            "vmstat",
+            "Mémoire, swap, run queue, contexte"
+          ],
+          [
+            "iostat",
+            "Débit et latence par disque"
+          ],
+          [
+            "sar",
+            "Historique des métriques système"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un service affiche un IPC de 0,4 et un taux élevé de cache-misses alors que le CPU n'est qu'à 45 %. Que soupçonnez-vous et comment vérifier ?",
+          "correction": "Un IPC faible avec beaucoup de défauts de cache suggère que les cœurs attendent la mémoire : accès aléatoires, empreinte de données trop grande, mauvaise localité NUMA ou faux partage. Vérifiez la topologie avec `numactl --hardware`, mesurez les accès distants avec `numastat`, puis testez un binding CPU/mémoire local avec `numactl --cpunodebind=0 --membind=0`. Examinez aussi la taille des structures et l'alignement pour détecter le false sharing."
+        }
+      ],
+      "tip": "`perf` sur ARM64 nécessite les compteurs PMU exposés par le noyau et, selon la configuration, des droits élevés. Si `perf stat` renvoie zéro événement, vérifiez `kernel.perf_event_paranoid` et le support du modèle de CPU."
+    },
+    {
+      "heading": "Optimiser le CPU : compilation, LTO et PGO",
+      "body": "Le compilateur peut transformer un programme correct en programme rapide, à condition de lui donner les bonnes informations. `-O2` est un bon compromis par défaut ; `-O3` ajoute des optimisations agressives, notamment la vectorisation, mais peut augmenter la taille du code et parfois dégrader les performances à cause de la pression sur le cache d'instructions. Il faut mesurer, pas supposer.\n\n`-march=native` permet au compilateur d'utiliser toutes les extensions du CPU local. C'est excellent pour un serveur homogène, mais dangereux si le binaire doit tourner sur un autre modèle de Kunpeng. Pour un artefact portable, ciblez explicitement `-march=armv8-a` ou une variante documentée.\n\nLa LTO (Link Time Optimization) repousse certaines optimisations à l'édition de liens, ce qui permet d'optimiser à travers les fichiers. La PGO (Profile-Guided Optimization) va plus loin : on compile avec instrumentation, on exécute une charge représentative, puis on recompile en utilisant le profil. Le compilateur sait alors quelles branches sont chaudes et peut mieux organiser le code. Sur ARM, la vectorisation NEON traite plusieurs données par instruction, mais elle n'est jamais garantie : consultez les rapports `-fopt-info-vec`.",
+      "bullets": [
+        "`-O2` par défaut, `-O3` à valider par mesure",
+        "`-march=native` performant mais non portable entre modèles",
+        "LTO optimise à travers les unités de compilation",
+        "PGO : instrumenter, exécuter une charge réelle, recompiler avec le profil"
+      ],
+      "code": [
+        "# PGO en trois étapes\ngcc -O3 -march=armv8-a -fprofile-generate app.c -o app_prof\n./app_prof --workload representatif\ngcc -O3 -march=armv8-a -fprofile-use app.c -o app_opt\n\n# Vérifier la vectorisation\ngcc -O3 -march=armv8-a -fopt-info-vec-missed app.c -o app 2> vec.log"
+      ],
+      "exercises": [
+        {
+          "prompt": "Décrivez la séquence PGO complète avec GCC et expliquez pourquoi la charge utilisée pendant l'entraînement est cruciale.",
+          "correction": "1) Compiler avec `-fprofile-generate` et les optimisations visées. 2) Exécuter le binaire sur une charge représentative de la production pour générer les fichiers `.gcda`. 3) Recompiler avec `-fprofile-use` en conservant les mêmes options. Si la charge d'entraînement ne ressemble pas à la production, le compilateur optimise les mauvaises branches : les gains peuvent disparaître, voire devenir négatifs."
+        }
+      ],
+      "tip": "La PGO n'est pas une option magique : elle dépend de la représentativité de la charge. Une PGO entraînée sur un benchmark synthétique peut dégrader la production réelle."
+    },
+    {
+      "heading": "Mémoire, cache et NUMA",
+      "body": "Sur un serveur bi-socket Kunpeng, chaque socket possède ses propres contrôleurs mémoire. Un cœur accède rapidement à la mémoire de son nœud local, mais traverse l'interconnexion pour accéder à la mémoire distante. Ce surcoût est le cœur du problème NUMA. Une application qui alloue de la mémoire sur un nœud et l'utilise depuis un autre perd une partie du bénéfice du multi-cœur.\n\nLa politique de premier contact (first touch) explique souvent les mauvaises surprises : la mémoire est physiquement placée sur le nœud du thread qui l'a allouée en premier. Si un thread d'initialisation unique alloue un grand tableau ensuite utilisé par les threads du second socket, la moitié des accès seront distants. `numactl` permet de contraindre l'exécution et l'allocation : `--cpunodebind` fixe les cœurs, `--membind` fixe la mémoire, `--interleave` répartit les pages pour maximiser la bande passante agrégée.\n\nLe cache ajoute une autre dimension. Les lignes de cache font généralement 64 octets ; deux variables indépendantes situées sur la même ligne peuvent provoquer du faux partage (false sharing) lorsque deux cœurs les modifient. Ajouter du rembourrage ou aligner les structures sur la taille de ligne réduit ce phénomène. Les huge pages et MPAM aident ensuite à limiter les défauts de TLB et à contrôler la pression sur le cache L3.",
+      "bullets": [
+        "Accès mémoire local plus rapide que l'accès distant NUMA",
+        "Le first touch détermine le placement physique des pages",
+        "`numactl --cpunodebind` et `--membind` alignent CPU et mémoire",
+        "False sharing : variables indépendantes sur une même ligne de cache"
+      ],
+      "code": [
+        "# Voir la topologie\nnumactl --hardware\nnumastat\n\n# Lancer l'application sur le nœud 0 avec sa mémoire locale\nnumactl --cpunodebind=0 --membind=0 ./app\n\n# Répartir la mémoire pour maximiser la bande passante\nnumactl --interleave=all ./app"
+      ],
+      "table": {
+        "headers": [
+          "Politique numactl",
+          "Effet"
+        ],
+        "rows": [
+          [
+            "--cpunodebind=N",
+            "Exécute les threads sur les cœurs du nœud N"
+          ],
+          [
+            "--membind=N",
+            "Alloue la mémoire uniquement sur le nœud N"
+          ],
+          [
+            "--preferred=N",
+            "Préfère N, avec repli si insuffisant"
+          ],
+          [
+            "--interleave=all",
+            "Répartit les pages sur tous les nœuds"
+          ]
+        ]
+      },
+      "tip": "`--cpunodebind` sans `--membind` ne garantit pas la localité mémoire : les deux réglages doivent être cohérents. Et `--interleave` améliore la bande passante agrégée mais peut augmenter la latence d'un accès individuel.",
+      "diagram": "Nœud NUMA 0                       Nœud NUMA 1\n┌──────────────────┐             ┌──────────────────┐\n│ N cœurs          │             │ N cœurs          │\n│ L1 / L2 privés   │             │ L1 / L2 privés   │\n│ L3 partagé       │             │ L3 partagé       │\n└────────┬─────────┘             └─────────┬────────┘\n         │ accès local                     │ accès local\n┌────────▼─────────┐   lien inter-socket  ┌─▼────────────────┐\n│ RAM du nœud 0    │◄──── plus lent ─────►│ RAM du nœud 1    │\n└──────────────────┘                     └──────────────────┘\n\nLocal  : latence faible, bande passante maximale\nDistant: latence plus élevée, bande passante partagée\n→ épingler les threads et allouer la mémoire du même nœud (numactl)"
+    },
+    {
+      "heading": "I/O, stockage et réseau",
+      "body": "Les entrées-sorties sont souvent le maillon faible d'une application pourtant bien optimisée. Le noyau Linux utilise le page cache pour absorber les lectures et les écritures de fichiers. Une lecture répétée d'un petit fichier peut donc être entièrement servie depuis la mémoire, tandis qu'un accès aléatoire à un volume trop grand que le cache provoquera des lectures disque. Comprendre ce mécanisme évite d'accuser le CPU à tort.\n\nLe choix des appels système compte. `fread` et `fwrite` utilisent un buffer en espace utilisateur (la libc), ce qui réduit le nombre d'appels système mais ajoute une copie mémoire. `read` et `write` évitent cette copie mais multiplient les transitions vers le noyau. Pour de gros transferts, `read`/`write` sont souvent préférables ; pour de petites opérations fréquentes, le buffering de la libc réduit le coût des appels. Les accès directs (`O_DIRECT`) contournent le page cache et conviennent aux bases de données qui gèrent elles-mêmes leur cache.\n\nCôté réseau, surveillez les retransmissions, les files d'attente et les interruptions. Une carte 25 GE mal réglée peut saturer un cœur avec les interruptions logicielles. L'étalement des IRQ, le RSS, les files multiqueue et l'offload matériel réduisent ce coût. `iostat`, `sar -n DEV` et `ethtool -S` fournissent les premières pistes.",
+      "bullets": [
+        "Le page cache absorbe une partie des I/O de fichiers",
+        "`fread`/`fwrite` : buffer utilisateur, moins d'appels système, une copie en plus",
+        "`O_DIRECT` contourne le page cache pour les SGBD qui gèrent leur cache",
+        "Réseau : surveiller IRQ, RSS, retransmissions et files d'attente"
+      ],
+      "code": [
+        "# I/O par disque et par interface\niostat -xz 1 5\nsar -n DEV 1 5\n\n# Statistiques détaillées de la carte réseau\nethtool -S ens3 | head -40\n\n# Tester le débit disque en lecture directe\nfio --name=lecture --rw=read --bs=1M --direct=1 --size=2G --filename=/data/test"
+      ],
+      "table": {
+        "headers": [
+          "Méthode",
+          "Copies mémoire",
+          "Appels système",
+          "Usage typique"
+        ],
+        "rows": [
+          [
+            "fread / fwrite",
+            "Une copie vers le buffer libc",
+            "Moins nombreux",
+            "Petits transferts fréquents"
+          ],
+          [
+            "read / write",
+            "Copie directe vers le buffer applicatif",
+            "Plus nombreux",
+            "Gros transferts"
+          ],
+          [
+            "mmap",
+            "Mapping, pas de copie explicite",
+            "Très peu",
+            "Fichiers accédés aléatoirement"
+          ],
+          [
+            "O_DIRECT",
+            "Minimale",
+            "Variables",
+            "SGBD avec cache propre"
+          ]
+        ]
+      },
+      "tip": "Ne concluez pas « disque lent » sur la seule base du débit : regardez aussi `await`, `%util` et la taille des requêtes. Un `%util` proche de 100 % avec de faibles IOPS peut indiquer une saturation, pas nécessairement un disque défectueux."
+    },
+    {
+      "heading": "Java et BiSheng JDK : tuner la JVM",
+      "body": "Une application Java combine deux niveaux : le code applicatif et la JVM. Le JIT compile progressivement le bytecode en code natif, ce qui explique pourquoi les premières secondes sont plus lentes. Les performances dépendent donc de l'échauffement, de la taille du heap, du ramasse-miettes et du nombre de threads. Sans mesure, le réglage de la JVM devient vite de la superstition.\n\nBiSheng JDK est une distribution OpenJDK optimisée par Huawei pour ARM64, notamment pour les charges big data et les serveurs multicœurs. Elle reste compatible avec l'écosystème Java standard. Pour une application à faible latence, on privilégie souvent un heap fixe (`-Xms` égal à `-Xmx`) afin d'éviter les redimensionnements, et un ramasse-miettes à faibles pauses comme ZGC ou G1 selon la version et le profil. Un heap trop petit provoque des GC fréquentes ; un heap trop grand peut allonger certaines pauses et augmenter l'empreinte mémoire.\n\nLes outils d'observation sont indispensables. Java Flight Recorder enregistre les événements JVM, `jcmd` expose des diagnostics, et les logs GC montrent la fréquence et la durée des pauses. Un CPU élevé avec un débit faible peut venir d'un GC qui travaille en boucle, d'un verrou contentionné ou d'un pool de threads mal dimensionné.",
+      "bullets": [
+        "Le JIT nécessite un échauffement avant les mesures stables",
+        "BiSheng JDK : OpenJDK optimisé ARM64, compatible Java standard",
+        "Heap fixe (`-Xms` = `-Xmx`) pour éviter les redimensionnements",
+        "JFR, `jcmd` et logs GC pour diagnostiquer les pauses"
+      ],
+      "code": [
+        "# Démarrage avec heap fixe et ZGC\njava -Xms8g -Xmx8g -XX:+UseZGC -jar app.jar\n\n# Enregistrer 60 s de JFR\njcmd <pid> JFR.start duration=60s filename=/tmp/app.jfr\n\n# Inspecter le heap et les classes\njcmd <pid> GC.heap_info\njcmd <pid> VM.flags"
+      ],
+      "table": {
+        "headers": [
+          "Paramètre",
+          "Effet principal"
+        ],
+        "rows": [
+          [
+            "-Xms / -Xmx",
+            "Taille initiale et maximale du heap"
+          ],
+          [
+            "-XX:+UseG1GC",
+            "Ramasseur équilibré, pauses courtes"
+          ],
+          [
+            "-XX:+UseZGC",
+            "Très faibles pauses, adapté aux gros heaps"
+          ],
+          [
+            "-XX:ActiveProcessorCount",
+            "Nombre de CPU vus par la JVM"
+          ],
+          [
+            "-Xlog:gc*",
+            "Journalisation détaillée du GC"
+          ]
+        ]
+      },
+      "tip": "Un heap plus grand n'est pas toujours plus rapide : il peut retarder le GC mais augmenter la durée de certaines pauses et l'empreinte mémoire. Mesurez toujours avec la charge réelle."
+    },
+    {
+      "heading": "Benchmarker et conclure",
+      "body": "Un benchmark n'est utile que s'il est reproductible. Commencez par définir le scénario : type de requêtes, distribution des tailles, taux de lecture/écriture, nombre d'utilisateurs simultanés et durée. Mélangez un échauffement (warm-up) et une phase stable, puis mesurez cette dernière. Les premières secondes sont dominées par le chargement des classes, la compilation JIT et le remplissage des caches.\n\nLes outils varient selon la cible : LoadRunner pour les applications web d'entreprise, JMeter pour les tests HTTP et les files de messages, sysbench pour le CPU, la mémoire et les bases MySQL, MySQLslap pour comparer des requêtes SQL. Un benchmark de base de données doit utiliser un jeu de données réaliste et un taux de concurrence proche de la production, sinon les conclusions sont trompeuses.\n\nEnfin, interprétez avec prudence. Trois exécutions minimum, médiane plutôt que meilleure valeur, intervalles de confiance si possible. Comparez toujours à une baseline et vérifiez que les autres paramètres n'ont pas changé. Un gain de 5 % peut être du bruit ; une régression de 20 % sur le p99 mérite une investigation, même si la moyenne s'améliore.",
+      "bullets": [
+        "Définir scénario, charge, durée et critères d'acceptation",
+        "Séparer échauffement et phase de mesure stable",
+        "Utiliser des jeux de données et une concurrence réalistes",
+        "Répéter, prendre la médiane et comparer à une baseline"
+      ],
+      "code": [
+        "# Benchmark CPU et base de données\nsysbench cpu --threads=64 --time=60 run\nsysbench oltp_read_write --db-driver=mysql \\\n  --mysql-db=test --tables=10 --table-size=1000000 prepare\nsysbench oltp_read_write --db-driver=mysql --mysql-db=test \\\n  --threads=32 --time=300 run\n\n# Test HTTP avec JMeter en mode non graphique\njmeter -n -t plan.jmx -l resultats.jtl"
+      ],
+      "exercises": [
+        {
+          "prompt": "Une équipe annonce un gain de 40 % après optimisation, sur la base d'une seule exécution de 10 secondes. Quels problèmes méthodologiques identifiez-vous et que proposez-vous ?",
+          "correction": "Une seule exécution ne permet pas de distinguer le gain du bruit ; 10 secondes est trop court pour dépasser l'échauffement JVM, le remplissage des caches et les variations de charge. Il faut définir un scénario représentatif, prévoir un warm-up, mesurer une phase stable, répéter au moins trois fois, comparer la médiane et vérifier que l'environnement et les paramètres sont identiques. Il faut aussi regarder le p99, pas seulement la moyenne."
+        }
+      ],
+      "tip": "« Le benchmark le plus rapide » n'est pas une preuve : la reproductibilité et la comparaison contrôlée comptent davantage. Méfiez-vous des gains annoncés sans baseline ni répétition."
+    }
+  ],
+  "key_points": [
+    "Optimiser commence par mesurer : latence, p99, débit, erreurs et ressources.",
+    "Le modèle USE (utilisation, saturation, erreurs) structure le diagnostic.",
+    "`perf` fournit compteurs matériels, IPC et piles d'appels ; le flame graph localise les fonctions chaudes.",
+    "`-O2` est un bon défaut ; `-O3`, LTO et PGO doivent être validés par des mesures.",
+    "La PGO exige une charge d'entraînement représentative de la production.",
+    "NUMA : aligner cœurs et mémoire avec `numactl` pour éviter les accès distants.",
+    "Le false sharing et les défauts de cache peuvent limiter les performances malgré un CPU peu chargé.",
+    "BiSheng JDK, heap fixe, JFR et logs GC sont les outils clés du tuning Java."
+  ],
+  "traps": [
+    "La vectorisation NEON n'est pas garantie par `-O3` : vérifiez les rapports de compilation.",
+    "`-march=native` produit un binaire potentiellement incompatible avec un autre modèle de Kunpeng.",
+    "`--cpunodebind` seul ne garantit pas la localité mémoire ; ajoutez `--membind`.",
+    "Une moyenne de latence peut masquer un p99 dégradé.",
+    "Un CPU peu utilisé avec une latence élevée indique souvent une attente (I/O, verrou, GC), pas un manque de puissance."
+  ],
+  "quiz": [
+    {
+      "id": "hcia-kp-03-q01",
+      "type": "single",
+      "prompt": "Which Linux tool samples CPU stacks and produces the data used for flame graphs?",
+      "options": [
+        "perf",
+        "lsblk",
+        "useradd",
+        "dnf"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "`perf record -g` échantillonne les piles d'appels, et `perf script` alimente les outils de flame graph. `lsblk` liste les périphériques de bloc, `useradd` gère les comptes et `dnf` les paquets : aucun ne réalise de profiling CPU.",
+      "topic": "Profiling"
+    },
+    {
+      "id": "hcia-kp-03-q02",
+      "type": "single",
+      "prompt": "Which sequence correctly applies Profile-Guided Optimization with GCC?",
+      "options": [
+        "Compile with -march=native only",
+        "Compile with -fprofile-generate, run a representative workload, recompile with -fprofile-use",
+        "Compile with -O0, delete the binary, recompile with -O3",
+        "Run the program twice without recompiling"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "La PGO instrumente d'abord le binaire avec `-fprofile-generate`, collecte un profil pendant une charge représentative, puis recompile avec `-fprofile-use`. Les autres propositions ne collectent aucun profil et ne permettent donc pas au compilateur d'optimiser les branches chaudes.",
+      "topic": "Compilation"
+    },
+    {
+      "id": "hcia-kp-03-q03",
+      "type": "single",
+      "prompt": "Which CPU frequency governor is preferred for stable, maximum-performance server benchmarks?",
+      "options": [
+        "schedutil",
+        "ondemand",
+        "performance",
+        "powersave"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Le governor `performance` maintient la fréquence élevée et réduit la variabilité des mesures. `powersave`, `schedutil` et `ondemand` font varier la fréquence selon la charge, ce qui introduit du bruit dans un benchmark.",
+      "topic": "Tuning système"
+    },
+    {
+      "id": "hcia-kp-03-q04",
+      "type": "single",
+      "prompt": "Which metric best captures the user-perceived worst-case latency of an API?",
+      "options": [
+        "Average CPU utilization",
+        "Total number of requests",
+        "Disk size",
+        "p99 response time"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Le p99 représente le temps de réponse en dessous duquel se situent 99 % des requêtes : il révèle les expériences dégradées. L'utilisation CPU, le volume total et la taille du disque ne décrivent pas directement la latence perçue.",
+      "topic": "Métriques"
+    },
+    {
+      "id": "hcia-kp-03-q05",
+      "type": "single",
+      "prompt": "Which command binds a process to NUMA node 0 and allocates its memory on that same node?",
+      "options": [
+        "numactl --cpunodebind=0 --membind=0 ./app",
+        "taskset -c 0 ./app",
+        "nice -n -20 ./app",
+        "chrt -f 99 ./app"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "`numactl --cpunodebind=0 --membind=0` fixe à la fois les cœurs et la mémoire sur le nœud 0. `taskset` ne fixe qu'un CPU, `nice` change la priorité et `chrt` la politique d'ordonnancement : aucun ne contrôle le placement mémoire NUMA.",
+      "topic": "NUMA"
+    },
+    {
+      "id": "hcia-kp-03-q06",
+      "type": "single",
+      "prompt": "Which statement about BiSheng JDK is correct?",
+      "options": [
+        "It only runs on x86",
+        "It is an OpenJDK distribution optimized for ARM64",
+        "It is a Python interpreter",
+        "It is a replacement for the Linux kernel"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "BiSheng JDK est une distribution OpenJDK optimisée par Huawei pour ARM64, compatible avec l'écosystème Java. Ce n'est ni un interpréteur Python, ni un noyau, et elle ne se limite pas à x86.",
+      "topic": "Java"
+    },
+    {
+      "id": "hcia-kp-03-q07",
+      "type": "multi",
+      "prompt": "Which techniques help reduce remote-memory access latency on a NUMA system? (Choose two.)",
+      "options": [
+        "Interleaving all memory across nodes for every workload",
+        "Disabling all CPU caches",
+        "Binding threads and memory to the same node",
+        "Allocating memory with first-touch locality"
+      ],
+      "answer": [
+        2,
+        3
+      ],
+      "explanation_fr": "Le binding CPU/mémoire et une allocation locale au thread qui utilise les données réduisent les accès distants. L'interleave peut aider la bande passante agrégée mais augmente souvent la latence individuelle, et désactiver les caches n'a aucun sens.",
+      "topic": "NUMA"
+    },
+    {
+      "id": "hcia-kp-03-q08",
+      "type": "multi",
+      "prompt": "Which Java options are relevant when tuning a low-latency service? (Choose two.)",
+      "options": [
+        "--interleave=all",
+        "-XX:+UseZGC",
+        "-Xms8g -Xmx8g",
+        "-march=native"
+      ],
+      "answer": [
+        1,
+        2
+      ],
+      "explanation_fr": "ZGC vise de très faibles pauses et un heap fixe évite les redimensionnements. `-march=native` est une option du compilateur C/C++ et `--interleave=all` une option numactl : elles ne se passent pas à la JVM.",
+      "topic": "Java"
+    },
+    {
+      "id": "hcia-kp-03-q09",
+      "type": "multi",
+      "prompt": "Which tools provide system-level performance data on Linux? (Choose three.)",
+      "options": [
+        "grub2-mkconfig",
+        "perf",
+        "pidstat",
+        "iostat"
+      ],
+      "answer": [
+        1,
+        2,
+        3
+      ],
+      "explanation_fr": "perf, pidstat et iostat observent respectivement le CPU, les processus et les disques. `grub2-mkconfig` régénère la configuration du chargeur d'amorçage et ne collecte aucune métrique de performance.",
+      "topic": "Outils"
+    },
+    {
+      "id": "hcia-kp-03-q10",
+      "type": "tf",
+      "prompt": "NEON auto-vectorization is guaranteed whenever -O3 is passed to GCC.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : la vectorisation dépend du code, des dépendances de données et des capacités du compilateur. `-O3` l'active plus agressivement mais ne la garantit pas ; il faut consulter `-fopt-info-vec` et parfois réécrire les boucles.",
+      "topic": "Compilation"
+    },
+    {
+      "id": "hcia-kp-03-q11",
+      "type": "tf",
+      "prompt": "A reliable benchmark should be run at least three times, using the median rather than the best result.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : répéter les mesures permet d'écarter le bruit et les valeurs aberrantes. Prendre la meilleure exécution surestime systématiquement les performances ; la médiane est plus représentative.",
+      "topic": "Benchmark"
+    },
+    {
+      "id": "hcia-kp-03-q12",
+      "type": "tf",
+      "prompt": "On a NUMA system, accessing memory attached to a remote node is generally slower than accessing local memory.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : l'accès distant traverse l'interconnexion entre sockets, ce qui ajoute de la latence et consomme de la bande passante. C'est pourquoi le placement CPU/mémoire est un levier d'optimisation important.",
+      "topic": "NUMA"
+    },
+    {
+      "id": "hcia-kp-03-q13",
+      "type": "tf",
+      "prompt": "Increasing the Java heap size always improves application throughput.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : un heap plus grand peut réduire la fréquence des GC, mais aussi allonger certaines pauses, augmenter l'empreinte mémoire et provoquer du swapping. Le bon réglage dépend de la charge et doit être mesuré.",
+      "topic": "Java"
+    },
+    {
+      "id": "hcia-kp-03-q14",
+      "type": "text",
+      "prompt": "Which single command sets the CPU frequency governor to performance with cpupower? (Enter the full command.)",
+      "accept": [
+        "cpupower frequency-set -g performance",
+        "cpupower frequency-set --governor performance"
+      ],
+      "sample_answer": "cpupower frequency-set -g performance",
+      "explanation_fr": "`cpupower frequency-set -g performance` sélectionne le governor performance pour les CPU. L'option `-g` est l'abréviation de `--governor`. Cette commande nécessite les droits root.",
+      "topic": "Tuning système"
+    },
+    {
+      "id": "hcia-kp-03-q15",
+      "type": "text",
+      "prompt": "Which GCC flag aligns code generation with the local CPU at build time? (Enter the flag.)",
+      "accept": [
+        "-march=native",
+        "march=native"
+      ],
+      "sample_answer": "-march=native",
+      "explanation_fr": "`-march=native` demande au compilateur d'utiliser les extensions du processeur qui exécute la compilation. Le binaire obtenu peut ne pas fonctionner sur un CPU plus ancien ou différent, ce qui impose de vérifier l'homogénéité du parc.",
+      "topic": "Compilation"
+    },
+    {
+      "id": "hcia-kp-03-q16",
+      "type": "text",
+      "prompt": "Which GCC flag instruments a program to collect profile data for PGO? (Enter the flag.)",
+      "accept": [
+        "-fprofile-generate",
+        "fprofile-generate"
+      ],
+      "sample_answer": "-fprofile-generate",
+      "explanation_fr": "`-fprofile-generate` ajoute l'instrumentation nécessaire pour enregistrer les compteurs d'exécution. Après la charge d'entraînement, on recompile avec `-fprofile-use` pour exploiter ces données.",
+      "topic": "Compilation"
+    },
+    {
+      "id": "hcia-kp-03-q17",
+      "type": "single",
+      "prompt": "Which tool shows per-disk I/O utilization and average wait time?",
+      "options": [
+        "systemctl",
+        "ip addr",
+        "iostat",
+        "jstack"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "`iostat` affiche les débits, les IOPS, l'utilisation et les temps d'attente par périphérique de bloc. `jstack` examine les threads Java, `systemctl` gère les services et `ip addr` les adresses réseau.",
+      "topic": "I/O"
+    },
+    {
+      "id": "hcia-kp-03-q18",
+      "type": "single",
+      "prompt": "What is false sharing?",
+      "options": [
+        "A disk reports a wrong capacity",
+        "A JVM allocates too many threads",
+        "A network packet is duplicated",
+        "Two cores modify different variables located on the same cache line"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Le false sharing survient lorsque deux cœurs modifient des variables distinctes situées sur la même ligne de cache : la cohérence de cache invalide la ligne en permanence. La solution consiste à aligner ou espacer les variables. Les autres propositions n'ont aucun rapport avec la cohérence de cache.",
+      "topic": "Mémoire"
+    },
+    {
+      "id": "hcia-kp-03-q19",
+      "type": "single",
+      "prompt": "What is the role of openEuler A-Tune?",
+      "options": [
+        "Automatic profiling and tuning of system resources based on workload characteristics",
+        "Compiling Java bytecode",
+        "Encrypting block devices",
+        "Routing network packets"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "A-Tune profile la charge et applique un modèle de réglage adapté aux caractéristiques du workload. Il ne compile pas de bytecode, ne chiffre pas les disques et n'assure pas le routage réseau.",
+      "topic": "Tuning système"
+    },
+    {
+      "id": "hcia-kp-03-q20",
+      "type": "single",
+      "prompt": "What should be the first step of any performance optimization project?",
+      "options": [
+        "Upgrade the hardware",
+        "Measure and establish a baseline",
+        "Increase all buffer sizes",
+        "Set every governor to performance"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Sans mesure ni baseline, on ne sait ni où se situe le goulot ni si une modification apporte un gain réel. Augmenter les buffers, changer les governeurs ou acheter du matériel sont des actions qui doivent être justifiées par des données.",
+      "topic": "Méthode"
+    }
+  ]
+}

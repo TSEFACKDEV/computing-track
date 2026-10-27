@@ -1,0 +1,659 @@
+{
+  "id": "hcip-kp-01",
+  "phase": "HCIP",
+  "subject": "Kunpeng",
+  "number": 1,
+  "title_fr": "DevKit et optimisation avancée sur Kunpeng",
+  "title_en": "DevKit and Advanced Optimization",
+  "minutes": 80,
+  "source": "Pas de Training Material Kunpeng dans les ressources (la gamme Computing Track ne couvre Kunpeng qu'en HCIA) — contenu aligné sur la documentation publique Huawei : Kunpeng DevKit / BoostKit, GCC ARM64, perf et BiSheng JDK.",
+  "objectives": [
+    "Décrire les outils de la suite Kunpeng DevKit et leur place dans le cycle d'optimisation",
+    "Lire un rapport de portage et prioriser les corrections x86 vers ARM64",
+    "Choisir les options de compilation ARM64 : cible, LTO et PGO",
+    "Remplacer SSE par NEON uniquement lorsque la mesure le justifie",
+    "Profiler avec perf dans des conditions reproductibles",
+    "Dimensionner et observer une JVM BiSheng en production"
+  ],
+  "sections": [
+    {
+      "heading": "La suite DevKit et son cycle d'optimisation",
+      "body": "Kunpeng DevKit n'est pas un compilateur unique, mais une suite d'outils qui accompagne une application tout au long de son adaptation à ARM64. Le point d'entrée est Porting Advisor : il examine le code source, les scripts de build et les binaires pour repérer ce qui ne survivra pas au changement d'architecture. Vient ensuite l'assistant de compilation, qui propose des options adaptées aux processeurs Taishan, puis les outils de profilage, qui mesurent le comportement réel et désignent les goulots d'étranglement.\n\nL'intérêt de la suite tient à la traçabilité. Chaque rapport est exportable, daté et devient un livrable de projet : on sait qui doit corriger quoi, et on évite la découverte tardive, en production, d'une bibliothèque précompilée pour x86. L'analogie du contrôle technique est utile : on ne démonte pas la voiture avant d'avoir la liste des pièces à changer.\n\nLe cycle se répète ensuite : analyser, compiler, profiler, corriger. Le premier passage produit souvent un build correct mais lent ; les passages suivants visent une performance mesurable, pas une impression.",
+      "bullets": [
+        "Porting Advisor détecte assembly, intrinsics SSE/AVX et bibliothèques binaires x86",
+        "L'assistant de compilation traduit la cible en options concrètes pour GCC",
+        "Le profilage intervient après un build fonctionnel, jamais avant",
+        "Chaque rapport daté devient un livrable et un point de contrôle du projet"
+      ],
+      "code": [
+        "devkit porting --input /src --output rapport.html",
+        "devkit advisor --target aarch64"
+      ],
+      "table": {
+        "headers": [
+          "Outil",
+          "Rôle principal",
+          "Livrable"
+        ],
+        "rows": [
+          [
+            "Porting Advisor",
+            "Détecter les incompatibilités x86 vers ARM64",
+            "Rapport priorisé"
+          ],
+          [
+            "Assistant de compilation",
+            "Proposer des options adaptées à la cible",
+            "Ligne de build"
+          ],
+          [
+            "Perf Profiler",
+            "Mesurer les points chauds sur la machine cible",
+            "Profil et rapport"
+          ],
+          [
+            "Code Advisor",
+            "Analyser les motifs de code coûteux",
+            "Recommandations"
+          ]
+        ]
+      },
+      "diagram": "+-------------+     +-------------+     +-------------+\n|   Analyse   | --> |  Build ARM  | --> |  Profilage  |\n| Porting Adv.|     | gcc/BiSheng |     | perf / JFR  |\n+-------------+     +-------------+     +------+------+\n                                             |\n      +--------------------------------------+\n      v\n+-------------+\n|   Tuning    |\n| flags / JVM |\n+-------------+",
+      "exercises": [],
+      "tip": "Ne commencez jamais par les flags de compilation : une bibliothèque binaire x86 rendra le binaire inutilisable quel que soit le niveau d'optimisation."
+    },
+    {
+      "heading": "Lire un rapport de portage et prioriser",
+      "body": "Porting Advisor classe ses constats en grandes familles, et l'ordre de traitement découle directement de leur gravité. Les dépendances binaires arrivent en premier : une bibliothèque .so compilée pour x86-64 ne peut pas être chargée sur ARM64, et aucun flag de compilation ne corrigera cela. Il faut trouver un équivalent ARM64, recompiler depuis les sources ou remplacer la fonctionnalité.\n\nViennent ensuite les instructions spécifiques à x86 : assembly inline, intrinsics SSE/AVX, en-têtes comme immintrin.h. Le code compile parfois, mais produit un résultat faux ou un plantage à l'exécution. Puis les API et bibliothèques non portables, les scripts qui détectent l'architecture en dur (uname -m comparé à x86_64), et enfin les problèmes de performance, moins bloquants mais coûteux.\n\nUn rapport bien lu se transforme en liste de tâches priorisées, avec un responsable et un test de non-régression par correctif. C'est cette discipline, plus que l'outil lui-même, qui évite les mauvaises surprises lors de la mise en production.",
+      "bullets": [
+        "Bloquant : binaire x86, dépendance indisponible en aarch64",
+        "Faux résultat : assembly et intrinsics x86 compilés sans erreur",
+        "Installation : scripts testant x86_64 ou des chemins /usr/lib64",
+        "Performance : boucles non vectorisées, à traiter en dernier"
+      ],
+      "code": [
+        "file /opt/app/lib/libcodec.so",
+        "ldd /opt/app/bin/app | grep 'not found'"
+      ],
+      "table": {
+        "headers": [
+          "Constat",
+          "Exemple",
+          "Action"
+        ],
+        "rows": [
+          [
+            "Binaire x86",
+            "libcrypto.so.1.1 ELF x86-64",
+            "Recompiler ou remplacer"
+          ],
+          [
+            "Intrinsics x86",
+            "_mm_add_ps dans codec.c",
+            "Réécrire en NEON ou en C portable"
+          ],
+          [
+            "Script rigide",
+            "uname -m = x86_64",
+            "Tester aarch64 et x86_64"
+          ],
+          [
+            "Boucle lente",
+            "Copie octet par octet",
+            "Optimiser après mesure"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un rapport signale quatre points : (a) libcrypto.so.1.1 compilée pour x86-64, (b) des intrinsics _mm_add_ps dans codec.c, (c) un script install.sh qui teste x86_64, (d) une boucle de copie non vectorisée. Dans quel ordre les traiter et pourquoi ?",
+          "correction": "Traiter (a) en premier : c'est un blocage absolu, aucun code source ne compense une bibliothèque binaire d'une autre architecture. Puis (b), car le code peut compiler mais produire un résultat faux ou une instruction illégale à l'exécution : c'est un risque de corruption silencieuse. Ensuite (c), qui empêche l'installation correcte même si le binaire fonctionne. Enfin (d), qui n'affecte que la performance et doit être confirmé par une mesure avant tout effort. Chaque correction s'accompagne d'un test de non-régression et d'une entrée dans le rapport de suivi."
+        }
+      ],
+      "tip": "Un rapport qui ne distingue pas bloquant et performance fait perdre des semaines : triez toujours par « ne démarre pas », « résultat faux », « installation », « lenteur »."
+    },
+    {
+      "heading": "Compilation ARM64 : cible, LTO et PGO",
+      "body": "Sur ARM64, le compilateur ne devine pas la cible : il faut la nommer. -march fixe le jeu d'instructions autorisé, -mtune oriente les décisions d'ordonnancement pour un cœur donné. Pour un Kunpeng 920, viser armv8.2-a est un choix raisonnable ; -mtune=tsv110 affine le scheduling lorsque la version de GCC reconnaît ce cœur. Un binaire trop optimisé pour une machine récente peut refuser de démarrer sur un modèle plus ancien : d'où l'intérêt de figer la cible dans le pipeline.\n\n-O2 reste le compromis par défaut ; -O3 ajoute l'autovectorisation et le déroulage de boucles, au prix d'un code plus gros et parfois plus lent à cause de la pression sur les caches. -flto repousse l'optimisation au moment de l'édition de liens, ce qui permet d'incorporer les fonctions entre modules.\n\nPGO demande trois temps : compiler avec -fprofile-generate, exécuter un scénario représentatif, recompiler avec -fprofile-use. Le gain dépend étroitement de la ressemblance entre le scénario d'entraînement et la charge réelle.",
+      "bullets": [
+        "-march définit les instructions autorisées, -mtune seulement l'ordonnancement",
+        "-O3 n'est pas universellement meilleur : mesurez face à -O2",
+        "-flto optimise à l'édition de liens, au prix de builds plus lents",
+        "PGO : générer, exécuter un workload représentatif, puis réutiliser"
+      ],
+      "code": [
+        "gcc -O2 -march=armv8.2-a -mtune=tsv110 -c module.c",
+        "gcc -O2 -march=armv8.2-a -flto -o app *.o",
+        "gcc -O2 -fprofile-generate app.c -o app_prof",
+        "gcc -O2 -fprofile-use -fprofile-correction app.c -o app_fast"
+      ],
+      "table": {
+        "headers": [
+          "Option",
+          "Effet",
+          "Piège"
+        ],
+        "rows": [
+          [
+            "-march",
+            "Jeu d'instructions autorisé",
+            "Binaire incompatible avec un CPU plus ancien"
+          ],
+          [
+            "-mtune",
+            "Ordonnancement pour un cœur",
+            "Aucun gain sur l'encodage des instructions"
+          ],
+          [
+            "-flto",
+            "Optimisation inter-modules",
+            "Builds plus longs, débogage plus difficile"
+          ],
+          [
+            "-fprofile-use",
+            "Réutilise un profil d'exécution",
+            "Profil non représentatif, gain nul"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Écrivez la séquence PGO complète pour app.c, avec un scénario d'entraînement « ./app --bench 60s », puis expliquez le rôle de -fprofile-correction.",
+          "correction": "Étape 1 : gcc -O2 -march=armv8.2-a -fprofile-generate app.c -o app_prof. Étape 2 : exécuter ./app_prof --bench 60s, idéalement plusieurs fois pour couvrir les chemins chauds. Étape 3 : recompiler avec gcc -O2 -march=armv8.2-a -fprofile-use -fprofile-correction app.c -o app_fast. Le fichier de profil est lu au moment de la compilation. -fprofile-correction tolère les compteurs incohérents produits par un programme multithread, là où GCC refuserait sinon d'utiliser le profil. Il faut enfin mesurer app_fast face à app sur la même charge : si le scénario d'entraînement ne ressemble pas à la production, le gain peut être nul voire négatif."
+        }
+      ],
+      "tip": "PGO sur un workload d'entraînement qui ne ressemble pas à la production peut dégrader les performances réelles : documentez toujours le scénario utilisé."
+    },
+    {
+      "heading": "NEON : remplacer SSE sans casser le code",
+      "body": "NEON est le moteur SIMD d'ARM64. AArch64 expose trente-deux registres vectoriels de 128 bits, et une instruction traite par exemple quatre flottants simple précision ou seize octets en une fois. C'est le pendant de SSE, mais l'interface de programmation diffère : les intrinsics SSE n'existent pas, il faut réécrire avec arm_neon.h et des types comme float32x4_t.\n\nLa règle pratique est de ne jamais réécrire à la main ce qu'une bibliothèque fait déjà mieux. OpenBLAS, FFTW, zlib-ng ou zstd possèdent des chemins NEON éprouvés : les utiliser est plus sûr et souvent plus rapide qu'une boucle maison. On réserve l'écriture manuelle aux noyaux réellement chauds, identifiés par le profilage.\n\nDeux pièges classiques : la taille de char, qui est non signée par défaut sur ARM Linux alors qu'elle est signée sur x86, ce qui casse les comparaisons ; et les hypothèses d'alignement héritées de certains codes x86. Activez -Wall -Wextra et vérifiez l'autovectorisation avec -fopt-info-vec avant d'écrire du SIMD manuel.",
+      "bullets": [
+        "arm_neon.h fournit les intrinsics, avec des types float32x4_t et int8x16_t",
+        "Préférez les bibliothèques déjà optimisées NEON au code maison",
+        "char est non signé par défaut sous ARM Linux : utilisez uint8_t ou signed char",
+        "Vérifiez l'autovectorisation avec -fopt-info-vec avant de réécrire"
+      ],
+      "code": [
+        "float32x4_t v = vld1q_f32(src);",
+        "v = vmlaq_f32(v, vld1q_f32(a), vld1q_f32(b));",
+        "vst1q_f32(dst, v);",
+        "gcc -O3 -march=armv8.2-a -fopt-info-vec -c kernel.c"
+      ],
+      "diagram": "Registre NEON : 128 bits\n+----+----+----+----+\n| f0 | f1 | f2 | f3 |   4 x float32\n+----+----+----+----+\n| b0 ........... b15 |  16 x int8\n+--------------------+",
+      "exercises": [],
+      "tip": "Ne réécrivez pas une bibliothèque en NEON pour le plaisir : si le profileur ne désigne pas la fonction, le gain sera invisible et la maintenance coûtera cher."
+    },
+    {
+      "heading": "Profiler avec perf dans des conditions fiables",
+      "body": "perf s'appuie sur l'unité de surveillance de performance du processeur. perf stat résume des compteurs sur une durée : cycles, instructions, défauts de cache, erreurs de prédiction de branchement. Le rapport instructions sur cycles donne l'IPC, un indicateur précieux : un IPC faible avec beaucoup d'instructions suggère un problème mémoire, un IPC faible avec peu d'instructions suggère des blocages.\n\nperf record échantillonne et écrit un fichier, perf report le dépouille. L'option -g capture les chaînes d'appel, indispensables pour attribuer le temps à une fonction et non à un simple symbole. Pour comparer deux versions, on fixe le governor en mode performance, on épingle le processus avec taskset, on neutralise les voisins et on répète la mesure au moins trois fois.\n\nUne mesure unique ne prouve rien : la variance d'un serveur partagé est souvent du même ordre que le gain recherché. Notez aussi que certains outils, comme perf c2c pour le faux partage, sont spécifiques à x86 et ne sont pas disponibles sur ARM64.",
+      "bullets": [
+        "perf stat pour les compteurs, perf record puis report pour les points chauds",
+        "-g capture les chaînes d'appel, sans quoi le temps est mal attribué",
+        "Governor performance, épinglage taskset, trois répétitions minimum",
+        "Les outils x86 comme perf c2c n'existent pas sur ARM64"
+      ],
+      "code": [
+        "sudo cpupower frequency-set -g performance",
+        "perf stat -e cycles,instructions,cache-misses,branch-misses -- ./bench",
+        "perf record -g -F 999 -- ./app",
+        "perf report --stdio --sort comm,dso,symbol"
+      ],
+      "table": {
+        "headers": [
+          "Commande",
+          "Usage"
+        ],
+        "rows": [
+          [
+            "perf stat",
+            "Résumé des compteurs matériels sur une exécution"
+          ],
+          [
+            "perf top",
+            "Visualisation en direct des symboles chauds"
+          ],
+          [
+            "perf record -g",
+            "Échantillonnage avec chaînes d'appel"
+          ],
+          [
+            "perf report",
+            "Analyse du fichier perf.data"
+          ]
+        ]
+      },
+      "exercises": [],
+      "tip": "La moyenne cache les problèmes : pour un service, regardez p95 et p99. Pour un benchmark batch, regardez le temps total et la variance entre répétitions."
+    },
+    {
+      "heading": "BiSheng JDK : dimensionner et observer la JVM",
+      "body": "BiSheng JDK est la distribution OpenJDK de Huawei pour ARM64. Elle apporte des intrinsics optimisés pour NEON dans les bibliothèques de bas niveau, des améliorations du compilateur JIT et un support complet des collecteurs modernes. Elle reste compatible avec l'écosystème Java standard : les mêmes options, les mêmes outils, les mêmes API.\n\nLe dimensionnement commence par la mémoire. Poser -Xms égal à -Xmx évite les cycles de croissance du tas, qui provoquent des pauses et de la fragmentation. ZGC convient aux services qui exigent une latence stable ; G1 reste un bon choix par défaut pour les applications mixtes. En conteneur, la JVM détecte les limites du cgroup, mais -XX:ActiveProcessorCount permet de corriger une détection erronée.\n\nL'observabilité ne doit pas être ajoutée après l'incident : Java Flight Recorder, activé en continu avec un disque borné, fournit une trace exploitable. Les bibliothèques natives chargées par JNI doivent impérativement être recompilées pour aarch64 ; c'est la cause la plus fréquente d'échec au démarrage.",
+      "bullets": [
+        "-Xms = -Xmx pour stabiliser le tas et éviter les cycles de croissance",
+        "-XX:+UseZGC pour une latence stable, G1 par défaut ailleurs",
+        "-XX:ActiveProcessorCount corrige une détection de CPU erronée en conteneur",
+        "Les bibliothèques JNI doivent être recompilées pour aarch64"
+      ],
+      "code": [
+        "java -Xms4g -Xmx4g -XX:+UseZGC -XX:ActiveProcessorCount=4 -jar app.jar",
+        "java -XX:StartFlightRecording=filename=app.jfr,maxsize=256m -jar app.jar",
+        "jcmd $(pgrep -f app.jar) GC.heap_info",
+        "jcmd $(pgrep -f app.jar) JFR.dump filename=/tmp/session.jfr"
+      ],
+      "table": {
+        "headers": [
+          "Option",
+          "Objectif"
+        ],
+        "rows": [
+          [
+            "-Xms / -Xmx",
+            "Taille initiale et maximale du tas"
+          ],
+          [
+            "-XX:+UseZGC",
+            "Collecteur à pauses très courtes"
+          ],
+          [
+            "-XX:ActiveProcessorCount",
+            "Corriger le nombre de CPU vu par la JVM"
+          ],
+          [
+            "-XX:StartFlightRecording",
+            "Activer JFR avec une taille bornée"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un service Java tourne dans un pod limité à 4 vCPU et 8 GiB. La JVM voit 64 processeurs et un tas maximal de 2 GiB, et les latences p99 sont irrégulières. Proposez un dimensionnement argumenté.",
+          "correction": "Le pool de threads du JVM et du framework se dimensionne sur les CPU vus : 64 au lieu de 4 provoque surcharge de threads, contentions et latences erratiques. On ajoute -XX:ActiveProcessorCount=4. Pour la mémoire, la JVM réserve par défaut une fraction de la limite du conteneur ; avec 8 GiB, un tas de 4 à 5 GiB laisse de la place au metaspace, aux threads, aux buffers directs et au page cache. On pose -Xms5g -Xmx5g pour éviter la croissance, et on laisse le reste au système. On active JFR en continu avec maxsize borné, puis on vérifie avec jcmd GC.heap_info et les métriques de throttling que ni le tas ni le CPU ne saturent. Enfin, on mesure p99 avant et après sur la même charge."
+        }
+      ],
+      "tip": "Une JVM qui voit 64 CPU dans un pod limité à 4 crée trop de threads : le symptôme est une latence instable avec un CPU moyen qui paraît faible."
+    },
+    {
+      "heading": "Méthode de bout en bout et preuve du gain",
+      "body": "Une optimisation réussie suit un enchaînement stable, avec une porte de sortie à chaque étape. D'abord l'analyse : inventaire des dépendances, rapport de portage, critères de succès chiffrés. Ensuite le build : compilation ARM64 reproductible, tests unitaires verts, artefact versionné et signé. Puis le profilage : mesure de la ligne de base sur un scénario réaliste, identification des trois principaux goulots.\n\nLe tuning vient après, jamais avant. Chaque modification est isolée, mesurée et documentée : flag appliqué, charge utilisée, résultat avant et après. Un gain non mesuré n'est pas un gain. Enfin la validation : test de charge, comparaison des percentiles de latence, vérification de la consommation mémoire, et plan de retour arrière testé.\n\nLe rapport final n'est pas administratif. Il permet à un autre ingénieur de reproduire la mesure, de comprendre pourquoi un flag a été retenu et de savoir quoi surveiller en production. C'est ce qui distingue une optimisation industrielle d'un réglage opportuniste.",
+      "bullets": [
+        "Cinq étapes : analyser, construire, profiler, régler, valider",
+        "Une seule modification mesurée à la fois, sinon le gain n'est pas attribuable",
+        "Critères de succès définis avant les mesures, pas après",
+        "Plan de retour arrière testé et documenté"
+      ],
+      "code": [
+        "perf stat -e cycles,instructions -r 3 -- ./bench > avant.txt",
+        "perf stat -e cycles,instructions -r 3 -- ./bench > apres.txt"
+      ],
+      "table": {
+        "headers": [
+          "Étape",
+          "Livrable",
+          "Critère de sortie"
+        ],
+        "rows": [
+          [
+            "Analyse",
+            "Inventaire et rapport de portage",
+            "Aucun blocage binaire identifié"
+          ],
+          [
+            "Build",
+            "Artefact ARM64 signé",
+            "Tests unitaires verts"
+          ],
+          [
+            "Profilage",
+            "Ligne de base et points chauds",
+            "Trois goulots documentés"
+          ],
+          [
+            "Tuning",
+            "Journal des modifications",
+            "Chaque changement mesuré"
+          ],
+          [
+            "Validation",
+            "Rapport avant/après",
+            "Aucune régression p99"
+          ]
+        ]
+      },
+      "exercises": [],
+      "tip": "Un rapport d'optimisation doit contenir la commande exacte, la charge et la machine : sans ces trois éléments, le résultat n'est pas reproductible."
+    }
+  ],
+  "key_points": [
+    "DevKit couvre l'analyse, la compilation, le profilage et les recommandations de code",
+    "Les dépendances binaires x86 sont bloquantes et se traitent avant les flags",
+    "-march fixe le jeu d'instructions, -mtune seulement l'ordonnancement",
+    "LTO optimise entre modules, PGO réutilise un profil d'exécution représentatif",
+    "NEON s'écrit avec arm_neon.h, après mesure et de préférence via des bibliothèques optimisées",
+    "perf stat, record -g et report exigent des conditions contrôlées et des répétitions",
+    "BiSheng JDK : tas fixe, ZGC pour la latence, JFR pour l'observabilité, JNI recompilés",
+    "Un gain non mesuré et non documenté n'est pas un gain"
+  ],
+  "traps": [
+    "Une bibliothèque .so x86 peut être présente sans erreur de build : seul un test d'exécution ou un contrôle file/ldd la révèle",
+    "char est non signé par défaut sous ARM Linux, contrairement à x86 : les comparaisons de valeurs > 127 changent de résultat",
+    "-O3 et PGO ne sont pas des gains garantis : un workload d'entraînement non représentatif peut dégrader les performances",
+    "perf c2c et plusieurs outils de faux partage sont spécifiques à x86 et absents sur ARM64",
+    "Une JVM en conteneur peut voir tous les CPU de l'hôte : sans ActiveProcessorCount, les pools de threads sont surdimensionnés"
+  ],
+  "quiz": [
+    {
+      "id": "hcip-kp-01-q01",
+      "type": "single",
+      "prompt": "Which DevKit component scans source code and binaries for x86-specific constructs before an ARM64 port?",
+      "options": [
+        "Porting Advisor",
+        "Perf Profiler",
+        "JFR Analyzer",
+        "kube-bench"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Porting Advisor analyse le code, les scripts de build et les binaires afin d'identifier assembly x86, intrinsics SSE/AVX et bibliothèques .so incompatibles. Perf Profiler mesure les performances d'un programme déjà fonctionnel, il ne détecte pas les incompatibilités de portage. JFR Analyzer concerne la JVM et kube-bench audite un cluster Kubernetes : aucun des deux n'analyse un projet C/C++.",
+      "topic": "DevKit"
+    },
+    {
+      "id": "hcip-kp-01-q02",
+      "type": "single",
+      "prompt": "Which GCC sequence implements Profile-Guided Optimization?",
+      "options": [
+        "-pg, then -march=armv8-a",
+        "-fprofile-generate, run the workload, then -fprofile-use",
+        "-flto, then -march=native",
+        "-O0, then -O3"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "PGO compile une première fois avec -fprofile-generate, exécute un scénario représentatif pour collecter les compteurs, puis recompile avec -fprofile-use. -flto active l'optimisation à l'édition de liens, pas la collecte de profil. -O0 puis -O3 ne fait que changer le niveau d'optimisation, et -pg instrumente pour gprof sans produire de profil GCC.",
+      "topic": "Compilation"
+    },
+    {
+      "id": "hcip-kp-01-q03",
+      "type": "single",
+      "prompt": "Which header provides NEON intrinsics on ARM64?",
+      "options": [
+        "sse2.h",
+        "altivec.h",
+        "arm_neon.h",
+        "immintrin.h"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "arm_neon.h déclare les intrinsics NEON et les types vectoriels comme float32x4_t, qui correspondent aux registres 128 bits d'AArch64. immintrin.h et sse2.h appartiennent à l'écosystème x86 et ne compilent pas sur ARM. altivec.h est l'interface SIMD d'IBM Power.",
+      "topic": "NEON/SIMD"
+    },
+    {
+      "id": "hcip-kp-01-q04",
+      "type": "single",
+      "prompt": "What does the GCC option -march=armv8.2-a control?",
+      "options": [
+        "The scheduler tuning for a specific core",
+        "The link-time optimization level",
+        "The default stack size of threads",
+        "The instruction set baseline the compiler may emit"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "-march définit le jeu d'instructions que le compilateur est autorisé à générer, donc la compatibilité minimale du binaire. L'ordonnancement pour un cœur précis relève de -mtune, pas de -march. L'optimisation à l'édition de liens s'active avec -flto, et la taille de pile des threads est une option d'exécution ou de linkage, pas de génération de code.",
+      "topic": "Compilation"
+    },
+    {
+      "id": "hcip-kp-01-q05",
+      "type": "single",
+      "prompt": "On ARM Linux, what is the default signedness of the plain char type?",
+      "options": [
+        "Unsigned",
+        "Signed",
+        "It depends on the GCC version",
+        "char is always 32 bits"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "La convention ARM (AAPCS) impose un char non signé par défaut sous Linux, alors qu'il est signé sur x86. Un test comme c > 127 ne donne donc pas le même résultat après un portage. La parade consiste à utiliser uint8_t ou signed char explicitement, plutôt qu'à dépendre du défaut du compilateur.",
+      "topic": "NEON/SIMD"
+    },
+    {
+      "id": "hcip-kp-01-q06",
+      "type": "single",
+      "prompt": "Which perf subcommand summarizes hardware counters such as cycles, instructions and cache misses for one run?",
+      "options": [
+        "perf annotate",
+        "perf stat",
+        "perf record",
+        "perf report"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "perf stat exécute une commande et affiche les compteurs matériels agrégés, ce qui permet de calculer l'IPC et de repérer un comportement mémoire anormal. perf record échantillonne et écrit un fichier, tandis que perf report exploite ce fichier. perf annotate affiche le code assembleur d'une fonction déjà profilée.",
+      "topic": "Profilage"
+    },
+    {
+      "id": "hcip-kp-01-q07",
+      "type": "single",
+      "prompt": "What does the -flto option enable?",
+      "options": [
+        "Static linking of the C library",
+        "Automatic translation of SSE into NEON",
+        "Optimization across translation units at link time",
+        "Generation of a PGO profile"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "-flto conserve une représentation intermédiaire dans les objets et laisse le compilateur optimiser à l'édition de liens, ce qui permet l'inlining entre modules. La collecte de profil utilise -fprofile-generate. -flto ne lie pas statiquement la libc et ne traduit aucune instruction x86 en NEON.",
+      "topic": "Compilation"
+    },
+    {
+      "id": "hcip-kp-01-q08",
+      "type": "single",
+      "prompt": "What typically happens when source code containing SSE intrinsics is built and run on ARM64?",
+      "options": [
+        "GCC translates the intrinsics automatically with no impact",
+        "The kernel emulates SSE transparently",
+        "It runs slower but produces correct results",
+        "It fails to build, or crashes with an illegal instruction if a binary is reused"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Les en-têtes SSE ne sont pas disponibles pour la cible aarch64, donc la compilation échoue en général dès l'inclusion. Si un binaire x86 est copié tel quel, il ne peut pas s'exécuter et produit une erreur de format ou d'instruction. Aucune émulation SSE transparente n'est assurée par le noyau Linux ARM.",
+      "topic": "NEON/SIMD"
+    },
+    {
+      "id": "hcip-kp-01-q09",
+      "type": "single",
+      "prompt": "Which JVM option overrides the number of processors detected inside a container?",
+      "options": [
+        "-XX:ActiveProcessorCount",
+        "-XX:+UseSerialGC",
+        "-Xss",
+        "-XX:+PrintFlagsFinal"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "-XX:ActiveProcessorCount fixe le nombre de CPU utilisés par la JVM pour dimensionner ses pools de threads et certaines heuristiques du GC. -XX:+UseSerialGC choisit un collecteur, -Xss règle la taille de pile des threads et -XX:+PrintFlagsFinal se contente d'afficher les options. Un pod limité à 4 vCPU peut ainsi être traité comme une machine à 64 cœurs si l'option est absente.",
+      "topic": "JVM"
+    },
+    {
+      "id": "hcip-kp-01-q10",
+      "type": "single",
+      "prompt": "Which order reflects a sound optimization methodology?",
+      "options": [
+        "Tune the JVM first, then check whether native libraries exist",
+        "Analyze compatibility, build, measure a baseline, tune one change at a time, validate",
+        "Enable -O3 and PGO, then look for build errors",
+        "Rewrite hot loops in NEON before any profiling"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Il faut d'abord garantir un build ARM64 fonctionnel, puis mesurer une référence avant de modifier quoi que ce soit. Chaque changement est isolé pour que le gain soit attribuable, et la validation compare les percentiles de latence. Optimiser avant de profiler revient à deviner, et vérifier les dépendances natives après le tuning fait perdre tout le bénéfice.",
+      "topic": "Méthode"
+    },
+    {
+      "id": "hcip-kp-01-q11",
+      "type": "single",
+      "prompt": "What is the role of perf report?",
+      "options": [
+        "It compiles the application with instrumentation",
+        "It sets the CPU frequency governor",
+        "It reads a perf.data file and attributes samples to symbols and call chains",
+        "It launches the application under a debugger"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "perf record produit un fichier d'échantillons, et perf report le dépouille en associant chaque échantillon à un symbole et, avec -g, à une chaîne d'appel. Il ne lance pas de débogueur, ne compile rien et ne modifie pas la fréquence du processeur. C'est cette attribution qui permet de distinguer une fonction chaude d'un simple appelant.",
+      "topic": "Profilage"
+    },
+    {
+      "id": "hcip-kp-01-q12",
+      "type": "single",
+      "prompt": "What is the safest way to evaluate a hand-written NEON rewrite of a hot loop?",
+      "options": [
+        "Compare the new ARM build against an x86 server",
+        "Trust the theoretical speedup of 128-bit registers",
+        "Measure only the compilation time",
+        "Benchmark the old and new versions on the same machine, workload and settings, with repeated runs"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Seule une comparaison à machine, charge et configuration identiques permet d'attribuer l'écart au changement de code. Comparer un serveur ARM à un serveur x86 mélange architecture, génération de CPU et environnement. Le gain théorique du SIMD ne se réalise que si la boucle est réellement limitée par le calcul, ce que seul le profilage confirme.",
+      "topic": "Méthode"
+    },
+    {
+      "id": "hcip-kp-01-q13",
+      "type": "multi",
+      "prompt": "Which techniques can produce measurable gains on Kunpeng? (Choose 3)",
+      "options": [
+        "PGO with a representative workload",
+        "NEON rewrite of profiled hot loops",
+        "Disabling CPU caches",
+        "LTO linking"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "LTO, PGO et une réécriture NEON ciblée par le profilage agissent sur des coûts réels et se mesurent. Les caches CPU ne se désactivent pas depuis l'espace utilisateur, et une telle manipulation n'aurait aucun sens en production. Une optimisation non guidée par la mesure n'apporte pas de gain fiable.",
+      "topic": "Méthode"
+    },
+    {
+      "id": "hcip-kp-01-q14",
+      "type": "multi",
+      "prompt": "Which practices make performance measurements reproducible? (Choose 3)",
+      "options": [
+        "Pin the process to dedicated cores with taskset",
+        "Repeat the run at least three times",
+        "Run the benchmark while other jobs randomly saturate the machine",
+        "Set the CPU governor to performance"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Un governor fixe évite les variations de fréquence, l'épinglage limite la migration entre cœurs et les répétitions permettent d'estimer la variance. Faire tourner des charges concurrentes non contrôlées introduit du bruit qui peut dépasser le gain mesuré. La reproductibilité exige au contraire de stabiliser ou de documenter tout l'environnement.",
+      "topic": "Profilage"
+    },
+    {
+      "id": "hcip-kp-01-q15",
+      "type": "multi",
+      "prompt": "Which actions are relevant when tuning a latency-sensitive Java service on BiSheng JDK? (Choose 3)",
+      "options": [
+        "Enable ZGC for short pauses",
+        "Record JFR with a bounded size",
+        "Disable container support to ignore cgroup limits",
+        "Set -Xms equal to -Xmx"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Un tas fixe évite les cycles de croissance, ZGC réduit les pauses et JFR borné fournit des traces exploitables en continu. Désactiver la prise en charge des conteneurs ferait ignorer les limites mémoire du pod, avec un risque d'éviction par le noyau. Le réglage doit rester aligné sur les limites réellement appliquées.",
+      "topic": "JVM"
+    },
+    {
+      "id": "hcip-kp-01-q16",
+      "type": "tf",
+      "prompt": "BiSheng JDK provides ARM-optimized intrinsics and support for modern garbage collectors.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "BiSheng JDK est une distribution OpenJDK optimisée pour ARM64 : elle inclut des intrinsics de bas niveau et prend en charge les collecteurs modernes comme ZGC et G1. Elle reste compatible avec les API Java standard. Elle ne dispense pas de recompiler les bibliothèques JNI tierces pour aarch64.",
+      "topic": "JVM"
+    },
+    {
+      "id": "hcip-kp-01-q17",
+      "type": "tf",
+      "prompt": "The standard perf tool is unavailable on ARM64 and requires Huawei-specific tooling.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "perf fait partie du noyau Linux et fonctionne sur ARM64 en s'appuyant sur l'unité de surveillance de performance du processeur. Les événements disponibles varient selon le modèle de CPU, mais les sous-commandes stat, record et report restent identiques. Certains outils annexes, comme perf c2c, sont en revanche spécifiques à x86.",
+      "topic": "Profilage"
+    },
+    {
+      "id": "hcip-kp-01-q18",
+      "type": "tf",
+      "prompt": "Compiling with -O3 is always faster than -O2 on every workload.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "-O3 ajoute l'autovectorisation et le déroulage, ce qui accroît la taille du code et peut dégrader les performances en saturant le cache d'instructions. Sur certaines charges, -O2 produit un binaire plus rapide ou plus stable. La seule conclusion valable vient d'un benchmark sur le workload réel.",
+      "topic": "Compilation"
+    },
+    {
+      "id": "hcip-kp-01-q19",
+      "type": "text",
+      "prompt": "Give the perf command that records call graphs while running ./app.",
+      "accept": [
+        "perf record -g ./app",
+        "perf record -g -- ./app",
+        "perf record --call-graph ./app",
+        "perf record --call-graph dwarf ./app"
+      ],
+      "sample_answer": "perf record -g -- ./app",
+      "explanation_fr": "perf record -g capture les chaînes d'appel en plus des échantillons, ce qui permet ensuite à perf report d'attribuer le temps aux fonctions et à leurs appelants. Le double tiret sépare les options de perf de la commande observée. Sans -g, on obtient des symboles isolés, beaucoup moins utiles pour localiser un goulot.",
+      "topic": "Profilage"
+    },
+    {
+      "id": "hcip-kp-01-q20",
+      "type": "text",
+      "prompt": "Which JVM flag enables ZGC? (flag only)",
+      "accept": [
+        "-XX:+UseZGC",
+        "-xx:+usezgc"
+      ],
+      "sample_answer": "-XX:+UseZGC",
+      "explanation_fr": "-XX:+UseZGC sélectionne le collecteur ZGC, conçu pour des pauses très courtes même avec un tas important. L'option se place avant -jar dans la ligne de commande Java. Elle ne remplace pas le dimensionnement du tas : il faut toujours définir -Xms et -Xmx en fonction de la limite mémoire du conteneur.",
+      "topic": "JVM"
+    }
+  ]
+}

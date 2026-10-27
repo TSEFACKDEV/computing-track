@@ -1,0 +1,578 @@
+{
+  "id": "hcia-kp-05",
+  "phase": "HCIA",
+  "subject": "Kunpeng",
+  "number": 5,
+  "title_fr": "Serveurs TaiShan et ateliers pratiques",
+  "title_en": "TaiShan Servers and Practical Workshops",
+  "minutes": 40,
+  "source": "HCIA-Kunpeng Application Developer V2.0 — Chapitres 1 (§1.3 TaiShan), 4 «Comprehensive Experiment», 5 «Solutions», 6 «Community» · Lab Guide",
+  "objectives": [
+    "Décrire les modèles TaiShan 200 et leurs usages",
+    "Installer openEuler sur un serveur Kunpeng avec un partitionnement UEFI correct",
+    "Déployer une pile Nginx, application Java, openGauss et Redis",
+    "Mettre en place une haute disponibilité et une sauvegarde restaurable",
+    "Diagnostiquer une application lente avec une démarche structurée"
+  ],
+  "sections": [
+    {
+      "heading": "TaiShan 200 : une gamme pour chaque charge",
+      "body": "Le TaiShan 200 est la génération de serveurs construite autour du Kunpeng 920. Huawei la décline en plusieurs modèles pour éviter de surdimensionner ou de sous-dimensionner une infrastructure. Le 2280 « Balanced » est le modèle polyvalent, adapté aux applications web, aux bases de données et aux microservices. Le 5280 « Storage » privilégie la capacité et les baies de disques pour le stockage massif. Le X6000 « High-Density » cible les déploiements très denses, où le nombre de nœuds par rack compte davantage que l'extensibilité individuelle.\n\nAu-delà du nombre de cœurs, un serveur se juge sur sa capacité à rester disponible. Les alimentations redondantes permettent de remplacer une panne sans couper la machine ; les ventilateurs hot-swap et les disques hot-swap réduisent les interruptions. L'iBMC surveille températures, tensions, ventilateurs et alimentations, et permet une console distante même lorsque le système d'exploitation ne répond plus.\n\nLes fonctions RAS (reliability, availability, serviceability) couvrent la correction d'erreurs mémoire, la journalisation matérielle et les chemins de secours. Pour une banque ou un opérateur télécom, ces fonctions pèsent autant que le prix du CPU. Un serveur qui redémarre rarement et se répare sans interruption a une valeur opérationnelle supérieure à un simple rapport performance/prix.",
+      "bullets": [
+        "TaiShan 200 s'appuie sur le Kunpeng 920",
+        "2280 : polyvalent ; 5280 : stockage ; X6000 : haute densité",
+        "Alimentations redondantes, disques et ventilateurs hot-swap",
+        "iBMC et fonctions RAS pour la disponibilité"
+      ],
+      "code": [
+        "# Identifier le modèle et le numéro de serie\nsudo dmidecode -t system | grep -E 'Manufacturer|Product|Serial'\n\n# Vérifier l'état des alimentations via Redfish\ncurl -k -u admin:MotDePasse \\\n  https://192.168.1.100/redfish/v1/Chassis/1/Power"
+      ],
+      "table": {
+        "headers": [
+          "Modèle",
+          "Positionnement",
+          "Usage typique"
+        ],
+        "rows": [
+          [
+            "2280 Balanced",
+            "2U polyvalent, 2 sockets",
+            "Web, microservices, bases de données"
+          ],
+          [
+            "5280 Storage",
+            "Grande capacité de stockage",
+            "Big data, archivage, serveurs de fichiers"
+          ],
+          [
+            "X6000 High-Density",
+            "Densité élevée",
+            "Cloud, conteneurs, calcul distribué"
+          ]
+        ]
+      },
+      "tip": "TaiShan 2280 bi-socket avec deux Kunpeng 920 de 64 cœurs expose 128 cœurs. Ne confondez pas « 128 cœurs » avec un seul processeur : c'est le total du serveur."
+    },
+    {
+      "heading": "Installer openEuler sur TaiShan",
+      "body": "L'installation d'openEuler sur un serveur ARM64 commence par le firmware. Le mode de démarrage doit être UEFI, et le disque système doit contenir une partition EFI (ESP) formatée en FAT32. Sur ARM64, cette partition est indispensable : le firmware y cherche le chargeur d'amorçage. Une taille de 200 Mo à 512 Mo est une bonne pratique, car les futures mises à jour de GRUB et du noyau peuvent y ajouter des fichiers.\n\nLe partitionnement dépend du rôle du serveur. Pour un serveur simple, on peut utiliser `/boot` en ext4 ou XFS, une ESP séparée et un volume racine en LVM. LVM facilite l'extension ultérieure, les snapshots et la séparation des données. Pour un serveur de base de données, on isole souvent `/var/lib/opengauss` ou `/data` sur un volume dédié afin de maîtriser les performances et les sauvegardes.\n\nAprès l'installation, la première série d'actions est classique : mettre à jour les paquets, configurer le réseau avec NetworkManager, activer la synchronisation NTP, choisir un profil tuned et vérifier SELinux. Il faut aussi documenter l'adresse iBMC, les VLAN, les passerelles et les comptes de service. Un serveur mal documenté devient une dette opérationnelle dès le premier incident.",
+      "bullets": [
+        "Démarrage UEFI et partition ESP FAT32 obligatoires",
+        "LVM pour la souplesse ; volumes dédiés pour les données",
+        "Mise à jour, réseau, NTP, tuned et SELinux après installation",
+        "Documenter iBMC, réseau, comptes et procédures"
+      ],
+      "code": [
+        "# Vérification après installation\ncat /etc/os-release\nlsblk -f\nblkid | grep -i efi\n\n# Mise à jour et configuration de base\ndnf update -y\ntimedatectl set-ntp true\ntuned-adm profile throughput-performance\nsestatus\n\n# Configurer une interface statique avec nmcli\nnmcli con add type ethernet ifname ens3 con-name prod \\\n  ipv4.addresses 10.0.0.10/24 ipv4.gateway 10.0.0.1 \\\n  ipv4.dns 10.0.0.53 ipv4.method manual\nnmcli con up prod"
+      ],
+      "table": {
+        "headers": [
+          "Point de montage",
+          "Taille indicative",
+          "Remarque"
+        ],
+        "rows": [
+          [
+            "/boot/efi (ESP)",
+            "200 à 512 Mo",
+            "FAT32, requis par UEFI"
+          ],
+          [
+            "/boot",
+            "1 Go",
+            "Noyaux et initramfs"
+          ],
+          [
+            "/ (LVM)",
+            "20 à 50 Go",
+            "Racine du système"
+          ],
+          [
+            "/data ou /var/lib/opengauss",
+            "Selon les données",
+            "Volume dédié aux données"
+          ],
+          [
+            "swap",
+            "0 à 8 Go",
+            "Souvent réduit sur serveur"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un serveur doit héberger openGauss avec 2 To de données et pouvoir étendre son stockage sans réinstallation. Proposez un schéma de partitionnement et justifiez chaque choix.",
+          "correction": "Prévoir une ESP FAT32 de 512 Mo, `/boot` de 1 Go, une racine LVM de 50 Go, et surtout un volume LVM dédié monté sur `/var/lib/opengauss` ou `/data`, dimensionné pour les 2 To avec de la marge. LVM permet d'ajouter un disque ou d'étendre le volume logique sans réinstaller. Séparer les données du système simplifie les sauvegardes, les snapshots et l'isolation des I/O. Ajouter éventuellement un volume de journaux WAL distinct pour réduire la contention."
+        }
+      ],
+      "tip": "Sur ARM64 UEFI, l'absence de partition ESP empêche le démarrage, même si le reste du partitionnement est correct. C'est un piège classique des travaux pratiques d'installation."
+    },
+    {
+      "heading": "Déployer la pile applicative de bout en bout",
+      "body": "Une pile classique sur Kunpeng associe un frontal Nginx, une application Java, une base openGauss et un cache Redis. Nginx reçoit les requêtes HTTP, sert les ressources statiques et répartit le trafic vers plusieurs instances applicatives via un bloc `upstream`. Cette séparation permet de mettre à jour l'application sans interrompre le service et de répartir la charge sur plusieurs nœuds.\n\nL'application Java est empaquetée dans un JAR et exécutée par BiSheng JDK ou OpenJDK ARM64. Elle se connecte à openGauss par JDBC et à Redis pour les sessions ou les données chaudes. Chaque composant doit être supervisé par systemd ou par Kubernetes : redémarrage automatique, limites de ressources, journaux centralisés. Les ports doivent être documentés et filtrés par le pare-feu ; seuls le frontal et les flux d'administration nécessaires sont exposés.\n\nLa validation de bout en bout ne se limite pas à « la page s'affiche ». Il faut tester l'authentification, une écriture en base suivie d'une lecture, l'expiration du cache, la perte d'un nœud applicatif et le comportement lorsque la base est indisponible. Ces scénarios révèlent les timeouts mal réglés et les dépendances cachées qui transforment une panne locale en panne générale.",
+      "bullets": [
+        "Nginx : frontal, statique et répartition via `upstream`",
+        "Application Java exécutée par un JDK ARM64",
+        "openGauss pour la persistance, Redis pour le cache",
+        "Supervision systemd/Kubernetes, pare-feu et tests de panne"
+      ],
+      "code": [
+        "# Extrait de configuration Nginx\n# /etc/nginx/conf.d/app.conf\nupstream apps {\n    server 10.0.0.11:8080;\n    server 10.0.0.12:8080;\n}\nserver {\n    listen 80;\n    location / {\n        proxy_pass http://apps;\n        proxy_set_header Host $host;\n    }\n}\n\n# Vérifier et recharger\nnginx -t\nsystemctl reload nginx"
+      ],
+      "diagram": "        Internet\n           v\n   +---------------+\n   |    Nginx      |  :80 / :443\n   |  upstream     |\n   +-------+-------+\n           |\n     +-----+------+\n     |            |\n     v            v\n+---------+  +---------+\n| App #1  |  | App #2  |   BiSheng JDK\n+----+----+  +----+----+\n     |            |\n     +-----+------+\n           |\n     +-----v------+      +---------+\n     | openGauss  |      |  Redis  |\n     |  :15400    |      |  :6379  |\n     +------------+      +---------+",
+      "tip": "`proxy_pass http://apps;` utilise le bloc `upstream` nommé, pas une adresse IP. Une erreur de nom dans `upstream` empêche Nginx de démarrer ou renvoie une erreur 502."
+    },
+    {
+      "heading": "Haute disponibilité, sauvegarde et restauration",
+      "body": "La haute disponibilité vise à réduire l'interruption de service, pas à empêcher toute panne. keepalived fournit une adresse IP virtuelle (VIP) partagée entre deux nœuds via le protocole VRRP. Si le nœud actif tombe, le nœud passif prend la VIP et le service continue, à condition que la configuration et les données soient synchronisées. La VIP ne remplace pas la réplication de la base : elle déplace seulement le point d'entrée réseau.\n\nPour une base openGauss, la haute disponibilité repose sur un primaire et un ou plusieurs standby, avec réplication des journaux. La sauvegarde physique `gs_basebackup` copie les fichiers de données et les WAL nécessaires pour restaurer un état cohérent. Une stratégie complète combine une sauvegarde de base périodique, l'archivage continu des WAL et la conservation hors site. Sans test de restauration, cette stratégie n'est qu'une hypothèse.\n\nDeux indicateurs structurent les décisions : le RPO (perte de données acceptable) et le RTO (durée d'indisponibilité acceptable). Une sauvegarde toutes les nuits donne un RPO potentiel de 24 heures ; l'archivage des WAL le réduit à quelques minutes. Le RTO dépend du temps de restauration, de la taille de la base et du niveau d'automatisation. Ces valeurs doivent être validées par un exercice réel.",
+      "bullets": [
+        "keepalived + VIP : bascule réseau via VRRP",
+        "openGauss : primaire, standby et réplication des WAL",
+        "`gs_basebackup` + archivage WAL pour une restauration cohérente",
+        "RPO et RTO pilotent la stratégie de sauvegarde"
+      ],
+      "code": [
+        "# Sauvegarde physique openGauss\ngs_basebackup -D /backup/data -Fp -X stream -P\n\n# Vérifier l'état de keepalived\nsystemctl status keepalived\nip addr show | grep -A2 'inet '\n\n# Tester la restauration dans un environnement isolé\n# (ne jamais tester sur la base de production)"
+      ],
+      "table": {
+        "headers": [
+          "Objectif",
+          "Question",
+          "Exemple"
+        ],
+        "rows": [
+          [
+            "RPO",
+            "Combien de données peut-on perdre ?",
+            "15 minutes de transactions"
+          ],
+          [
+            "RTO",
+            "Combien de temps peut-on être indisponible ?",
+            "2 heures maximum"
+          ],
+          [
+            "Sauvegarde",
+            "Quand et comment copie-t-on ?",
+            "Base complète + WAL continu"
+          ],
+          [
+            "Restauration",
+            "A-t-on déjà prouvé que cela fonctionne ?",
+            "Exercice trimestriel"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Une entreprise sauvegarde sa base chaque nuit à 2 h et déclare un RPO de 15 minutes. La sauvegarde prend 4 heures. Cette promesse est-elle tenable ? Que faut-il changer ?",
+          "correction": "Non : avec une seule sauvegarde quotidienne, une panne à 13 h peut faire perdre jusqu'à 11 heures de données. Pour un RPO de 15 minutes, il faut archiver les WAL en continu vers un stockage distinct et pouvoir rejouer les journaux après restauration de la base. Il faut aussi vérifier que la restauration complète respecte le RTO et tester régulièrement l'exercice, car une sauvegarde non restaurée n'apporte aucune garantie."
+        }
+      ],
+      "tip": "Une sauvegarde n'est valide que si la restauration a été testée. À l'examen, « sauvegarde quotidienne » ne garantit ni un RPO faible ni un RTO court."
+    },
+    {
+      "heading": "Atelier : la plateforme de messagerie instantanée",
+      "body": "L'atelier complet du cours déploie une plateforme de messagerie instantanée sur Kunpeng. L'architecture associe Nginx en frontal, un backend Java, MySQL pour les données transactionnelles, Hadoop pour le stockage distribué et Hive pour l'entrepôt de données. Les messages et événements sont collectés en temps réel par Kafka, puis traités par plusieurs moteurs selon le besoin : MapReduce pour le traitement par lots, Spark pour le calcul en mémoire et Storm pour le flux continu.\n\nCette diversité est volontaire : elle montre qu'une plateforme réelle combine plusieurs styles de traitement. Le backend Java expose les API de messagerie ; Nginx termine le TLS et répartit les requêtes ; MySQL stocke les utilisateurs et les messages récents ; Hadoop conserve les volumes historiques ; Hive permet des requêtes de type SQL sur ces données. Kafka sert de tampon entre la production d'événements et les consommateurs, ce qui absorbe les pics.\n\nLa migration d'un tel ensemble ne se fait pas en une fois. On commence par l'environnement et les composants les plus simples, puis on porte les modules Java et les dépendances natives, avant de valider les flux de données de bout en bout. Les tests doivent vérifier non seulement l'API, mais aussi la livraison des messages, l'ordre éventuel, la reprise après incident et la cohérence entre l'OLTP et l'entrepôt.",
+      "bullets": [
+        "Frontal Nginx, backend Java, MySQL transactionnel",
+        "Hadoop pour l'historique, Hive pour l'entrepôt SQL",
+        "Kafka pour l'ingestion, Spark/MapReduce/Storm pour le traitement",
+        "Migration par étapes et validation des flux de bout en bout"
+      ],
+      "code": [
+        "# Vérifier les services de la plateforme\nsystemctl status nginx mysqld\ndocker ps --format 'table {{.Names}}\\t{{.Status}}'\n\n# Requête Hive de contrôle (exemple)\nhive -e 'SELECT COUNT(*) FROM messages WHERE dt = current_date;'"
+      ],
+      "diagram": " Clients\n    |\n    v\n+--------+     +------------------+     +-----------+\n| Nginx  | --> | Backend Java     | --> |  MySQL    |\n+--------+     | API messagerie   |     |  OLTP     |\n               +--------+---------+     +-----------+\n                        |\n                        v\n                 +-------------+      +-------------+\n                 |    Kafka    | ---> | Spark/Storm |\n                 |  ingestion  |      |  streaming  |\n                 +------+------+      +------+------+\n                        |                    |\n                        v                    v\n                 +-------------+      +-------------+\n                 |   Hadoop    | ---> |    Hive     |\n                 | stockage    |      |  entrepôt   |\n                 +-------------+      +-------------+",
+      "tip": "Hive n'est pas une base transactionnelle : il sert à analyser de grands volumes avec un langage proche de SQL. Ne l'utilisez pas comme substitut de MySQL pour les écritures unitaires à faible latence."
+    },
+    {
+      "heading": "Exploitation, supervision et dépannage",
+      "body": "En production, l'exploitation commence par la visibilité. L'iBMC surveille le matériel : température, alimentations, ventilateurs, disques. Redfish expose ces données via une API HTTPS, ce qui permet de les intégrer à un outil de supervision. Côté système, node_exporter collecte CPU, mémoire, disque, réseau et charge ; Prometheus stocke les séries temporelles et Grafana les affiche. Des alertes sur seuils et sur tendances évitent de découvrir une saturation dans les journaux.\n\nLe dépannage suit une méthode. D'abord qualifier l'impact : qui est touché, depuis quand, quel service, quelle erreur. Ensuite vérifier les ressources et les dépendances : CPU, mémoire, disque, base, DNS, réseau. Pour une application Java, `jstack` révèle les threads bloqués, `jcmd` donne l'état du heap et des classes, et les logs GC montrent les pauses. Pour un problème réseau, `ss`, `ip`, `tcpdump` et les compteurs de la carte fournissent des preuves.\n\nUn diagnostic sans preuve devient une suite d'essais. Notez les hypothèses, les commandes exécutées et les résultats. Si un redémarrage résout le problème, il ne l'explique pas : sans analyse des journaux et des métriques, l'incident reviendra. Le runbook doit capitaliser ces enseignements pour réduire le temps de résolution futur.",
+      "bullets": [
+        "iBMC/Redfish pour le matériel, Prometheus/Grafana pour le système",
+        "Qualifier l'impact avant de modifier quoi que ce soit",
+        "Java : `jstack`, `jcmd`, logs GC ; réseau : `ss`, `tcpdump`",
+        "Capitaliser hypothèses, preuves et résolutions dans un runbook"
+      ],
+      "code": [
+        "# Diagnostiquer une application Java\njcmd <pid> GC.heap_info\njstack <pid> > /tmp/threads.txt\ngrep -A20 'BLOCKED' /tmp/threads.txt\n\n# Vérifier les connexions et le trafic\nss -s\ntcpdump -i ens3 -nn port 15400 -c 100\n\n# Collecter un diagnostic système\nsos report --batch --tmp-dir=/var/tmp"
+      ],
+      "exercises": [
+        {
+          "prompt": "Une API Java tourne à 95 % de CPU mais son débit a chuté de moitié. Les logs montrent des pauses GC de plus en plus longues. Proposez une démarche de diagnostic et trois actions possibles.",
+          "correction": "Confirmer d'abord la cause avec les logs GC et JFR, puis vérifier le heap et le nombre de threads (`jcmd GC.heap_info`, `jstack`). Actions : augmenter ou fixer le heap si les GC sont trop fréquentes, changer de ramasseur (G1 ou ZGC selon la version), réduire l'allocation d'objets dans le code ou ajuster le pool de threads. Vérifier aussi une éventuelle fuite mémoire et l'empreinte des caches. Mesurer après chaque changement avec la même charge."
+        }
+      ],
+      "tip": "Un CPU élevé ne signifie pas toujours « ajouter des cœurs ». Si les threads passent leur temps en GC, en verrous ou en attente, plus de CPU ne fera qu'augmenter la contention."
+    },
+    {
+      "heading": "Préparer l'examen et industrialiser",
+      "body": "La préparation de l'examen HCIA Kunpeng repose sur quelques réflexes. Sachez distinguer les couches : matériel TaiShan, CPU Kunpeng, OS openEuler, base openGauss, runtime Java, outils DevKit et BoostKit. Sachez nommer les modèles et les fonctions : 2280, 5280, X6000, iBMC, ESP, A-Tune, iSulad. Sachez expliquer une migration : évaluation, portage, validation, optimisation, sans oublier les dépendances natives.\n\nLes questions pièges portent souvent sur des confusions de vocabulaire : CPU contre serveur, conteneur contre VM, Porting Advisor contre ExaGear, sauvegarde contre haute disponibilité, RPO contre RTO. Prenez l'habitude de reformuler la question et de repérer l'unité : par socket ou par serveur, par seconde ou par minute, données perdues ou temps d'arrêt.\n\nL'industrialisation transforme un projet réussi en capacité durable. Documentez les versions, les paramètres, les procédures de déploiement et de retour arrière. Automatisez les tests et les builds multi-arch. Surveillez les indicateurs et révisez les runbooks après chaque incident. C'est cette rigueur, plus que la connaissance d'une commande isolée, qui distingue un administrateur fiable sur une plateforme Kunpeng.",
+      "bullets": [
+        "Distinguer matériel, OS, base, runtime et outils",
+        "Mémoriser les modèles, acronymes et fonctions clés",
+        "Repérer les unités et les confusions classiques du QCM",
+        "Documenter, automatiser, superviser et réviser les runbooks"
+      ],
+      "code": [
+        "# Checklist de vérification d'un serveur avant mise en service\nuname -m\ncat /etc/os-release\nsestatus | head -3\nsystemctl --failed\ndf -hT\ntuned-adm active"
+      ],
+      "table": {
+        "headers": [
+          "Confusion fréquente",
+          "Distinction à retenir"
+        ],
+        "rows": [
+          [
+            "Kunpeng / TaiShan",
+            "CPU / serveur complet"
+          ],
+          [
+            "Conteneur / VM",
+            "Noyau partagé / noyau dédié"
+          ],
+          [
+            "Porting Advisor / ExaGear",
+            "Analyse statique / traduction à l'exécution"
+          ],
+          [
+            "Sauvegarde / haute disponibilité",
+            "Restauration / continuité de service"
+          ],
+          [
+            "RPO / RTO",
+            "Données perdues / durée d'indisponibilité"
+          ]
+        ]
+      },
+      "tip": "Lisez attentivement « par socket », « par serveur », « par nœud » et « par conteneur ». Beaucoup d'erreurs d'examen viennent d'une unité mal interprétée, pas d'une méconnaissance du produit."
+    }
+  ],
+  "key_points": [
+    "TaiShan 200 repose sur le Kunpeng 920 ; les modèles 2280, 5280 et X6000 couvrent des usages distincts.",
+    "L'installation ARM64 exige un démarrage UEFI et une partition ESP en FAT32.",
+    "La pile typique associe Nginx, une application Java, openGauss et Redis.",
+    "keepalived fournit une VIP via VRRP, mais ne réplique pas les données.",
+    "`gs_basebackup` et l'archivage des WAL permettent une restauration cohérente.",
+    "Le RPO mesure la perte de données acceptable, le RTO la durée d'indisponibilité acceptable.",
+    "L'atelier de messagerie combine Nginx, Java, MySQL, Hadoop, Hive et Kafka.",
+    "Le diagnostic doit être guidé par des preuves : métriques, journaux, traces et tests."
+  ],
+  "traps": [
+    "Sans partition ESP FAT32, un serveur ARM64 UEFI ne démarre pas.",
+    "Une VIP keepalived bascule le trafic mais ne garantit pas la cohérence des données.",
+    "Une sauvegarde non testée n'est pas une garantie de restauration.",
+    "RPO et RTO ne sont pas interchangeables : l'un concerne les données, l'autre la durée.",
+    "Hive est un entrepôt analytique, pas une base OLTP pour des écritures unitaires."
+  ],
+  "quiz": [
+    {
+      "id": "hcia-kp-05-q01",
+      "type": "single",
+      "prompt": "What is the maximum number of CPU cores on a dual-socket TaiShan 200 server equipped with Kunpeng 920 processors?",
+      "options": [
+        "128",
+        "256",
+        "64",
+        "96"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Chaque Kunpeng 920 fournit jusqu'à 64 cœurs, donc deux sockets en offrent 128. 64 correspond à un seul socket, 96 à une configuration intermédiaire, et 256 à une confusion avec d'autres métriques comme les threads ou la mémoire.",
+      "topic": "Matériel"
+    },
+    {
+      "id": "hcia-kp-05-q02",
+      "type": "single",
+      "prompt": "Which partition must exist on an ARM64 UEFI installation?",
+      "options": [
+        "A raw partition without a filesystem",
+        "A FAT32 EFI System Partition",
+        "An NTFS recovery partition",
+        "A swap partition only"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le firmware UEFI recherche le chargeur d'amorçage sur une partition EFI formatée en FAT32. NTFS n'est pas le format attendu pour l'ESP, le swap seul ne permet pas de démarrer et une partition brute ne contient pas de chargeur.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-kp-05-q03",
+      "type": "single",
+      "prompt": "Which interface does iBMC expose for programmatic hardware monitoring?",
+      "options": [
+        "SMTP",
+        "SMB",
+        "Redfish",
+        "JDBC"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Redfish est une API REST standard pour la gestion de serveurs, exposée par l'iBMC. JDBC concerne les bases de données, SMTP le courrier et SMB le partage de fichiers : aucun ne sert à superviser le matériel.",
+      "topic": "Matériel"
+    },
+    {
+      "id": "hcia-kp-05-q04",
+      "type": "single",
+      "prompt": "Which command creates a physical backup of an openGauss database?",
+      "options": [
+        "mysqldump",
+        "tar --exclude",
+        "kubectl cp",
+        "gs_basebackup"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "`gs_basebackup` est l'outil openGauss de sauvegarde physique, qui copie les fichiers de données et les WAL nécessaires. `mysqldump` cible MySQL, `tar` ne garantit pas la cohérence d'une base active et `kubectl cp` copie des fichiers dans un pod sans logique de sauvegarde.",
+      "topic": "Sauvegarde"
+    },
+    {
+      "id": "hcia-kp-05-q05",
+      "type": "single",
+      "prompt": "Which protocol does keepalived use for virtual IP failover?",
+      "options": [
+        "VRRP",
+        "BGP",
+        "DHCP",
+        "SNMP"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "keepalived implémente VRRP pour élire un maître et basculer l'adresse IP virtuelle. BGP est un protocole de routage entre systèmes autonomes, DHCP attribue des adresses et SNMP supervise des équipements.",
+      "topic": "Haute disponibilité"
+    },
+    {
+      "id": "hcia-kp-05-q06",
+      "type": "single",
+      "prompt": "What is the role of the `upstream` block in an Nginx configuration?",
+      "options": [
+        "Create a RAID array",
+        "Define a group of backend servers for load balancing",
+        "Configure the DNS resolver",
+        "Set the root password"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le bloc `upstream` déclare un ensemble de serveurs backend vers lesquels Nginx répartit les requêtes. Il ne configure ni le DNS, ni un mot de passe, ni le stockage RAID.",
+      "topic": "Déploiement"
+    },
+    {
+      "id": "hcia-kp-05-q07",
+      "type": "single",
+      "prompt": "Which model of the TaiShan 200 family is positioned for storage-intensive workloads?",
+      "options": [
+        "TaiShan 100",
+        "2280 Balanced",
+        "5280 Storage",
+        "X6000 High-Density"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Le 5280 Storage est conçu pour les charges de stockage massif. Le 2280 est polyvalent, le X6000 vise la haute densité et le TaiShan 100 appartient à la génération précédente.",
+      "topic": "Matériel"
+    },
+    {
+      "id": "hcia-kp-05-q08",
+      "type": "multi",
+      "prompt": "Which layers are part of a typical end-to-end Kunpeng application stack? (Choose three.)",
+      "options": [
+        "openGauss database",
+        "Microsoft Excel",
+        "Nginx front end",
+        "Java application on an ARM64 JDK"
+      ],
+      "answer": [
+        0,
+        2,
+        3
+      ],
+      "explanation_fr": "Nginx, l'application Java sur JDK ARM64 et openGauss constituent des couches classiques de la pile. Microsoft Excel est une application bureautique et ne fait pas partie d'une architecture serveur de production.",
+      "topic": "Déploiement"
+    },
+    {
+      "id": "hcia-kp-05-q09",
+      "type": "multi",
+      "prompt": "Which practices help protect openGauss data? (Choose three.)",
+      "options": [
+        "Continuous WAL archiving",
+        "Periodic restore tests",
+        "Disabling all backups to save disk space",
+        "Regular gs_basebackup"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "La sauvegarde physique, l'archivage des WAL et les tests de restauration forment une stratégie cohérente. Supprimer les sauvegardes réduit l'espace mais rend toute restauration impossible.",
+      "topic": "Sauvegarde"
+    },
+    {
+      "id": "hcia-kp-05-q10",
+      "type": "multi",
+      "prompt": "Which actions are appropriate when a Java service has high CPU and low throughput? (Choose three.)",
+      "options": [
+        "Inspect thread stacks with jstack",
+        "Analyze GC logs and heap usage",
+        "Profile hot methods with perf or JFR",
+        "Restart the server without collecting data"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "Les piles de threads, les logs GC et le profiling permettent d'identifier verrous, pauses et méthodes chaudes. Un redémarrage immédiat peut rétablir le service mais détruit les preuves et ne corrige pas la cause.",
+      "topic": "Diagnostic"
+    },
+    {
+      "id": "hcia-kp-05-q11",
+      "type": "tf",
+      "prompt": "keepalived can provide a virtual IP that moves to a standby node when the active node fails.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : keepalived utilise VRRP pour élire un nœud actif et transférer la VIP en cas de défaillance. Cela assure la continuité du point d'entrée réseau, mais ne synchronise pas les données applicatives.",
+      "topic": "Haute disponibilité"
+    },
+    {
+      "id": "hcia-kp-05-q12",
+      "type": "tf",
+      "prompt": "A long garbage collection pause can cause high CPU utilization with low application throughput.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : pendant une pause GC, les threads applicatifs sont suspendus alors que la JVM consomme du CPU pour collecter. Le débit chute et la latence augmente. Les logs GC et JFR permettent de confirmer cette cause.",
+      "topic": "Diagnostic"
+    },
+    {
+      "id": "hcia-kp-05-q13",
+      "type": "tf",
+      "prompt": "The EFI System Partition can be formatted as ext4 on an ARM64 UEFI server.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : l'ESP doit être formatée en FAT32 pour être lue par le firmware UEFI. ext4 est adapté à `/boot` ou à la racine, mais pas à la partition EFI.",
+      "topic": "Installation"
+    },
+    {
+      "id": "hcia-kp-05-q14",
+      "type": "tf",
+      "prompt": "RAID replaces the need for backups because it protects data against accidental deletion.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : le RAID protège contre la panne d'un disque, pas contre une suppression accidentelle, une corruption logique ou un ransomware. La sauvegarde reste indispensable, et elle doit être testée.",
+      "topic": "Sauvegarde"
+    },
+    {
+      "id": "hcia-kp-05-q15",
+      "type": "text",
+      "prompt": "Which open-source reverse proxy is commonly configured with an upstream block in front of application servers? (Enter one word.)",
+      "accept": [
+        "nginx",
+        "Nginx",
+        "NGINX"
+      ],
+      "sample_answer": "nginx",
+      "explanation_fr": "Nginx est un serveur web et proxy inverse très répandu, configurable avec un bloc `upstream` pour répartir les requêtes. Il peut aussi terminer TLS et servir des fichiers statiques.",
+      "topic": "Déploiement"
+    },
+    {
+      "id": "hcia-kp-05-q16",
+      "type": "text",
+      "prompt": "Which openGauss command performs a physical base backup? (Enter the command name.)",
+      "accept": [
+        "gs_basebackup",
+        "gs-basebackup"
+      ],
+      "sample_answer": "gs_basebackup",
+      "explanation_fr": "`gs_basebackup` copie les fichiers de la base et les WAL nécessaires pour obtenir une sauvegarde cohérente. Il s'utilise avec des options comme `-D` pour le répertoire cible et `-X stream` pour inclure les journaux.",
+      "topic": "Sauvegarde"
+    },
+    {
+      "id": "hcia-kp-05-q17",
+      "type": "text",
+      "prompt": "Which service manager starts and supervises services on openEuler? (Enter the name.)",
+      "accept": [
+        "systemd",
+        "systemctl"
+      ],
+      "sample_answer": "systemd",
+      "explanation_fr": "systemd est le gestionnaire de services et d'initialisation d'openEuler. La commande `systemctl` permet de démarrer, arrêter, activer et inspecter les unités gérées par systemd.",
+      "topic": "Administration"
+    },
+    {
+      "id": "hcia-kp-05-q18",
+      "type": "single",
+      "prompt": "What does RPO measure in a disaster recovery plan?",
+      "options": [
+        "The acceptable service downtime",
+        "The number of backup servers",
+        "The RAID level",
+        "The acceptable amount of data loss"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Le RPO (Recovery Point Objective) définit la quantité maximale de données qu'on accepte de perdre, souvent exprimée en minutes ou heures. Le RTO mesure la durée d'indisponibilité acceptable ; les deux notions sont complémentaires.",
+      "topic": "Sauvegarde"
+    },
+    {
+      "id": "hcia-kp-05-q19",
+      "type": "single",
+      "prompt": "Which RAID level provides mirroring?",
+      "options": [
+        "RAID 1",
+        "RAID 5",
+        "RAID 6",
+        "RAID 0"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "RAID 1 duplique les données sur deux disques, ce qui offre une tolérance à la panne d'un disque. RAID 0 répartit sans redondance, RAID 5 utilise une parité simple et RAID 6 une double parité.",
+      "topic": "Stockage"
+    },
+    {
+      "id": "hcia-kp-05-q20",
+      "type": "single",
+      "prompt": "What is the first step when troubleshooting a production service?",
+      "options": [
+        "Disable monitoring",
+        "Qualify the impact and gather evidence",
+        "Reinstall the operating system",
+        "Delete the logs"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Il faut d'abord savoir qui est touché, depuis quand, sur quel service et avec quel symptôme, puis collecter métriques et journaux. Réinstaller, supprimer les logs ou désactiver la supervision détruit des preuves et aggrave l'incident.",
+      "topic": "Diagnostic"
+    }
+  ]
+}

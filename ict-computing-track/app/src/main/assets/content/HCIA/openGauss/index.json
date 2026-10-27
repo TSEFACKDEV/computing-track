@@ -1,0 +1,45 @@
+{
+  "phase": "HCIA",
+  "subject": "openGauss",
+  "name": "openGauss — cours base de données complet",
+  "tagline": "Architecture, installation/gsql, SQL, objets, permissions, sauvegarde",
+  "weight": 30,
+  "chapters": [
+    {
+      "id": "hcia-og-01",
+      "file": "ch01.json",
+      "title": "openGauss : présentation et architecture",
+      "minutes": 35
+    },
+    {
+      "id": "hcia-og-02",
+      "file": "ch02.json",
+      "title": "Installation openGauss et outils de base",
+      "minutes": 40
+    },
+    {
+      "id": "hcia-og-03",
+      "file": "ch03.json",
+      "title": "SQL : types, DDL, DML et requêtes",
+      "minutes": 50
+    },
+    {
+      "id": "hcia-og-04",
+      "file": "ch04.json",
+      "title": "Bases, schémas, tablespaces et objets",
+      "minutes": 45
+    },
+    {
+      "id": "hcia-og-05",
+      "file": "ch05.json",
+      "title": "Rôles, utilisateurs et privilèges",
+      "minutes": 40
+    },
+    {
+      "id": "hcia-og-06",
+      "file": "ch06.json",
+      "title": "Sauvegarde, restauration et dépannage",
+      "minutes": 50
+    }
+  ]
+}

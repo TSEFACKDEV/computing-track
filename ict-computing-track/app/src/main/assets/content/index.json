@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "app": "ICT Computing Track",
+  "exam": "Huawei ICT Competition 2025-2026 — Computing Track",
+  "phases": [
+    {
+      "id": "HCIA",
+      "title": "HCIA",
+      "subtitle": "Phase nationale — fondamentaux",
+      "description": "openEuler, openGauss et Kunpeng : les bases certifiées, niveau examen préliminaire et national.",
+      "duration_min": 60,
+      "question_count": 60
+    },
+    {
+      "id": "HCIP",
+      "title": "HCIP",
+      "subtitle": "Phase professionnelle — maîtrise",
+      "description": "Services, clusters, stockage, SQL avancé, migration, sécurité et optimisation.",
+      "duration_min": 120,
+      "question_count": 150
+    },
+    {
+      "id": "HCIE",
+      "title": "HCIE",
+      "subtitle": "Phase expert — architecture et O&M",
+      "description": "Ceph, Kubernetes, CI/CD, supervision, transactions, moteur SQL et dépannage expert.",
+      "duration_min": 90,
+      "question_count": 60
+    }
+  ]
+}

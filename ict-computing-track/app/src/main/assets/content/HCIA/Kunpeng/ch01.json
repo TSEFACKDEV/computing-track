@@ -1,0 +1,578 @@
+{
+  "id": "hcia-kp-01",
+  "phase": "HCIA",
+  "subject": "Kunpeng",
+  "number": 1,
+  "title_fr": "Écosystème Kunpeng et processeurs ARM",
+  "title_en": "Kunpeng Ecosystem and ARM Processors",
+  "minutes": 35,
+  "source": "HCIA-Kunpeng Application Developer V2.0 — Chapitre 1 «Introduction to the Kunpeng System» · Lab Guide",
+  "objectives": [
+    "Expliquer les différences entre les architectures x86 et ARMv8/AArch64",
+    "Décrire les caractéristiques du processeur Kunpeng 920 et des serveurs TaiShan",
+    "Situer openEuler, openGauss et les outils DevKit dans l'écosystème Kunpeng",
+    "Identifier les cas d'usage adaptés à une plateforme ARM64",
+    "Appliquer la méthodologie de migration en cinq phases à un scénario simple"
+  ],
+  "sections": [
+    {
+      "heading": "Du x86 à ARM : pourquoi un nouveau socle de calcul",
+      "body": "Pendant des décennies, le datacenter s'est construit presque exclusivement sur l'architecture x86. Celle-ci appartient à la famille CISC : les instructions sont nombreuses, de longueur variable et parfois complexes. ARM appartient à la famille RISC : les instructions sont courtes, de longueur fixe, et la plupart des calculs s'effectuent dans un grand nombre de registres. Ce choix simplifie le décodage des instructions et permet d'empiler beaucoup de cœurs sur une puce tout en maîtrisant la consommation électrique.\n\nL'analogie du transport aide à comprendre : x86 est un gros camion très polyvalent, capable de tout faire mais coûteux à l'usage ; ARM ressemble à une flotte de navettes spécialisées, moins puissantes individuellement mais redoutables lorsqu'il faut transporter beaucoup de colis en parallèle. C'est exactement le profil des services web, des microservices, du big data et des bases de données modernes, qui exécutent de nombreuses tâches indépendantes.\n\nKunpeng utilise l'architecture ARMv8-A, dont l'état d'exécution 64 bits s'appelle AArch64. Huawei dispose d'une licence d'architecture ARM et conçoit lui-même ses cœurs : il ne fabrique pas simplement un processeur ARM générique. Cette maîtrise permet d'adapter le silicium aux besoins du serveur : une grande capacité mémoire, des entrées-sorties rapides et haute fiabilité.",
+      "bullets": [
+        "ARMv8-A / AArch64 : jeu d'instructions 64 bits de type RISC",
+        "Cœurs Kunpeng conçus par Huawei sous licence d'architecture ARM",
+        "Le multi-cœur ARM vise d'abord le parallélisme et le ratio performance/watt",
+        "Un binaire x86 ne s'exécute pas nativement sur ARM64 : il faut recompiler ou traduire"
+      ],
+      "code": [
+        "# Vérifier l'architecture de la machine\nuname -m\n# Résultat attendu sur Kunpeng : aarch64\n\n# Afficher le modèle de CPU et les cœurs\nlscpu | grep -E 'Architecture|Model name|CPU\\(s\\)'"
+      ],
+      "table": {
+        "headers": [
+          "Critère",
+          "x86-64",
+          "ARMv8-A / AArch64"
+        ],
+        "rows": [
+          [
+            "Famille",
+            "CISC",
+            "RISC"
+          ],
+          [
+            "Longueur d'instruction",
+            "Variable",
+            "Fixe (4 octets)"
+          ],
+          [
+            "Modèle de licence",
+            "Intel/AMD",
+            "Licence d'architecture, cœurs personnalisés"
+          ],
+          [
+            "Point fort serveur",
+            "Mono-thread et compatibilité",
+            "Densité de cœurs et performance/watt"
+          ]
+        ]
+      },
+      "tip": "À l'examen, « ARM » ne signifie pas « processeur mobile » : Kunpeng est un processeur ARM de datacenter. De même, AArch64 désigne l'état 64 bits, pas un modèle de serveur."
+    },
+    {
+      "heading": "Kunpeng 920 : anatomie d'un processeur serveur",
+      "body": "La famille Kunpeng a progressé par étapes : Kunpeng 912 en 2014, Kunpeng 916 en 2016, puis Kunpeng 920 en janvier 2019. Le Kunpeng 920 est présenté comme le premier processeur ARM de datacenter gravé en 7 nm. Il intègre jusqu'à 64 cœurs par socket, ce qui change radicalement la densité de calcul par rapport aux processeurs serveur classiques.\n\nAutour des cœurs, le processeur embarque huit canaux mémoire DDR4 et des lignes PCIe 4.0. Ces deux caractéristiques comptent autant que le nombre de cœurs : un CPU très parallèle a besoin d'être nourri en données. Avec huit canaux, chaque socket dispose d'une bande passante mémoire élevée, et le PCIe 4.0 alimente sans goulot les cartes réseau 25/100 GE et les SSD NVMe. Le cache est organisé hiérarchiquement, du cache privé de chaque cœur jusqu'au cache partagé, afin de limiter les accès à la mémoire centrale.\n\nUn serveur bi-socket Kunpeng 920 expose donc jusqu'à 128 cœurs, répartis en deux nœuds NUMA. Chaque socket accède plus vite à sa mémoire locale qu'à celle de l'autre socket. Les applications doivent être conçues ou configurées pour exploiter cette localité, sinon les gains du multi-cœur sont partiellement perdus.",
+      "bullets": [
+        "Kunpeng 920 : 7 nm, jusqu'à 64 cœurs par socket",
+        "8 canaux DDR4 et PCIe 4.0 par socket",
+        "Deux sockets forment deux nœuds NUMA, avec 128 cœurs au total",
+        "Le débit mémoire et les I/O doivent suivre la montée en cœurs"
+      ],
+      "code": [
+        "# Voir la topologie NUMA et les canaux mémoire visibles\nnumactl --hardware\n\n# Vérifier la fréquence et le nombre de cœurs\nlscpu | grep -E 'CPU\\(s\\)|MHz|NUMA'"
+      ],
+      "table": {
+        "headers": [
+          "Caractéristique",
+          "Valeur typique du Kunpeng 920"
+        ],
+        "rows": [
+          [
+            "Gravure",
+            "7 nm"
+          ],
+          [
+            "Cœurs par socket",
+            "Jusqu'à 64"
+          ],
+          [
+            "Mémoire",
+            "8 canaux DDR4 par socket"
+          ],
+          [
+            "Interconnexion",
+            "PCIe 4.0"
+          ],
+          [
+            "Configuration serveur",
+            "1 ou 2 sockets (jusqu'à 128 cœurs)"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un serveur bi-socket embarque deux Kunpeng 920 de 64 cœurs. Calculez le nombre total de cœurs, le nombre de nœuds NUMA et le nombre total de canaux mémoire DDR4.",
+          "correction": "Cœurs : 2 × 64 = 128. Chaque socket constitue un nœud NUMA, donc 2 nœuds. Canaux mémoire : 2 × 8 = 16 canaux au total. Retenez que le chiffre de 64 cœurs s'entend par socket : c'est le piège classique de l'examen."
+        }
+      ],
+      "tip": "« 64 cœurs » est une valeur par socket, pas par serveur. Un TaiShan 200 bi-socket peut donc afficher 128 cœurs. Lisez toujours l'unité de la question."
+    },
+    {
+      "heading": "TaiShan : du processeur au serveur complet",
+      "body": "Un processeur seul ne suffit pas à construire un datacenter. Huawei industrialise les CPUs Kunpeng dans la gamme de serveurs TaiShan. Le TaiShan 100, lancé en 2016, reposait sur le Kunpeng 916. Le TaiShan 200, apparu en 2019, s'appuie sur le Kunpeng 920 et devient le fer de lance de la gamme. Il décline plusieurs modèles selon le usage : le 2280 « Balanced » pour les charges générales, le 5280 « Storage » pour le stockage massif et le X6000 « High-Density » pour les déploiements très denses.\n\nUn serveur TaiShan n'est pas seulement un boîtier autour d'un CPU. Il ajoute des alimentations redondantes, des ventilateurs remplaçables à chaud, des disques hot-swap, un BIOS/UEFI adapté et surtout un contrôleur de gestion iBMC. L'iBMC fonctionne indépendamment du système d'exploitation : il permet d'allumer, d'éteindre, de surveiller les capteurs et d'ouvrir une console distante même lorsque le serveur est bloqué.\n\nCette couche matérielle explique pourquoi la migration ne se résume pas à recompiler un logiciel. Il faut aussi valider les pilotes, le firmware, la gestion de l'énergie et les chemins de secours. Les fonctions de fiabilité, de disponibilité et de serviceabilité (RAS) sont un argument central pour les clients bancaires ou télécoms.",
+      "bullets": [
+        "TaiShan 100 : première génération, basée sur Kunpeng 916",
+        "TaiShan 200 : basée sur Kunpeng 920, modèles 2280, 5280 et X6000",
+        "iBMC : gestion hors bande, console distante et supervision matérielle",
+        "Alimentations redondantes, disques hot-swap et fonctions RAS"
+      ],
+      "code": [
+        "# Interroger l'iBMC via l'API Redfish (exemple)\ncurl -k -u admin:MotDePasse https://192.168.1.100/redfish/v1/Systems/1\n\n# Vérifier la version du firmware BIOS côté OS\nsudo dmidecode -s bios-version"
+      ],
+      "diagram": "+--------------------------------------------------+\n|                TaiShan 200 (2U)                  |\n|                                                  |\n|  +----------------+      +----------------+      |\n|  | Kunpeng 920 #0 |      | Kunpeng 920 #1 |      |\n|  | 64 cores       |<---->| 64 cores       |      |\n|  | 8x DDR4        |      | 8x DDR4        |      |\n|  +-------+--------+      +--------+-------+      |\n|          | PCIe 4.0               | PCIe 4.0     |\n|  +-------v------------------------v-------+      |\n|  |  NVMe / RAID / NIC 25-100 GE           |      |\n|  +----------------------------------------+      |\n|  |  iBMC (hors bande)  |  PSU redondantes  |      |\n|  +----------------------------------------+      |\n+--------------------------------------------------+",
+      "tip": "Ne confondez pas TaiShan (serveur) et Kunpeng (processeur). Une question qui demande « quel serveur » attend TaiShan ; une question qui demande « quel CPU » attend Kunpeng."
+    },
+    {
+      "heading": "openEuler, le système d'exploitation de référence",
+      "body": "openEuler est la distribution Linux recommandée sur Kunpeng. Son histoire commence avec EulerOS, système serveur développé et utilisé par Huawei depuis 2010. En septembre 2019, EulerOS est passé en open source sous le nom openEuler. La distribution est depuis portée par une communauté mondiale et prend en charge Kunpeng ainsi que d'autres architectures.\n\nopenEuler n'est pas un simple clone de CentOS. Elle ajoute des composants pensés pour le matériel diversifié : A-Tune, qui profile la charge et applique automatiquement un modèle de réglage adapté ; iSulad, un moteur de conteneurs léger écrit en C/C++ ; et la prise en charge de MPAM, qui permet de contrôler l'allocation du cache L3 et de la bande passante mémoire, un peu comme les technologies RDT des processeurs x86 haut de gamme.\n\nPour un développeur, l'essentiel est de retrouver ses repères Linux : noyau, systemd, RPM et dnf, SELinux, réseau NetworkManager. La différence se joue dans les paquets aarch64, les pilotes et les profils de performance. Une application validée sur openEuler x86 devra être reconstruite pour aarch64, puis testée avec les mêmes scénarios fonctionnels.",
+      "bullets": [
+        "openEuler dérive d'EulerOS, ouvert en septembre 2019",
+        "Gestion des paquets RPM/dnf, init systemd, SELinux",
+        "A-Tune automatise le réglage des performances selon la charge",
+        "iSulad est le moteur de conteneurs léger de l'écosystème openEuler"
+      ],
+      "code": [
+        "# Identifier la distribution et l'architecture\ncat /etc/os-release\nuname -m\n\n# Mettre à jour et installer un serveur web\ndnf update -y\ndnf install -y nginx\nsystemctl enable --now nginx"
+      ],
+      "table": {
+        "headers": [
+          "Composant",
+          "Rôle"
+        ],
+        "rows": [
+          [
+            "A-Tune",
+            "Profilage et réglage automatique des performances"
+          ],
+          [
+            "iSulad",
+            "Moteur de conteneurs OCI léger"
+          ],
+          [
+            "MPAM",
+            "Contrôle du cache L3 et de la bande passante mémoire"
+          ],
+          [
+            "dnf / RPM",
+            "Gestion des paquets"
+          ],
+          [
+            "systemd",
+            "Gestion des services et du démarrage"
+          ]
+        ]
+      },
+      "tip": "openEuler est une distribution Linux, pas un noyau propriétaire ni un hyperviseur. Elle est dérivée d'EulerOS, et non de CentOS, même si sa gestion des paquets rappelle l'écosystème Red Hat."
+    },
+    {
+      "heading": "openGauss et la pile logicielle Kunpeng",
+      "body": "Une plateforme de calcul a besoin d'une base de données performante. openGauss est la base relationnelle open source développée par Huawei avec ses partenaires, publiée en juin 2020. Elle est conçue pour les processeurs multicœurs : structures de données adaptées au NUMA, parallélisme des requêtes, optimisation guidée par l'IA et fonctions de sécurité de bout en bout. Elle respecte les standards SQL et propose une haute disponibilité avec un nœud primaire et des nœuds standby.\n\nLa pile typique sur Kunpeng se lit de bas en haut : le matériel TaiShan, le système openEuler, la base openGauss, puis le runtime applicatif. Pour Java, Huawei propose BiSheng JDK, une distribution OpenJDK optimisée pour ARM64. Pour les langages compilés, on utilise GCC for openEuler ou le compilateur BiSheng, basé sur LLVM. Les bibliothèques d'accélération et les bonnes pratiques sont regroupées dans BoostKit.\n\nCette pile n'est pas imposée : une entreprise peut utiliser PostgreSQL, MySQL, Redis ou une autre base, à condition de disposer d'une version aarch64. Le point important est de vérifier chaque étage, du firmware au pilote JDBC. Une incompatibilité à un seul étage suffit à bloquer le déploiement, même si les autres composants sont parfaitement portés.",
+      "bullets": [
+        "openGauss : base relationnelle open source, optimisée multicœur et NUMA",
+        "BiSheng JDK : OpenJDK optimisé pour ARM64",
+        "BiSheng Compiler (LLVM) et GCC for openEuler pour les langages compilés",
+        "Chaque étage de la pile doit disposer d'une version aarch64 validée"
+      ],
+      "code": [
+        "# Vérifier la version de Java et du JDK utilisé\njava -version\nreadlink -f \"$(which java)\"\n\n# Se connecter à openGauss avec l'outil client\ngsql -d postgres -p 15400 -U omm -W MotDePasse"
+      ],
+      "diagram": "+---------------------------------------+\n|  Application (Java, Go, Python, C++)  |\n+---------------------------------------+\n|  Runtime : BiSheng JDK / GCC / Python |\n+---------------------------------------+\n|  Middleware & donnees : openGauss,    |\n|  Redis, Kafka, Nginx                  |\n+---------------------------------------+\n|  openEuler (noyau Linux aarch64)      |\n+---------------------------------------+\n|  TaiShan / Kunpeng 920 (ARMv8)        |\n+---------------------------------------+\n|  iBMC, UEFI, firmware, PSU            |\n+---------------------------------------+",
+      "tip": "openGauss n'est pas un module du noyau ni un système d'exploitation : c'est une base de données relationnelle. Son port par défaut dans les labs est souvent 15400, à ne pas confondre avec le 5432 de PostgreSQL."
+    },
+    {
+      "heading": "DevKit, BoostKit et l'écosystème partenaires",
+      "body": "Huawei accompagne les développeurs avec deux ensembles complémentaires. Le Kunpeng Development Kit (DevKit) couvre le cycle de vie du logiciel : analyse de compatibilité, migration du code, compilation, débogage, tests et analyse de performance. Son outil de migration de code, souvent appelé Porting Advisor, remplit trois fonctions : évaluer un paquet sans source, analyser un paquet source et proposer des corrections, puis reconstruire un paquet x86 en paquet Kunpeng.\n\nLe Kunpeng BoostKit, lui, ne migre pas le code : il fournit des bibliothèques accélérées, des patches et des bonnes pratiques pour huit grands scénarios, notamment le big data, les bases de données, le stockage distribué, le web, le CDN et la virtualisation. La distinction est importante : DevKit répond à « comment faire tourner mon application ? », BoostKit répond à « comment la faire tourner plus vite ? ».\n\nAutour de ces outils gravitent les distributions, les éditeurs de logiciels (ISV), les intégrateurs et la communauté Kunpeng. Les partenaires certifient leurs solutions sur ARM64 et publient des images de conteneurs multi-architectures. Pour un architecte, cet écosystème compte autant que les caractéristiques du processeur : une puce performante sans logiciels validés ne sert à rien.",
+      "bullets": [
+        "DevKit : migration, compilation, débogage, tests et analyse de performance",
+        "Porting Advisor : évaluation, migration du code source et reconstruction de paquets",
+        "BoostKit : bibliothèques et bonnes pratiques d'accélération par scénario",
+        "Communauté et partenaires ISV : certification et images multi-arch"
+      ],
+      "code": [
+        "# Exemple d'analyse d'un paquet avec l'outil de migration (CLI)\n# Les chemins exacts dépendent de la version installée\nporting-advisor --help\n\n# Vérifier l'architecture d'un paquet RPM\ndnf install -y rpm\nrpm -qp --qf '%{NAME} %{ARCH}\\n' paquet.rpm"
+      ],
+      "table": {
+        "headers": [
+          "Outil",
+          "Usage principal"
+        ],
+        "rows": [
+          [
+            "Porting Advisor",
+            "Analyser le code et les dépendances avant migration"
+          ],
+          [
+            "ExaGear",
+            "Traduire dynamiquement des binaires x86 vers ARM64"
+          ],
+          [
+            "BiSheng Compiler",
+            "Compiler avec optimisations pour Kunpeng"
+          ],
+          [
+            "BiSheng JDK",
+            "Exécuter des applications Java optimisées ARM64"
+          ],
+          [
+            "BoostKit",
+            "Accélérer une application déjà portée"
+          ]
+        ]
+      },
+      "exercises": [
+        {
+          "prompt": "Un éditeur fournit une application métier uniquement sous forme binaire x86, sans code source, et refuse toute recompilation. Quel outil Huawei peut assurer une continuité de service, et avec quelles limites ?",
+          "correction": "ExaGear traduit dynamiquement les instructions x86 en instructions ARM64 à l'exécution. Il permet de faire tourner le binaire sans source, mais avec un surcoût de performance et sans garantir un comportement identique sur toutes les charges. Pour une application critique et sensible à la performance, il faut privilégier une version ARM64 native ou un portage du code."
+        }
+      ],
+      "tip": "Porting Advisor analyse et conseille ; ExaGear exécute des binaires x86 sans recompilation. Si la question mentionne « sans code source », pensez d'abord à ExaGear, pas à un compilateur croisé."
+    },
+    {
+      "heading": "Cas d'usage et méthodologie de migration",
+      "body": "Kunpeng cible trois grands territoires. Dans le cloud, il alimente les machines virtuelles, les conteneurs et les microservices. À la périphérie du réseau, il équipe les infrastructures 5G MEC, les passerelles IoT et les sites où la latence et la proximité des données comptent. Dans le datacenter d'entreprise, il prend en charge les applications web, les bases de données, le big data, le HPC léger et les charges financières par lots.\n\nLa migration suit une démarche en cinq phases. On commence par l'évaluation : inventaire des applications, analyse des dépendances, des bibliothèques natives et des contraintes de performance. Vient ensuite la préparation de l'environnement : matériel, openEuler, JDK, compilateurs et outils. La troisième phase porte le code : recompilation, correction des incompatibilités et reconstruction des paquets. La quatrième valide fonctionnellement et en performance. La cinquième optimise et industrialise, avec un déploiement progressif de type canary.\n\nL'erreur fréquente est de vouloir tout migrer d'un coup. Un bon projet commence par un Proof of Concept sur une charge représentative, mesure un écart de performance, puis étend le périmètre service par service. Cette progressivité limite le risque et permet d'ajuster les hypothèses avant l'engagement de production.",
+      "bullets": [
+        "Trois terrains : cloud, edge 5G/MEC, datacenter d'entreprise",
+        "Méthode : évaluation, environnement, portage, validation, optimisation",
+        "Commencer par un PoC sur une charge représentative",
+        "Déploiement progressif (canary) plutôt que big bang"
+      ],
+      "code": [
+        "# Inventaire rapide d'un système avant migration\nuname -a\ncat /etc/os-release\nldd /usr/bin/mon_application | head\nrpm -qa | wc -l"
+      ],
+      "exercises": [
+        {
+          "prompt": "Une banque veut migrer une application Java Spring Boot qui embarque une bibliothèque native de calcul et utilise une base Oracle sans version ARM64. Proposez les grandes étapes et les décisions clés.",
+          "correction": "1) Évaluer : analyser le JAR, identifier la bibliothèque native et vérifier la présence d'une version aarch64. 2) Environnement : TaiShan ou cloud Kunpeng, openEuler, BiSheng JDK. 3) Portage : reconstruire la bibliothèque native pour ARM64, repackager le JAR, remplacer Oracle par openGauss ou une autre base disposant d'une version ARM64. 4) Valider : tests fonctionnels, tests de charge et comparaison des temps de réponse. 5) Optimiser et déployer progressivement. Le point critique est la dépendance native et la base, pas le bytecode Java lui-même."
+        }
+      ],
+      "tip": "La première phase de migration est l'évaluation, pas l'achat de matériel ni la recompilation. À l'examen, toute réponse qui commence par « déployer en production » ou « réécrire toute l'application » est généralement fausse."
+    }
+  ],
+  "key_points": [
+    "Kunpeng est une famille de processeurs ARMv8-A (AArch64) conçus par Huawei.",
+    "Le Kunpeng 920 est gravé en 7 nm et atteint 64 cœurs par socket, avec 8 canaux DDR4 et PCIe 4.0.",
+    "Les serveurs TaiShan 200 reposent sur le Kunpeng 920 ; les modèles 2280, 5280 et X6000 couvrent des usages différents.",
+    "openEuler, dérivé d'EulerOS, est la distribution Linux de référence pour Kunpeng.",
+    "openGauss est une base relationnelle open source optimisée pour les architectures multicœurs et NUMA.",
+    "DevKit sert à migrer et analyser le code ; BoostKit sert à accélérer une application déjà portée.",
+    "La méthodologie de migration comporte cinq phases : évaluation, environnement, portage, validation, optimisation.",
+    "Un binaire x86 ne s'exécute pas nativement sur ARM64 : il faut recompiler, reconstruire le conteneur ou utiliser ExaGear."
+  ],
+  "traps": [
+    "Kunpeng est un CPU généraliste, pas un GPU ni une NPU : l'IA s'appuie sur les NPU Ascend.",
+    "Les 64 cœurs du Kunpeng 920 sont par socket ; un serveur bi-socket en compte 128.",
+    "Porting Advisor analyse et conseille, alors qu'ExaGear traduit les binaires à l'exécution.",
+    "openEuler est dérivé d'EulerOS, pas de CentOS, même si les outils RPM/dnf sont similaires.",
+    "La migration commence par l'évaluation et un PoC, jamais par un déploiement global immédiat."
+  ],
+  "quiz": [
+    {
+      "id": "hcia-kp-01-q01",
+      "type": "single",
+      "prompt": "On which instruction set architecture are Kunpeng server processors based?",
+      "options": [
+        "ARMv8-A (AArch64)",
+        "RISC-V",
+        "PowerPC",
+        "x86-64"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Les processeurs Kunpeng implémentent l'architecture ARMv8-A, dont l'état 64 bits est AArch64. x86-64 est l'architecture d'Intel et AMD, RISC-V est un autre jeu d'instructions ouvert, et PowerPC appartient à IBM. Kunpeng n'est donc pas compatible nativement avec les binaires x86.",
+      "topic": "Architecture"
+    },
+    {
+      "id": "hcia-kp-01-q02",
+      "type": "single",
+      "prompt": "What is the maximum number of cores per socket on the Kunpeng 920 processor?",
+      "options": [
+        "48",
+        "64",
+        "128",
+        "32"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Le Kunpeng 920 intègre jusqu'à 64 cœurs par socket. 128 correspond au total d'un serveur bi-socket, pas à un seul processeur. 32 et 48 sont des valeurs inférieures qui ne correspondent pas au modèle phare.",
+      "topic": "Architecture"
+    },
+    {
+      "id": "hcia-kp-01-q03",
+      "type": "single",
+      "prompt": "Which Linux distribution is the reference open-source OS recommended for Kunpeng servers?",
+      "options": [
+        "VMware ESXi",
+        "FreeDOS",
+        "openEuler",
+        "Windows Server"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "openEuler est la distribution Linux open source dérivée d'EulerOS et optimisée pour Kunpeng. Windows Server n'est pas la cible serveur ARM64 de Huawei, ESXi est un hyperviseur et non une distribution Linux générale, et FreeDOS est un système DOS sans rapport.",
+      "topic": "Système d'exploitation"
+    },
+    {
+      "id": "hcia-kp-01-q04",
+      "type": "single",
+      "prompt": "What is the main purpose of the Kunpeng Porting Advisor?",
+      "options": [
+        "To provide a graphical desktop for openEuler",
+        "To replace the BIOS of a TaiShan server",
+        "To encrypt databases at rest",
+        "To analyze source code and dependencies before migration"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "Porting Advisor analyse les paquets et le code source pour identifier les incompatibilités x86 et proposer des corrections. Il ne fournit pas d'environnement de bureau, ne remplace pas le firmware et ne chiffre pas les données. Ces trois dernières fonctions relèvent d'autres composants.",
+      "topic": "Outils"
+    },
+    {
+      "id": "hcia-kp-01-q05",
+      "type": "single",
+      "prompt": "Which component provides out-of-band management for a TaiShan server?",
+      "options": [
+        "iBMC",
+        "GRUB",
+        "systemd",
+        "Nginx"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "L'iBMC est le contrôleur de gestion autonome du serveur : il surveille les capteurs, permet la console distante et fonctionne même si l'OS est arrêté. GRUB est un chargeur d'amorçage, systemd un gestionnaire de services et Nginx un serveur web.",
+      "topic": "Matériel"
+    },
+    {
+      "id": "hcia-kp-01-q06",
+      "type": "single",
+      "prompt": "A TaiShan 200 server is equipped with two 64-core Kunpeng 920 processors. How many cores does it expose in total?",
+      "options": [
+        "96",
+        "128",
+        "256",
+        "64"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Chaque socket fournit 64 cœurs, donc deux sockets en exposent 128. 64 correspond à un seul processeur, 96 à une configuration hypothétique à un socket et demi, et 256 à une confusion avec le nombre de threads simultanés (SMT), qui n'est pas la métrique demandée ici.",
+      "topic": "Matériel"
+    },
+    {
+      "id": "hcia-kp-01-q07",
+      "type": "multi",
+      "prompt": "Which operating systems are officially supported on Kunpeng servers? (Choose three.)",
+      "options": [
+        "openEuler",
+        "Ubuntu",
+        "Kylin OS",
+        "Windows Server 2016"
+      ],
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation_fr": "openEuler, Ubuntu et Kylin OS disposent de versions aarch64 supportées sur Kunpeng. Windows Server 2016 n'est pas une cible ARM64 prise en charge dans cet écosystème : la plateforme Kunpeng est orientée Linux.",
+      "topic": "Système d'exploitation"
+    },
+    {
+      "id": "hcia-kp-01-q08",
+      "type": "multi",
+      "prompt": "Which workloads are typical targets for Kunpeng servers? (Choose three.)",
+      "options": [
+        "Big data processing",
+        "Desktop photo retouching",
+        "Cloud-native microservices",
+        "5G edge computing"
+      ],
+      "answer": [
+        0,
+        2,
+        3
+      ],
+      "explanation_fr": "Kunpeng vise les charges parallèles du datacenter et de l'edge : microservices, 5G MEC et big data. La retouche photo de bureau n'est pas un cas d'usage serveur typique et ne justifie pas une plateforme multicœur de datacenter.",
+      "topic": "Cas d'usage"
+    },
+    {
+      "id": "hcia-kp-01-q09",
+      "type": "multi",
+      "prompt": "Which components belong to the Kunpeng DevKit ecosystem? (Choose three.)",
+      "options": [
+        "BiSheng JDK",
+        "Kunpeng performance analysis tool",
+        "Microsoft Office",
+        "Porting Advisor"
+      ],
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation_fr": "Porting Advisor, BiSheng JDK et l'outil d'analyse de performance font partie de l'offre DevKit. Microsoft Office est une suite bureautique propriétaire sans lien avec la migration ou l'optimisation Kunpeng.",
+      "topic": "Outils"
+    },
+    {
+      "id": "hcia-kp-01-q10",
+      "type": "tf",
+      "prompt": "The Kunpeng 920 is a GPU designed for AI training.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : le Kunpeng 920 est un processeur généraliste ARMv8. Pour l'IA, Huawei propose les NPU Ascend 310 et 910. Confondre CPU et accélérateur est un piège fréquent dans les QCM.",
+      "topic": "Architecture"
+    },
+    {
+      "id": "hcia-kp-01-q11",
+      "type": "tf",
+      "prompt": "TaiShan servers are built around Kunpeng processors.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : TaiShan est la gamme de serveurs Huawei qui embarque les processeurs Kunpeng. Le TaiShan 100 utilise le Kunpeng 916 et le TaiShan 200 le Kunpeng 920.",
+      "topic": "Matériel"
+    },
+    {
+      "id": "hcia-kp-01-q12",
+      "type": "tf",
+      "prompt": "An x86-64 Linux binary can run natively on an ARM64 Kunpeng server without recompilation or translation.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "Faux : le code machine x86-64 et les conventions ABI diffèrent d'ARM64. Il faut recompiler, reconstruire un conteneur pour aarch64 ou utiliser un outil de traduction binaire comme ExaGear. Un simple copier-coller du binaire ne fonctionne pas.",
+      "topic": "Migration"
+    },
+    {
+      "id": "hcia-kp-01-q13",
+      "type": "tf",
+      "prompt": "openEuler originated from Huawei's EulerOS and was open-sourced in 2019.",
+      "options": [
+        "True",
+        "False"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "Vrai : EulerOS était utilisé par Huawei depuis 2010 et a été publié en open source sous le nom openEuler en septembre 2019. Cela explique la proximité technique avec l'écosystème Linux d'entreprise, mais openEuler n'est pas un dérivé de CentOS.",
+      "topic": "Système d'exploitation"
+    },
+    {
+      "id": "hcia-kp-01-q14",
+      "type": "text",
+      "prompt": "Which management controller provides out-of-band monitoring on TaiShan servers? (Enter the acronym.)",
+      "accept": [
+        "ibmc",
+        "iBMC",
+        "i-bmc"
+      ],
+      "sample_answer": "iBMC",
+      "explanation_fr": "iBMC signifie intelligent Baseboard Management Controller. Il fonctionne indépendamment du système d'exploitation et expose des interfaces comme IPMI ou Redfish pour la supervision et la console distante.",
+      "topic": "Matériel"
+    },
+    {
+      "id": "hcia-kp-01-q15",
+      "type": "text",
+      "prompt": "Which open-source Linux distribution is recommended by Huawei for Kunpeng servers? (Enter one word.)",
+      "accept": [
+        "openeuler",
+        "openEuler",
+        "open-euler"
+      ],
+      "sample_answer": "openEuler",
+      "explanation_fr": "openEuler est la distribution Linux communautaire dérivée d'EulerOS et optimisée pour Kunpeng. Elle fournit les paquets aarch64, A-Tune, iSulad et les outils de l'écosystème.",
+      "topic": "Système d'exploitation"
+    },
+    {
+      "id": "hcia-kp-01-q16",
+      "type": "text",
+      "prompt": "What is the name of the 64-bit execution state of the ARMv8-A architecture? (Enter the acronym.)",
+      "accept": [
+        "aarch64",
+        "AArch64",
+        "arm64"
+      ],
+      "sample_answer": "AArch64",
+      "explanation_fr": "AArch64 désigne l'état d'exécution 64 bits d'ARMv8-A. ARM64 et aarch64 sont les noms couramment utilisés par Linux et les outils de compilation pour la même cible.",
+      "topic": "Architecture"
+    },
+    {
+      "id": "hcia-kp-01-q17",
+      "type": "single",
+      "prompt": "Which statement best explains why Kunpeng's many-core design suits cloud workloads?",
+      "options": [
+        "It runs x86 binaries without translation",
+        "It maximizes single-thread clock speed above all else",
+        "It processes many independent requests in parallel with good power efficiency",
+        "It eliminates the need for memory"
+      ],
+      "answer": [
+        2
+      ],
+      "explanation_fr": "Les charges cloud se composent de nombreuses requêtes indépendantes : beaucoup de cœurs permettent de les traiter en parallèle avec un bon ratio performance/watt. Kunpeng ne maximise pas la fréquence mono-thread, ne supprime pas la mémoire et n'exécute pas nativement le x86.",
+      "topic": "Architecture"
+    },
+    {
+      "id": "hcia-kp-01-q18",
+      "type": "single",
+      "prompt": "What is the primary role of ExaGear in a Kunpeng migration?",
+      "options": [
+        "To replace openEuler with Windows",
+        "To compile Java bytecode into C",
+        "To manage the server's power supply",
+        "To translate x86 instructions to ARM64 at runtime"
+      ],
+      "answer": [
+        3
+      ],
+      "explanation_fr": "ExaGear est un outil de traduction binaire dynamique : il convertit les instructions x86 en ARM64 à l'exécution, ce qui permet de faire tourner des applications sans code source. Il ne change pas de système d'exploitation, ne compile pas du Java en C et ne gère pas l'alimentation.",
+      "topic": "Migration"
+    },
+    {
+      "id": "hcia-kp-01-q19",
+      "type": "single",
+      "prompt": "Which characteristic is central to the openGauss database design on Kunpeng?",
+      "options": [
+        "Optimization for multi-core and NUMA architectures",
+        "Exclusive support for x86 only",
+        "Storage of data only in flat text files",
+        "Absence of SQL support"
+      ],
+      "answer": [
+        0
+      ],
+      "explanation_fr": "openGauss est conçue pour exploiter les processeurs multicœurs et les architectures NUMA, avec parallélisme et optimisation des requêtes. Elle prend en charge SQL et ne se limite ni à x86 ni à des fichiers texte.",
+      "topic": "Base de données"
+    },
+    {
+      "id": "hcia-kp-01-q20",
+      "type": "single",
+      "prompt": "What is the first phase of the recommended Kunpeng migration methodology?",
+      "options": [
+        "Deploying all services to production",
+        "Assessing applications, dependencies and compatibility",
+        "Buying replacement laptops",
+        "Rewriting every application in Go"
+      ],
+      "answer": [
+        1
+      ],
+      "explanation_fr": "La première phase est l'évaluation : inventaire des applications, analyse des dépendances et des bibliothèques natives, estimation de l'effort. Le déploiement en production arrive en dernier, et une réécriture générale n'est ni systématique ni recommandée.",
+      "topic": "Migration"
+    }
+  ]
+}
